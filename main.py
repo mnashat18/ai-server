@@ -2,9 +2,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import os
 
-print("DIRECTUS_URL =", os.getenv("DIRECTUS_URL"))
-print("DIRECTUS_TOKEN exists =", bool(os.getenv("DIRECTUS_TOKEN")))
-
 from audio import analyze_audio
 from baseline import get_baseline, update_baseline
 from config import MODEL_VERSION
@@ -18,11 +15,18 @@ from vision import analyze_face
 
 from fastapi import FastAPI
 
+from fastapi import FastAPI
+import os
+
 app = FastAPI()
 
-@app.get("/")
-def root():
-    return {"status": "ok"}
+@app.get("/debug-env")
+def debug_env():
+    return {
+        "DIRECTUS_URL": os.getenv("DIRECTUS_URL"),
+        "HAS_TOKEN": bool(os.getenv("DIRECTUS_TOKEN"))
+    }
+
 
 logger = get_logger()
 ml_runtime = MLRuntime()
