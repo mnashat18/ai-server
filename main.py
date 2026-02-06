@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import os
+import requests
+import tempfile
 
 from audio import analyze_audio
 from baseline import get_baseline, update_baseline
@@ -9,13 +11,14 @@ from logger import get_logger
 from ml.features import features_from_signals, vector_from_features
 from ml.runtime import MLRuntime
 from scoring import compute_result, compute_task_score
-from utils import download_temp_file, is_url, remove_temp_file
+from utils import is_url, remove_temp_file
 from video import analyze_video
 from vision import analyze_face
 
 
-
-from fastapi import FastAPI
+# =========================
+# App & Runtime
+# =========================
 
 app = FastAPI()
 
@@ -23,16 +26,23 @@ app = FastAPI()
 def root():
     return {"status": "ok"}
 
-
 logger = get_logger()
+
 ml_runtime = MLRuntime()
 ml_runtime.load()
 
+DIRECTUS_URL = os.getenv("DIRECTUS_URL")
+DIRECTUS_TOKEN = os.getenv("DIRECTUS_TOKEN")
+
+
+# =========================
+# Models
+# =========================
 
 class Media(BaseModel):
-    image: str | None = Field(None, description="Local path or URL")
-    audio: str | None = Field(None, description="Local path or URL")
-    video: str | None = Field(None, description="Local path or URL")
+    image: str | None = Field(None, description="Local path, URL, or Directus asset ID")
+    audio: str | None = Field(None, description="Local path, URL, or Directus asset ID")
+    video: str | None = Field(None, description="Local path, URL, or Directus asset ID")
 
 
 class Task(BaseModel):
@@ -93,18 +103,72 @@ class BaselineResponse(BaseModel):
     model_version: str
 
 
+# =========================
+# Helpers
+# =========================
+
+def _download_directus_asset(asset_id: str, suffix: str) -> str:
+    if not DIRECTUS_URL or not DIRECTUS_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="Directus credentials are not configured"
+        )
+
+    url = f"{DIRECTUS_URL}/assets/{asset_id}"
+    headers = {
+        "Authorization": f"Bearer {DIRECTUS_TOKEN}"
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to download media: {asset_id}"
+        )
+
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(fd, "wb") as f:
+        f.write(r.content)
+
+    return path
+
+
 def _resolve_media_input(value: str | None, suffix: str):
     if not value:
         return None, False
+
+    # URL مباشر
     if is_url(value):
         try:
-            path = download_temp_file(value, suffix)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Failed to download media: {exc}")
+            r = requests.get(value, timeout=30)
+            r.raise_for_status()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download media: {value}"
+            )
+
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        with os.fdopen(fd, "wb") as f:
+            f.write(r.content)
+
         return path, True
-    if not os.path.exists(value):
-        raise HTTPException(status_code=400, detail=f"Media file not found: {value}")
-    return value, False
+
+    # Directus asset ID
+    if DIRECTUS_URL and DIRECTUS_TOKEN:
+        path = _download_directus_asset(value, suffix)
+        return path, True
+
+    # Local file
+    if os.path.exists(value):
+        return value, False
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Media file not found: {value}"
+    )
 
 
 def _safe_analyze(fn, path):
@@ -121,7 +185,10 @@ def _safe_analyze(fn, path):
 
 def _ensure_media_present(media: Media) -> None:
     if not any([media.image, media.audio, media.video]):
-        raise HTTPException(status_code=422, detail="At least one media input is required.")
+        raise HTTPException(
+            status_code=422,
+            detail="At least one media input is required."
+        )
 
 
 def _analyze_media(media: Media):
@@ -131,9 +198,11 @@ def _analyze_media(media: Media):
     image_path, is_temp = _resolve_media_input(media.image, ".jpg")
     if is_temp:
         temp_files.append(image_path)
+
     audio_path, is_temp = _resolve_media_input(media.audio, ".wav")
     if is_temp:
         temp_files.append(audio_path)
+
     video_path, is_temp = _resolve_media_input(media.video, ".mp4")
     if is_temp:
         temp_files.append(video_path)
@@ -144,6 +213,10 @@ def _analyze_media(media: Media):
 
     return {"camera": camera, "video": video, "voice": voice}, temp_files
 
+
+# =========================
+# Routes
+# =========================
 
 @app.get("/health")
 def health():
@@ -160,13 +233,23 @@ def set_baseline(req: BaselineRequest):
     signals, temp_files = _analyze_media(req.media)
     try:
         logger.info("baseline_update subject_id=%s", req.subject_id)
+
         scores = {k: v.get("score") for k, v in signals.items()}
         if req.task:
             scores["task"] = compute_task_score(req.task)
+
         if not any(v is not None for v in scores.values()):
-            raise HTTPException(status_code=422, detail="No valid signals for baseline update.")
+            raise HTTPException(
+                status_code=422,
+                detail="No valid signals for baseline update."
+            )
+
         baseline = update_baseline(req.subject_id, scores)
-        return {"subject_id": req.subject_id, "baseline": baseline, "model_version": MODEL_VERSION}
+        return {
+            "subject_id": req.subject_id,
+            "baseline": baseline,
+            "model_version": MODEL_VERSION
+        }
     finally:
         for path in temp_files:
             remove_temp_file(path)
@@ -176,15 +259,27 @@ def set_baseline(req: BaselineRequest):
 def process_scan(req: ScanRequest):
     signals, temp_files = _analyze_media(req.media)
     try:
-        logger.info("process_scan scan_id=%s subject_id=%s", req.scan_id, req.subject_id)
+        logger.info(
+            "process_scan scan_id=%s subject_id=%s",
+            req.scan_id,
+            req.subject_id
+        )
+
         camera_score = signals["camera"].get("score")
         video_score = signals["video"].get("score")
         voice_score = signals["voice"].get("score")
 
         baseline = get_baseline(req.subject_id) if req.subject_id else None
+
         feature_map, _ = features_from_signals(signals, task=req.task)
         feature_vector = vector_from_features(feature_map)
-        ml_result = ml_runtime.predict(feature_vector) if ml_runtime.is_loaded() else None
+
+        ml_result = (
+            ml_runtime.predict(feature_vector)
+            if ml_runtime.is_loaded()
+            else None
+        )
+
         result = compute_result(
             camera_score,
             video_score,
@@ -206,6 +301,7 @@ def process_scan(req: ScanRequest):
         response = dict(result)
         response["diagnostics"] = diagnostics
         response["model_version"] = MODEL_VERSION
+
         return response
     finally:
         for path in temp_files:
