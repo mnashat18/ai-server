@@ -13,7 +13,14 @@ from utils import download_temp_file, is_url, remove_temp_file
 from video import analyze_video
 from vision import analyze_face
 
-app = FastAPI(title="AI Scan Server", version="1.2.0")
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
 logger = get_logger()
 ml_runtime = MLRuntime()
 ml_runtime.load()
