@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+opencv-python
+mediapipe
+numpy
+scipy
+librosa
+torch
+openai-whisper
+pydantic
+requests

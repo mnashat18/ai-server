@@ -1,0 +1,48 @@
+#config.py
+import random
+import numpy as np
+import torch
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+MODEL_VERSION = "1.2.0"
+
+LABELS = ["High Risk", "Elevated Fatigue", "Low Focus", "Stable"]
+LABEL_SCORES = [0.2, 0.45, 0.6, 0.85]
+
+WEIGHT_CAMERA = 0.3
+WEIGHT_VIDEO = 0.4
+WEIGHT_VOICE = 0.3
+WEIGHT_TASK = 0.15
+ML_WEIGHT = 0.7
+MISSING_MEDIA_PENALTY = 0.1
+
+BASELINE_ALPHA = 0.25
+BASELINE_DRIFT_THRESHOLD = 0.12
+BASELINE_DRIFT_PENALTY = 0.05
+BASELINE_PATH = "data/baselines.json"
+ML_MODEL_PATH = "models/latest.pt"
+MAX_DOWNLOAD_BYTES = 20000000
+
+CAMERA_GOOD = 0.7
+CAMERA_MED  = 0.5
+
+VIDEO_GOOD = 0.65
+VIDEO_MED  = 0.45
+
+VOICE_GOOD = 0.6
+VOICE_MED  = 0.4
+
+TASK_RT_GOOD = 0.6
+TASK_RT_MED = 1.0
+TASK_ERR_GOOD = 0
+TASK_ERR_MED = 2
+
+MIN_AUDIO_ENERGY = 0.01
+MIN_SWAY_STD = 0.01
+MIN_EAR = 0.2
+VIDEO_MAX_FRAMES = 300
+VIDEO_FRAME_STRIDE = 5
