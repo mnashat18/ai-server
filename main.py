@@ -13,19 +13,15 @@ from utils import download_temp_file, is_url, remove_temp_file
 from video import analyze_video
 from vision import analyze_face
 
-from fastapi import FastAPI
+
 
 from fastapi import FastAPI
-import os
 
 app = FastAPI()
 
-@app.get("/debug-env")
-def debug_env():
-    return {
-        "DIRECTUS_URL": os.getenv("DIRECTUS_URL"),
-        "HAS_TOKEN": bool(os.getenv("DIRECTUS_TOKEN"))
-    }
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
 
 logger = get_logger()
