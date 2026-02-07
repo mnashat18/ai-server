@@ -15,11 +15,23 @@ def is_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 def download_temp_file(url: str, suffix: str):
-    response = requests.get(url, timeout=10, stream=True)
+    headers = {}
+
+    token = os.getenv("DIRECTUS_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=30,
+        stream=True
+    )
     response.raise_for_status()
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     total = 0
+
     for chunk in response.iter_content(chunk_size=8192):
         if not chunk:
             continue
@@ -29,8 +41,8 @@ def download_temp_file(url: str, suffix: str):
             remove_temp_file(tmp.name)
             raise ValueError("Downloaded file exceeds size limit.")
         tmp.write(chunk)
-    tmp.close()
 
+    tmp.close()
     return tmp.name
 
 
