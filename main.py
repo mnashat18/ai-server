@@ -1,3 +1,5 @@
+import subprocess
+import shutil
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import os
@@ -107,7 +109,19 @@ class BaselineResponse(BaseModel):
 # Helpers
 # =========================
 
-def _download_directus_asset(asset_id: str, suffix: str) -> str:
+def _convert_audio_to_wav(path: str) -> str:
+    if shutil.which("ffmpeg") is None:
+        raise HTTPException(status_code=500, detail="ffmpeg not installed")
+    fd, out = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    cmd = [
+        "ffmpeg", "-y", "-i", path,
+        "-ac", "1", "-ar", "16000", out
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return out
+
+    def _download_directus_asset(asset_id: str, suffix: str) -> str:
     if not DIRECTUS_URL or not DIRECTUS_TOKEN:
         raise HTTPException(
             status_code=500,
@@ -199,9 +213,17 @@ def _analyze_media(media: Media):
     if is_temp:
         temp_files.append(image_path)
 
-    audio_path, is_temp = _resolve_media_input(media.audio, ".wav")
-    if is_temp:
-        temp_files.append(audio_path)
+    audio_path, is_temp = _resolve_media_input(media.audio, ".bin")
+if is_temp:
+    temp_files.append(audio_path)
+
+if audio_path:
+    try:
+        converted = _convert_audio_to_wav(audio_path)
+        temp_files.append(converted)
+        audio_path = converted
+    except Exception:
+        return {"camera": camera, "video": video, "voice": {"score": None, "details": {"status": "load_failed"}}}, temp_files
 
     video_path, is_temp = _resolve_media_input(media.video, ".mp4")
     if is_temp:
@@ -306,3 +328,4 @@ def process_scan(req: ScanRequest):
     finally:
         for path in temp_files:
             remove_temp_file(path)
+
