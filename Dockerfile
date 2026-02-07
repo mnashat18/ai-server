@@ -1,7 +1,8 @@
 FROM python:3.10-slim
 
-# Install system dependencies required for OpenCV
+# System deps + ffmpeg
 RUN apt-get update && apt-get install -y \
+    ffmpeg \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
