@@ -209,16 +209,20 @@ def _analyze_media(media: Media):
         temp_files.append(image_path)
 
     audio_path, is_temp = _resolve_media_input(media.audio, ".bin")
-if is_temp:
-    temp_files.append(audio_path)
+    if is_temp:
+        temp_files.append(audio_path)
 
-if audio_path:
-    try:
-        converted = _convert_audio_to_wav(audio_path)
-        temp_files.append(converted)
-        audio_path = converted
-    except Exception:
-        return {"camera": camera, "video": video, "voice": {"score": None, "details": {"status": "load_failed"}}}, temp_files
+    if audio_path:
+        try:
+            converted = _convert_audio_to_wav(audio_path)
+            temp_files.append(converted)
+            audio_path = converted
+        except Exception:
+            return {
+                "camera": {"score": None, "details": {"status": "load_failed"}},
+                "video": {"score": None, "details": {"status": "load_failed"}},
+                "voice": {"score": None, "details": {"status": "load_failed"}},
+            }, temp_files
 
     video_path, is_temp = _resolve_media_input(media.video, ".mp4")
     if is_temp:
@@ -229,7 +233,6 @@ if audio_path:
     voice = _safe_analyze(analyze_audio, audio_path)
 
     return {"camera": camera, "video": video, "voice": voice}, temp_files
-
 
 # =========================
 # Routes
