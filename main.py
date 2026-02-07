@@ -104,7 +104,6 @@ class BaselineResponse(BaseModel):
     baseline: dict
     model_version: str
 
-
 # =========================
 # Helpers
 # =========================
@@ -114,14 +113,11 @@ def _convert_audio_to_wav(path: str) -> str:
         raise HTTPException(status_code=500, detail="ffmpeg not installed")
     fd, out = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
-    cmd = [
-        "ffmpeg", "-y", "-i", path,
-        "-ac", "1", "-ar", "16000", out
-    ]
+    cmd = ["ffmpeg", "-y", "-i", path, "-ac", "1", "-ar", "16000", out]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     return out
 
-    def _download_directus_asset(asset_id: str, suffix: str) -> str:
+def _download_directus_asset(asset_id: str, suffix: str) -> str:
     if not DIRECTUS_URL or not DIRECTUS_TOKEN:
         raise HTTPException(
             status_code=500,
@@ -129,9 +125,7 @@ def _convert_audio_to_wav(path: str) -> str:
         )
 
     url = f"{DIRECTUS_URL}/assets/{asset_id}"
-    headers = {
-        "Authorization": f"Bearer {DIRECTUS_TOKEN}"
-    }
+    headers = {"Authorization": f"Bearer {DIRECTUS_TOKEN}"}
 
     try:
         r = requests.get(url, headers=headers, timeout=30)
@@ -147,6 +141,7 @@ def _convert_audio_to_wav(path: str) -> str:
         f.write(r.content)
 
     return path
+
 
 
 def _resolve_media_input(value: str | None, suffix: str):
