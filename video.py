@@ -8,6 +8,31 @@ from config import MIN_SWAY_STD, VIDEO_FRAME_STRIDE, VIDEO_MAX_FRAMES
 mp_face = mp.solutions.face_mesh.FaceMesh(static_image_mode=False)
 LOW_LIGHT_THRESHOLD = 70.0
 BLUR_THRESHOLD = 40.0
+QUALITY_LOW_LIGHT_RATE = 0.6
+QUALITY_BLUR_RATE = 0.6
+NEUTRAL_SCORE = 0.5
+
+
+def _blend_with_neutral(score: float, quality_weight: float) -> float:
+    weight = max(0.0, min(quality_weight, 1.0))
+    return NEUTRAL_SCORE + (score - NEUTRAL_SCORE) * weight
+
+
+def _quality_info(sampled: int, low_light_frames: int, blurry_frames: int):
+    if sampled <= 0:
+        return 0.0, ["no_frames"], 0.0, 0.0
+    low_light_rate = low_light_frames / sampled
+    blurry_rate = blurry_frames / sampled
+    flags = []
+    if low_light_rate >= QUALITY_LOW_LIGHT_RATE:
+        flags.append("low_light")
+    if blurry_rate >= QUALITY_BLUR_RATE:
+        flags.append("blurry")
+    if flags:
+        quality_weight = max(0.0, min(1.0 - max(low_light_rate, blurry_rate), 1.0))
+    else:
+        quality_weight = 1.0
+    return quality_weight, flags, low_light_rate, blurry_rate
 
 
 def _apply_gamma(bgr, gamma: float):
@@ -90,9 +115,17 @@ def analyze_video(video_path: str) -> dict:
     finally:
         cap.release()
 
+    quality_weight, quality_flags, low_light_rate, blurry_rate = _quality_info(
+        sampled,
+        low_light_frames,
+        blurry_frames,
+    )
+
     if len(sway) < 5:
+        raw_score = 0.4
+        score = _blend_with_neutral(raw_score, quality_weight) if quality_flags else raw_score
         return {
-            "score": 0.4,
+            "score": round(score, 2),
             "details": {
                 "frames": frames,
                 "sampled_frames": sampled,
@@ -101,22 +134,37 @@ def analyze_video(video_path: str) -> dict:
                 "avg_blur_var": round(float(np.mean(blur_vals)), 2) if blur_vals else 0.0,
                 "low_light_frames": low_light_frames,
                 "blurry_frames": blurry_frames,
+                "low_light_rate": round(low_light_rate, 3),
+                "blurry_rate": round(blurry_rate, 3),
+                "quality_flags": quality_flags,
+                "quality_weight": round(quality_weight, 3),
+                "raw_score": round(raw_score, 2),
             },
         }
 
     instability = np.std(sway) * 3
     if instability < MIN_SWAY_STD:
+        raw_score = 0.3
+        score = _blend_with_neutral(raw_score, quality_weight) if quality_flags else raw_score
         return {
-            "score": 0.3,
+            "score": round(score, 2),
             "details": {
                 "frames": frames,
                 "sampled_frames": sampled,
                 "face_frames": face_frames,
                 "sway_std": float(np.std(sway)),
+                "low_light_frames": low_light_frames,
+                "blurry_frames": blurry_frames,
+                "low_light_rate": round(low_light_rate, 3),
+                "blurry_rate": round(blurry_rate, 3),
+                "quality_flags": quality_flags,
+                "quality_weight": round(quality_weight, 3),
+                "raw_score": round(raw_score, 2),
             },
         }
 
-    score = 1 - min(instability, 1)
+    raw_score = 1 - min(instability, 1)
+    score = _blend_with_neutral(raw_score, quality_weight) if quality_flags else raw_score
     face_rate = (face_frames / sampled) if sampled else 0.0
     return {
         "score": round(max(0, score), 2),
@@ -130,5 +178,10 @@ def analyze_video(video_path: str) -> dict:
             "avg_blur_var": round(float(np.mean(blur_vals)), 2) if blur_vals else 0.0,
             "low_light_frames": low_light_frames,
             "blurry_frames": blurry_frames,
+            "low_light_rate": round(low_light_rate, 3),
+            "blurry_rate": round(blurry_rate, 3),
+            "quality_flags": quality_flags,
+            "quality_weight": round(quality_weight, 3),
+            "raw_score": round(raw_score, 2),
         },
     }
