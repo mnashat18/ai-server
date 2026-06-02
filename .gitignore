@@ -1,5 +1,9 @@
-__pycache__/
-*.pyc
-.env
 .venv
 .vscode/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+data/baselines.json
+models/*.pt
