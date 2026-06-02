@@ -11,11 +11,22 @@ BLUR_THRESHOLD = 40.0
 QUALITY_LOW_LIGHT_RATE = 0.6
 QUALITY_BLUR_RATE = 0.6
 NEUTRAL_SCORE = 0.5
+MAX_FRAME_SIDE = 640
 
 
 def _blend_with_neutral(score: float, quality_weight: float) -> float:
     weight = max(0.0, min(quality_weight, 1.0))
     return NEUTRAL_SCORE + (score - NEUTRAL_SCORE) * weight
+
+
+def _resize_for_speed(bgr, max_side: int = MAX_FRAME_SIDE):
+    h, w = bgr.shape[:2]
+    if max(h, w) <= max_side:
+        return bgr
+    scale = max_side / float(max(h, w))
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 def _quality_info(sampled: int, low_light_frames: int, blurry_frames: int):
@@ -80,19 +91,15 @@ def analyze_video(video_path: str) -> dict:
     max_frames = VIDEO_MAX_FRAMES
 
     try:
-        while cap.isOpened():
+        while cap.isOpened() and frames < max_frames:
             ret, frame = cap.read()
             if not ret:
                 break
 
             frames += 1
-            if frames % VIDEO_FRAME_STRIDE != 0:
-                continue
-            if frames > max_frames:
-                break
-
             sampled += 1
             try:
+                frame = _resize_for_speed(frame)
                 enhanced, mean_v = _enhance_bgr(frame)
                 gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
                 blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
@@ -112,6 +119,14 @@ def analyze_video(video_path: str) -> dict:
                 face_frames += 1
                 nose = res.multi_face_landmarks[0].landmark[1]
                 sway.append(nose.x)
+
+            if VIDEO_FRAME_STRIDE > 1:
+                for _ in range(VIDEO_FRAME_STRIDE - 1):
+                    if frames >= max_frames:
+                        break
+                    if not cap.grab():
+                        break
+                    frames += 1
     finally:
         cap.release()
 
