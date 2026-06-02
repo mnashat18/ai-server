@@ -9,3 +9,4 @@ torch
 openai-whisper
 pydantic
 requests
+httpx
