@@ -31,7 +31,7 @@ class DirectusClient:
     ):
         self.base_url = (base_url or os.getenv("DIRECTUS_URL", "")).rstrip("/")
         self.token = token or os.getenv("DIRECTUS_TOKEN")
-        self.timeout = timeout
+        self.timeout = int(os.getenv("DIRECTUS_TIMEOUT", timeout))
 
     def is_configured(self) -> bool:
         return bool(self.base_url and self.token)
