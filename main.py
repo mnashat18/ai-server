@@ -5,9 +5,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+import traceback
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 import requests
 
@@ -20,7 +21,7 @@ from ml.features import features_from_signals, vector_from_features
 from ml.runtime import MLRuntime
 from quality import assess_quality
 from scoring import compute_result
-from utils import download_temp_file, is_url, remove_temp_file
+from utils import directus_auth_headers, download_temp_file, is_url, remove_temp_file
 from video import analyze_video
 from vision import analyze_face
 
@@ -71,6 +72,12 @@ class BaselineRequest(BaseModel):
 
 
 class ProcessResponse(BaseModel):
+    ok: bool = True
+    status: str
+    scan_id: str
+
+
+class ScanResultResponse(BaseModel):
     status: str
     retake_required: bool = False
     failure_reason: str | None = None
@@ -132,8 +139,9 @@ def _download_directus_asset(asset_id: str, suffix: str) -> str:
         raise HTTPException(status_code=500, detail="Directus credentials are not configured")
 
     url = f"{directus.base_url}/assets/{asset_id}"
-    headers = directus._headers()
-    response = requests.get(url, headers=headers, timeout=30, stream=True)
+    headers = directus_auth_headers(url)
+    logger.info("directus_asset_download_start asset_id=%s url=%s", asset_id, url)
+    response = requests.get(url, headers=headers, timeout=(10, 30), stream=True)
     response.raise_for_status()
 
     fd, path = tempfile.mkstemp(suffix=suffix)
@@ -147,34 +155,47 @@ def _download_directus_asset(asset_id: str, suffix: str) -> str:
                 remove_temp_file(path)
                 raise HTTPException(status_code=400, detail=f"Downloaded file too large: {asset_id}")
             handle.write(chunk)
+    logger.info("directus_asset_download_done asset_id=%s bytes=%s path=%s", asset_id, total, path)
     return path
 
 
-def _resolve_media_input(value: str | None, suffix: str):
+def _resolve_media_input(value: str | None, suffix: str, media_kind: str):
     if not value:
+        logger.info("media_resolve_skipped media_kind=%s reason=missing", media_kind)
         return None, False
     if os.path.exists(value):
+        logger.info("media_resolve_local media_kind=%s path=%s", media_kind, value)
         return value, False
     if is_url(value):
         try:
-            return download_temp_file(value, suffix), True
+            logger.info("media_download_start media_kind=%s url=%s", media_kind, value)
+            path = download_temp_file(value, suffix)
+            logger.info("media_download_done media_kind=%s path=%s", media_kind, path)
+            return path, True
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to download media: {value}") from exc
     try:
-        return _download_directus_asset(value, suffix), True
+        logger.info("media_directus_asset_start media_kind=%s asset_id=%s", media_kind, value)
+        path = _download_directus_asset(value, suffix)
+        logger.info("media_directus_asset_done media_kind=%s path=%s", media_kind, path)
+        return path, True
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to resolve media: {value}") from exc
 
 
-def _safe_analyze(fn, path):
+def _safe_analyze(fn, path, label: str):
     if not path:
+        logger.info("analyzer_skipped analyzer=%s reason=missing_input", label)
         return {"score": None, "details": {"status": "missing"}}
     try:
         result = fn(path)
-    except Exception:
+    except Exception as exc:
+        logger.exception("analyzer_error analyzer=%s path=%s error=%s", label, path, exc)
         return {"score": None, "details": {"status": "error"}}
     if isinstance(result, dict) and "score" in result:
+        logger.info("analyzer_result analyzer=%s score=%s details=%s", label, result.get("score"), result.get("details"))
         return result
+    logger.info("analyzer_result analyzer=%s score=%s", label, result)
     return {"score": result, "details": {}}
 
 
@@ -223,24 +244,55 @@ def _scan_timestamp(scan_context: dict) -> str:
     )
 
 
+def _log_step(scan_id: str, step: str, **details: Any) -> None:
+    if details:
+        logger.info("scan_id=%s step=%s details=%s", scan_id, step, details)
+        return
+    logger.info("scan_id=%s step=%s", scan_id, step)
+
+
+def _safe_string(value: Any, max_len: int = 500) -> str:
+    text = str(value)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _mark_scan_failed(scan_id: str, reason: str) -> dict[str, str]:
+    payload = {
+        "status": "failed",
+        "failure_reason": _safe_string(reason, max_len=255),
+        "completed_at": _utc_now(),
+    }
+    try:
+        directus.update_wellness_scan(scan_id, payload)
+        _log_step(scan_id, "directus_mark_failed_done", payload=payload)
+        return {"wellness_scan": "failed_updated"}
+    except Exception as exc:
+        logger.exception("scan_id=%s step=directus_mark_failed_error error=%s", scan_id, exc)
+        return {"wellness_scan": f"failed:{exc}"}
+
+
 def _analyze_media(media: Media):
     _ensure_media_present(media)
     temp_files = []
 
-    image_path, is_temp = _resolve_media_input(media.image, ".jpg")
+    image_path, is_temp = _resolve_media_input(media.image, ".jpg", "image")
     if is_temp:
         temp_files.append(image_path)
 
-    audio_path, is_temp = _resolve_media_input(media.audio, ".bin")
+    audio_path, is_temp = _resolve_media_input(media.audio, ".bin", "audio")
     if is_temp:
         temp_files.append(audio_path)
 
     if audio_path:
         try:
             if _should_convert_audio(audio_path):
+                logger.info("audio_convert_start path=%s", audio_path)
                 converted = _convert_audio_to_wav(audio_path)
                 temp_files.append(converted)
                 audio_path = converted
+                logger.info("audio_convert_done path=%s", audio_path)
         except Exception:
             return {
                 "camera": {"score": None, "details": {"status": "load_failed"}},
@@ -248,13 +300,15 @@ def _analyze_media(media: Media):
                 "voice": {"score": None, "details": {"status": "load_failed"}},
             }, temp_files
 
-    video_path, is_temp = _resolve_media_input(media.video, ".mp4")
+    video_path, is_temp = _resolve_media_input(media.video, ".mp4", "video")
     if is_temp:
         temp_files.append(video_path)
 
-    camera = _safe_analyze(analyze_face, image_path)
-    video = _safe_analyze(analyze_video, video_path)
-    voice = _safe_analyze(analyze_audio, audio_path)
+    logger.info("analyzers_start image=%s audio=%s video=%s", bool(image_path), bool(audio_path), bool(video_path))
+    camera = _safe_analyze(analyze_face, image_path, "image")
+    video = _safe_analyze(analyze_video, video_path, "video")
+    voice = _safe_analyze(analyze_audio, audio_path, "audio")
+    logger.info("analyzers_done camera_score=%s video_score=%s voice_score=%s", camera.get("score"), video.get("score"), voice.get("score"))
 
     return {"camera": camera, "video": video, "voice": voice}, temp_files
 
@@ -265,7 +319,7 @@ def _resolve_scan_context(scan_id: str) -> dict:
     try:
         return directus.get_scan_context(scan_id)
     except Exception as exc:
-        logger.warning("scan_context_failed scan_id=%s error=%s", scan_id, exc)
+        logger.exception("scan_context_failed scan_id=%s error=%s", scan_id, exc)
         raise HTTPException(status_code=404, detail="wellness_scans record not found") from exc
 
 
@@ -290,7 +344,9 @@ def _baseline_for_member(member_id: str | None, business_profile_id: str | None)
 
 def _quality_failure_response(scan_id: str, quality_result: dict, diagnostics: dict, writeback_status: dict) -> dict:
     return {
+        "ok": True,
         "status": "failed",
+        "scan_id": scan_id,
         "retake_required": True,
         "failure_reason": quality_result.get("failure_reason") or "low_quality_media",
         "readiness_score": None,
@@ -335,14 +391,10 @@ def _build_scan_result_payload(scan_id: str, result: dict, internal_analysis: di
 
 def _write_quality_failure(scan_id: str, quality_result: dict) -> dict:
     try:
-        directus.update_wellness_scan(
+        return _mark_scan_failed(
             scan_id,
-            {
-                "status": "failed",
-                "failure_reason": quality_result.get("failure_reason") or "low_quality_media",
-            },
+            quality_result.get("failure_reason") or "low_quality_media",
         )
-        return {"wellness_scan": "failed_updated"}
     except Exception as exc:
         logger.warning("writeback_failure_failed scan_id=%s error=%s", scan_id, exc)
         return {"wellness_scan": f"failed:{exc}"}
@@ -440,6 +492,221 @@ def _write_success(
     return status
 
 
+def _process_scan_sync(req: ScanRequest) -> ScanResultResponse:
+    _log_step(req.scan_id, "background_process_begin", request_id=req.request_id)
+    scan_context = _resolve_scan_context(req.scan_id)
+    _log_step(req.scan_id, "directus_scan_context_loaded", status=scan_context.get("status"))
+
+    media = _merge_media(req.media, scan_context)
+    task = _merge_task(req.task, scan_context)
+    identifiers = _identifier_payload(req, scan_context)
+    media_row = scan_context.get("scan_media")
+
+    try:
+        directus.update_wellness_scan(req.scan_id, {"status": "processing"})
+        _log_step(req.scan_id, "directus_processing_status_updated")
+    except Exception as exc:
+        logger.exception("scan_id=%s step=directus_processing_status_update_error error=%s", req.scan_id, exc)
+
+    logger.info(
+        "process_scan_started scan_id=%s media_row_found=%s video_file_id=%s audio_file_id=%s member_id=%s business_profile_id=%s",
+        req.scan_id,
+        media_row is not None,
+        _relation_id((media_row or {}).get("video_file")),
+        _relation_id((media_row or {}).get("audio_file")),
+        identifiers.get("member_id"),
+        identifiers.get("business_profile_id"),
+    )
+
+    temp_files: list[str] = []
+    try:
+        _log_step(req.scan_id, "media_analysis_start", media=_model_to_dict(media))
+        signals, temp_files = _analyze_media(media)
+        _log_step(req.scan_id, "media_analysis_done", temp_files=len(temp_files))
+    except HTTPException as exc:
+        logger.exception("scan_id=%s step=media_analysis_http_error error=%s", req.scan_id, exc.detail)
+        diagnostics = {
+            "scan_id": req.scan_id,
+            "media_row_found": media_row is not None,
+            "video_file_id": _relation_id((media_row or {}).get("video_file")),
+            "audio_file_id": _relation_id((media_row or {}).get("audio_file")),
+            "member": identifiers.get("member_id"),
+            "business_profile": identifiers.get("business_profile_id"),
+            "quality_status": "failed",
+        }
+        writeback_status = _write_quality_failure(
+            req.scan_id,
+            {
+                "status": "failed",
+                "failure_reason": "low_quality_media",
+                "suggested_action": "Please retake the scan in better lighting with clear face, voice, and reaction input.",
+            },
+        )
+        return ScanResultResponse(**_quality_failure_response(
+            req.scan_id,
+            {
+                "status": "failed",
+                "failure_reason": "low_quality_media",
+                "suggested_action": "Please retake the scan in better lighting with clear face, voice, and reaction input.",
+            },
+            diagnostics,
+            writeback_status,
+        ))
+
+    try:
+        _log_step(req.scan_id, "quality_assessment_start")
+        quality_result = assess_quality(signals, task)
+        _log_step(req.scan_id, "quality_assessment_done", quality_status=quality_result.get("status"))
+
+        _log_step(req.scan_id, "baseline_fetch_start")
+        baseline = _baseline_for_member(identifiers.get("member_id"), identifiers.get("business_profile_id"))
+        baseline_status = baseline_status_payload(baseline)
+        baseline_used = baseline_ready_for_scoring(baseline)
+        _log_step(req.scan_id, "baseline_fetch_done", baseline_used=baseline_used)
+
+        _log_step(req.scan_id, "feature_extraction_start")
+        feature_map, _ = features_from_signals(signals, task=task)
+        feature_vector = vector_from_features(feature_map)
+        _log_step(req.scan_id, "feature_extraction_done", feature_count=len(feature_vector))
+
+        _log_step(req.scan_id, "ml_predict_start", ml_loaded=ml_runtime.is_loaded())
+        ml_result = ml_runtime.predict(feature_vector) if ml_runtime.is_loaded() else None
+        _log_step(req.scan_id, "ml_predict_done", ml_result=ml_result)
+
+        diagnostics = {
+            "scan_id": req.scan_id,
+            "media_row_found": media_row is not None,
+            "video_file_id": _relation_id((media_row or {}).get("video_file")),
+            "audio_file_id": _relation_id((media_row or {}).get("audio_file")),
+            "member": identifiers.get("member_id"),
+            "business_profile": identifiers.get("business_profile_id"),
+            "baseline_scan_count": int((baseline or {}).get("scan_count", 0)),
+            "quality_status": quality_result["status"],
+            "signals": signals,
+            "baseline_status": baseline_status,
+            "ml": ml_result,
+        }
+
+        logger.info(
+            "quality_result scan_id=%s member_id=%s baseline_scan_count=%s quality_status=%s",
+            req.scan_id,
+            identifiers.get("member_id"),
+            diagnostics["baseline_scan_count"],
+            quality_result["status"],
+        )
+
+        if not quality_result["passed"]:
+            _log_step(req.scan_id, "quality_failed")
+            writeback_status = _write_quality_failure(req.scan_id, quality_result)
+            return ScanResultResponse(**_quality_failure_response(req.scan_id, quality_result, diagnostics, writeback_status))
+
+        _log_step(req.scan_id, "result_compute_start")
+        result = compute_result(
+            camera_score=signals["camera"].get("score"),
+            video_score=signals["video"].get("score"),
+            voice_score=signals["voice"].get("score"),
+            task=task,
+            previous_confidence=req.previous_confidence,
+            baseline=baseline,
+            baseline_used=baseline_used,
+            quality=quality_result,
+            ml_result=ml_result,
+        )
+        _log_step(req.scan_id, "result_compute_done", risk_level=result.get("risk_level"), confidence=result.get("confidence"))
+
+        if identifiers.get("member_id") and identifiers.get("business_profile_id"):
+            try:
+                _log_step(req.scan_id, "baseline_write_start")
+                baseline_payload = baseline_signal_payload(
+                    baseline,
+                    face_score=result["face_metrics"]["face_score"],
+                    voice_score=result["voice_metrics"]["voice_score"],
+                    reaction_score=result["reaction_metrics"]["reaction_score"],
+                    scanned_at=_scan_timestamp(scan_context),
+                )
+                baseline_payload["member"] = identifiers["member_id"]
+                baseline_payload["business_profile"] = identifiers["business_profile_id"]
+                updated_baseline = directus.upsert_employee_baseline(
+                    _relation_id((baseline or {}).get("id")),
+                    baseline_payload,
+                )
+                diagnostics["baseline_status_after"] = baseline_status_payload(updated_baseline)
+                _log_step(req.scan_id, "baseline_write_done")
+            except Exception as exc:
+                logger.exception(
+                    "scan_id=%s step=baseline_write_error member_id=%s error=%s",
+                    req.scan_id,
+                    identifiers.get("member_id"),
+                    exc,
+                )
+                diagnostics["baseline_write_error"] = str(exc)
+
+        internal_analysis = {
+            "quality": quality_result,
+            "baseline_status_before": baseline_status,
+            "ml": ml_result,
+            "signals": signals,
+            "scan_context": {
+                "scan_id": req.scan_id,
+                "member": identifiers.get("member_id"),
+                "business_profile": identifiers.get("business_profile_id"),
+                "department": identifiers.get("department_id"),
+                "user": identifiers.get("user_id"),
+                "media_row_found": media_row is not None,
+                "video_file_id": _relation_id((media_row or {}).get("video_file")),
+                "audio_file_id": _relation_id((media_row or {}).get("audio_file")),
+            },
+        }
+
+        _log_step(req.scan_id, "directus_writeback_start")
+        writeback_status = _write_success(
+            scan_id=req.scan_id,
+            request_id=req.request_id,
+            scan_context=scan_context,
+            identifiers=identifiers,
+            result=result,
+            internal_analysis=internal_analysis,
+        )
+        _log_step(req.scan_id, "directus_writeback_done", writeback_status=writeback_status)
+
+        logger.info(
+            "process_scan_completed scan_id=%s member_id=%s baseline_scan_count=%s quality_status=%s risk_level=%s confidence=%.3f result_writeback=%s",
+            req.scan_id,
+            identifiers.get("member_id"),
+            diagnostics["baseline_scan_count"],
+            quality_result["status"],
+            result["risk_level"],
+            float(result["confidence"]),
+            writeback_status.get("scan_result"),
+        )
+
+        response = dict(result)
+        response["ok"] = True
+        response["scan_id"] = req.scan_id
+        response["diagnostics"] = diagnostics
+        response["writeback_status"] = writeback_status
+        return ScanResultResponse(**response)
+    finally:
+        for path in temp_files:
+            remove_temp_file(path)
+        _log_step(req.scan_id, "temp_files_cleanup_done", temp_files=len(temp_files))
+
+
+def process_scan_background(req: ScanRequest) -> None:
+    try:
+        result = _process_scan_sync(req)
+        _log_step(
+            req.scan_id,
+            "background_process_done",
+            final_status=result.status,
+            failure_reason=result.failure_reason,
+        )
+    except Exception as exc:
+        logger.error("BACKGROUND ERROR scan_id=%s error=%s", req.scan_id, exc)
+        logger.error(traceback.format_exc())
+        _mark_scan_failed(req.scan_id, f"processing_exception: {exc}")
+
+
 @app.get("/health")
 def health():
     return {
@@ -527,169 +794,12 @@ def set_baseline(req: BaselineRequest):
             remove_temp_file(path)
 
 
-@app.post("/process", response_model=ProcessResponse)
-def process_scan(req: ScanRequest):
-    scan_context = _resolve_scan_context(req.scan_id)
-    media = _merge_media(req.media, scan_context)
-    task = _merge_task(req.task, scan_context)
-    identifiers = _identifier_payload(req, scan_context)
-    media_row = scan_context.get("scan_media")
-
-    try:
-        directus.update_wellness_scan(req.scan_id, {"status": "processing"})
-    except Exception as exc:
-        logger.warning("wellness_scan_processing_update_failed scan_id=%s error=%s", req.scan_id, exc)
-
-    logger.info(
-        "process_scan_started scan_id=%s media_row_found=%s video_file_id=%s audio_file_id=%s member_id=%s business_profile_id=%s",
-        req.scan_id,
-        media_row is not None,
-        _relation_id((media_row or {}).get("video_file")),
-        _relation_id((media_row or {}).get("audio_file")),
-        identifiers.get("member_id"),
-        identifiers.get("business_profile_id"),
-    )
-
-    try:
-        signals, temp_files = _analyze_media(media)
-    except HTTPException:
-        diagnostics = {
-            "scan_id": req.scan_id,
-            "media_row_found": media_row is not None,
-            "video_file_id": _relation_id((media_row or {}).get("video_file")),
-            "audio_file_id": _relation_id((media_row or {}).get("audio_file")),
-            "member": identifiers.get("member_id"),
-            "business_profile": identifiers.get("business_profile_id"),
-            "quality_status": "failed",
-        }
-        writeback_status = _write_quality_failure(
-            req.scan_id,
-            {
-                "status": "failed",
-                "failure_reason": "low_quality_media",
-                "suggested_action": "Please retake the scan in better lighting with clear face, voice, and reaction input.",
-            },
-        )
-        return _quality_failure_response(
-            req.scan_id,
-            {
-                "status": "failed",
-                "failure_reason": "low_quality_media",
-                "suggested_action": "Please retake the scan in better lighting with clear face, voice, and reaction input.",
-            },
-            diagnostics,
-            writeback_status,
-        )
-
-    try:
-        quality_result = assess_quality(signals, task)
-        baseline = _baseline_for_member(identifiers.get("member_id"), identifiers.get("business_profile_id"))
-        baseline_status = baseline_status_payload(baseline)
-        baseline_used = baseline_ready_for_scoring(baseline)
-
-        feature_map, _ = features_from_signals(signals, task=task)
-        feature_vector = vector_from_features(feature_map)
-        ml_result = ml_runtime.predict(feature_vector) if ml_runtime.is_loaded() else None
-
-        diagnostics = {
-            "scan_id": req.scan_id,
-            "media_row_found": media_row is not None,
-            "video_file_id": _relation_id((media_row or {}).get("video_file")),
-            "audio_file_id": _relation_id((media_row or {}).get("audio_file")),
-            "member": identifiers.get("member_id"),
-            "business_profile": identifiers.get("business_profile_id"),
-            "baseline_scan_count": int((baseline or {}).get("scan_count", 0)),
-            "quality_status": quality_result["status"],
-            "signals": signals,
-            "baseline_status": baseline_status,
-            "ml": ml_result,
-        }
-
-        logger.info(
-            "quality_result scan_id=%s member_id=%s baseline_scan_count=%s quality_status=%s",
-            req.scan_id,
-            identifiers.get("member_id"),
-            diagnostics["baseline_scan_count"],
-            quality_result["status"],
-        )
-
-        if not quality_result["passed"]:
-            writeback_status = _write_quality_failure(req.scan_id, quality_result)
-            return _quality_failure_response(req.scan_id, quality_result, diagnostics, writeback_status)
-
-        result = compute_result(
-            camera_score=signals["camera"].get("score"),
-            video_score=signals["video"].get("score"),
-            voice_score=signals["voice"].get("score"),
-            task=task,
-            previous_confidence=req.previous_confidence,
-            baseline=baseline,
-            baseline_used=baseline_used,
-            quality=quality_result,
-            ml_result=ml_result,
-        )
-
-        if identifiers.get("member_id") and identifiers.get("business_profile_id"):
-            try:
-                baseline_payload = baseline_signal_payload(
-                    baseline,
-                    face_score=result["face_metrics"]["face_score"],
-                    voice_score=result["voice_metrics"]["voice_score"],
-                    reaction_score=result["reaction_metrics"]["reaction_score"],
-                    scanned_at=_scan_timestamp(scan_context),
-                )
-                baseline_payload["member"] = identifiers["member_id"]
-                baseline_payload["business_profile"] = identifiers["business_profile_id"]
-                updated_baseline = directus.upsert_employee_baseline(
-                    _relation_id((baseline or {}).get("id")),
-                    baseline_payload,
-                )
-                diagnostics["baseline_status_after"] = baseline_status_payload(updated_baseline)
-            except Exception as exc:
-                logger.warning("baseline_write_failed scan_id=%s member_id=%s error=%s", req.scan_id, identifiers.get("member_id"), exc)
-                diagnostics["baseline_write_error"] = str(exc)
-
-        internal_analysis = {
-            "quality": quality_result,
-            "baseline_status_before": baseline_status,
-            "ml": ml_result,
-            "signals": signals,
-            "scan_context": {
-                "scan_id": req.scan_id,
-                "member": identifiers.get("member_id"),
-                "business_profile": identifiers.get("business_profile_id"),
-                "department": identifiers.get("department_id"),
-                "user": identifiers.get("user_id"),
-                "media_row_found": media_row is not None,
-                "video_file_id": _relation_id((media_row or {}).get("video_file")),
-                "audio_file_id": _relation_id((media_row or {}).get("audio_file")),
-            },
-        }
-
-        writeback_status = _write_success(
-            scan_id=req.scan_id,
-            request_id=req.request_id,
-            scan_context=scan_context,
-            identifiers=identifiers,
-            result=result,
-            internal_analysis=internal_analysis,
-        )
-
-        logger.info(
-            "process_scan_completed scan_id=%s member_id=%s baseline_scan_count=%s quality_status=%s risk_level=%s confidence=%.3f result_writeback=%s",
-            req.scan_id,
-            identifiers.get("member_id"),
-            diagnostics["baseline_scan_count"],
-            quality_result["status"],
-            result["risk_level"],
-            float(result["confidence"]),
-            writeback_status.get("scan_result"),
-        )
-
-        response = dict(result)
-        response["diagnostics"] = diagnostics
-        response["writeback_status"] = writeback_status
-        return response
-    finally:
-        for path in temp_files:
-            remove_temp_file(path)
+@app.post("/process", response_model=ProcessResponse, status_code=202)
+def process_scan(req: ScanRequest, background_tasks: BackgroundTasks):
+    logger.info("RECEIVED /process scan_id=%s", req.scan_id)
+    background_tasks.add_task(process_scan_background, req)
+    return {
+        "ok": True,
+        "status": "accepted",
+        "scan_id": req.scan_id,
+    }

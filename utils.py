@@ -12,17 +12,23 @@ def is_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-def download_temp_file(url: str, suffix: str):
-    headers = {}
+def directus_auth_headers(url: str | None = None) -> dict[str, str]:
+    headers: dict[str, str] = {}
 
     token = os.getenv("DIRECTUS_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
+    return headers
+
+
+def download_temp_file(url: str, suffix: str, timeout: tuple[int, int] = (10, 30)):
+    headers = directus_auth_headers(url)
+
     response = requests.get(
         url,
         headers=headers,
-        timeout=15,
+        timeout=timeout,
         stream=True,
         allow_redirects=True,
     )
