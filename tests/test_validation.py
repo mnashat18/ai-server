@@ -38,6 +38,7 @@ if "ml.runtime" not in sys.modules:
         def __init__(self, model_path=None):
             self.model_path = model_path or "models/latest.pt"
             self.error = None
+            self.require_local_model = False
 
         def load(self):
             return True
@@ -45,8 +46,11 @@ if "ml.runtime" not in sys.modules:
         def is_loaded(self):
             return True
 
+        def local_model_required(self):
+            return self.require_local_model
+
         def predict(self, features):
-            return {"confidence": 0.8, "label": "Stable", "model_version": "1.2.0"}
+            return {"confidence": 0.8, "label": "Stable", "model_version": "Conntinuity Intelligence Engine v1.2"}
 
     fake_runtime.MLRuntime = _FakeMLRuntime
     sys.modules["ml.runtime"] = fake_runtime
@@ -267,6 +271,87 @@ class ValidationTests(unittest.TestCase):
 
 
 class MainPayloadTests(unittest.TestCase):
+    def test_health_uses_configured_model_version_and_optional_local_model(self):
+        with patch.object(main, "MODEL_VERSION", "Conntinuity Intelligence Engine v1.2"), patch.object(
+            main.ml_runtime,
+            "is_loaded",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "local_model_required",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "error",
+            None,
+            create=True,
+        ), patch.object(
+            main.ml_runtime,
+            "model_path",
+            "models/latest.pt",
+            create=True,
+        ), patch("main.os.path.exists", return_value=False), patch.object(
+            main.directus,
+            "is_configured",
+            return_value=True,
+        ):
+            health = main.health()
+
+        self.assertEqual(health["model_version"], "Conntinuity Intelligence Engine v1.2")
+        self.assertFalse(health["ml_loaded"])
+        self.assertIsNone(health["ml_error"])
+        self.assertFalse(health["model_file_exists"])
+        self.assertFalse(health["local_model_required"])
+        self.assertTrue(health["directus_configured"])
+
+    def test_process_does_not_fail_when_local_model_is_optional_and_missing(self):
+        scan_context = {
+            "status": "media_ready",
+            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
+            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
+            "task_metrics": {},
+        }
+        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value=scan_context["scan_media"],
+        ), patch.object(
+            main.ml_runtime,
+            "is_loaded",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "local_model_required",
+            return_value=False,
+        ), patch.object(
+            main,
+            "_resolve_media_input",
+            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+        ), patch.object(
+            main,
+            "_safe_analyze",
+            side_effect=[_video_result(), _image_result(), _audio_result()],
+        ), patch.object(
+            main,
+            "_transcribe_audio_file",
+            return_value="hello world",
+        ), patch.object(
+            main,
+            "_expected_phrase",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_baseline_for_member",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_write_success",
+            return_value={"scan_result": "created:1"},
+        ):
+            result = main._process_scan_sync("scan-123")
+
+        self.assertEqual(result["status"], "completed")
+
     def test_no_undefined_values_in_scan_results_payload(self):
         with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
             main.directus,

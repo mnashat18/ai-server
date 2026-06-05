@@ -215,6 +215,7 @@ def _model_health() -> dict[str, Any]:
         "ml_error": ml_runtime.error,
         "configured_model_path": model_path,
         "model_file_exists": bool(model_path and os.path.exists(model_path)),
+        "local_model_required": ml_runtime.local_model_required(),
         "directus_configured": directus.is_configured(),
         "validation": {
             "require_video": VALIDATION_POLICY.require_video,
@@ -647,7 +648,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
         return {"status": SCAN_STATUS_FAILED, **validation_result}
 
-    if not ml_runtime.is_loaded():
+    if ml_runtime.local_model_required() and not ml_runtime.is_loaded():
         validation_result = fail_validation(FAILURE_REASON_MODEL_NOT_LOADED)
         _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"])
         _log_step(scan_id, "directus_writeback_start")
