@@ -13,7 +13,16 @@ np.random.seed(SEED)
 if torch is not None:
     torch.manual_seed(SEED)
 
-MODEL_VERSION = "1.2.0"
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+MODEL_VERSION = os.getenv("MODEL_VERSION", "Conntinuity Intelligence Engine v1.2")
+REQUIRE_LOCAL_MODEL = _env_bool("REQUIRE_LOCAL_MODEL", False)
 
 LABELS = ["High Risk", "Elevated Fatigue", "Low Focus", "Stable"]
 LABEL_SCORES = [0.2, 0.45, 0.6, 0.85]

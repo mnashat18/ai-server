@@ -3,19 +3,22 @@ from datetime import datetime
 
 import numpy as np
 
-from config import LABELS, LABEL_SCORES, ML_MODEL_PATH, MODEL_VERSION
+from config import LABELS, LABEL_SCORES, ML_MODEL_PATH, MODEL_VERSION, REQUIRE_LOCAL_MODEL
 
 
 class MLRuntime:
     def __init__(self, model_path: str | None = None):
         self.model_path = model_path or ML_MODEL_PATH
+        self.require_local_model = REQUIRE_LOCAL_MODEL
         self.bundle = None
         self.loaded_at = None
         self.error = None
 
     def load(self) -> bool:
         if not self.model_path or not os.path.exists(self.model_path):
-            self.error = "model_path_missing"
+            self.bundle = None
+            self.loaded_at = None
+            self.error = "model_path_missing" if self.require_local_model else None
             return False
         try:
             from ml.model import load_bundle
@@ -31,6 +34,9 @@ class MLRuntime:
 
     def is_loaded(self) -> bool:
         return self.bundle is not None
+
+    def local_model_required(self) -> bool:
+        return bool(self.require_local_model)
 
     def predict(self, features: list[float]) -> dict | None:
         if not self.bundle:
