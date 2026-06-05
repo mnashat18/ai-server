@@ -4,7 +4,6 @@ from datetime import datetime
 import numpy as np
 
 from config import LABELS, LABEL_SCORES, ML_MODEL_PATH, MODEL_VERSION
-from ml.model import load_bundle, predict_proba
 
 
 class MLRuntime:
@@ -19,6 +18,8 @@ class MLRuntime:
             self.error = "model_path_missing"
             return False
         try:
+            from ml.model import load_bundle
+
             self.bundle = load_bundle(self.model_path)
             self.loaded_at = datetime.utcnow().isoformat() + "Z"
             self.error = None
@@ -34,6 +35,8 @@ class MLRuntime:
     def predict(self, features: list[float]) -> dict | None:
         if not self.bundle:
             return None
+        from ml.model import predict_proba
+
         probs = predict_proba(self.bundle, features)
         idx = int(np.argmax(probs))
         label_names = self.bundle.label_names or LABELS

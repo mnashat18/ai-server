@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import shutil
 import subprocess
@@ -9,10 +9,10 @@ import traceback
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import requests
 
-from audio import analyze_audio
 from baseline import baseline_ready_for_scoring, baseline_signal_payload, baseline_status_payload
 from config import MAX_DOWNLOAD_BYTES, MODEL_VERSION
 from directus_client import DirectusClient
@@ -21,23 +21,56 @@ from ml.features import features_from_signals, vector_from_features
 from ml.runtime import MLRuntime
 from quality import assess_quality
 from scoring import compute_result
-from utils import directus_auth_headers, download_temp_file, is_url, remove_temp_file
-from video import analyze_video
-from vision import analyze_face
+from utils import directus_auth_headers, download_temp_file, is_url, remove_temp_file, sanitize_payload, sanitize_text
+from validation import ValidationPolicy, fail_validation, failure_message, validate_scan_inputs
 
 
 app = FastAPI()
-
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
-
-
 logger = get_logger()
 ml_runtime = MLRuntime()
 ml_runtime.load()
 directus = DirectusClient()
+
+VALIDATION_POLICY = ValidationPolicy.from_env()
+
+SCAN_STATUS_PENDING = "pending"
+SCAN_STATUS_MEDIA_READY = "media_ready"
+SCAN_STATUS_PROCESSING = "processing"
+SCAN_STATUS_COMPLETED = "completed"
+SCAN_STATUS_FAILED = "failed"
+
+FAILURE_REASON_MISSING_MEDIA = "missing_media"
+FAILURE_REASON_VIDEO_MISSING = "video_missing"
+FAILURE_REASON_VIDEO_TOO_DARK = "video_too_dark"
+FAILURE_REASON_VIDEO_BLURRY = "video_blurry"
+FAILURE_REASON_VIDEO_TOO_SHORT = "video_too_short"
+FAILURE_REASON_UNSTABLE_VIDEO = "unstable_video"
+FAILURE_REASON_IMAGE_MISSING = "image_missing"
+FAILURE_REASON_IMAGE_TOO_DARK = "image_too_dark"
+FAILURE_REASON_IMAGE_BLURRY = "image_blurry"
+FAILURE_REASON_AUDIO_MISSING = "audio_missing"
+FAILURE_REASON_AUDIO_TOO_QUIET = "audio_too_quiet"
+FAILURE_REASON_AUDIO_TOO_NOISY = "audio_too_noisy"
+FAILURE_REASON_SPEECH_NOT_DETECTED = "speech_not_detected"
+FAILURE_REASON_AUDIO_TOO_SHORT = "audio_too_short"
+FAILURE_REASON_FACE_NOT_VISIBLE = "face_not_visible"
+FAILURE_REASON_PHRASE_MISMATCH = "phrase_mismatch"
+FAILURE_REASON_TRANSCRIPTION_FAILED = "transcription_failed"
+FAILURE_REASON_EXPECTED_PHRASE_MISSING = "expected_phrase_missing"
+FAILURE_REASON_LOW_QUALITY_MEDIA = "low_quality_media"
+FAILURE_REASON_MODEL_NOT_LOADED = "model_not_loaded"
+FAILURE_REASON_DIRECTUS_DOWNLOAD_FAILED = "directus_download_failed"
+FAILURE_REASON_ANALYSIS_EXCEPTION = "analysis_exception"
+FAILURE_REASON_WRITEBACK_FAILED = "writeback_failed"
+
+OPTIONAL_SCAN_RESULT_FIELDS = [
+    "analysis_metadata",
+    "media_quality",
+    "warnings",
+    "modality_scores",
+    "fusion_details",
+    "internal_analysis",
+]
 
 
 class Media(BaseModel):
@@ -53,15 +86,10 @@ class Task(BaseModel):
 
 
 class ScanRequest(BaseModel):
-    scan_id: str
-    request_id: str | None = None
-    media: Media | None = None
-    task: Task | None = None
-    previous_confidence: float | None = None
-    subject_id: str | None = None
-    member_id: str | None = None
-    business_profile_id: str | None = None
-    department_id: str | None = None
+    scan_id: str = Field(..., min_length=1)
+
+    class Config:
+        extra = "ignore"
 
 
 class BaselineRequest(BaseModel):
@@ -109,99 +137,26 @@ class BaselineStatusResponse(BaseModel):
     message: str
 
 
+class ProcessingError(RuntimeError):
+    def __init__(self, reason: str, message: str | None = None):
+        super().__init__(message or reason)
+        self.reason = reason
+        self.message = message or reason
+
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _relation_id(value: Any) -> Any:
     if isinstance(value, dict):
         return value.get("id", value.get("uuid"))
     return value
-
-
-def _utc_now() -> str:
-    return datetime.utcnow().isoformat() + "Z"
-
-
-def _convert_audio_to_wav(path: str) -> str:
-    if shutil.which("ffmpeg") is None:
-        raise HTTPException(status_code=500, detail="ffmpeg not installed")
-    fd, out = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    cmd = ["ffmpeg", "-y", "-i", path, "-ac", "1", "-ar", "16000", out]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    return out
-
-
-def _should_convert_audio(path: str) -> bool:
-    _, ext = os.path.splitext(path)
-    return ext.lower() not in [".wav", ".wave"]
-
-
-def _download_directus_asset(asset_id: str, suffix: str) -> str:
-    if not directus.is_configured():
-        raise HTTPException(status_code=500, detail="Directus credentials are not configured")
-
-    url = f"{directus.base_url}/assets/{asset_id}"
-    headers = directus_auth_headers(url)
-    logger.info("directus_asset_download_start asset_id=%s url=%s", asset_id, url)
-    response = requests.get(url, headers=headers, timeout=(10, 30), stream=True)
-    response.raise_for_status()
-
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    total = 0
-    with os.fdopen(fd, "wb") as handle:
-        for chunk in response.iter_content(chunk_size=8192):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > MAX_DOWNLOAD_BYTES:
-                remove_temp_file(path)
-                raise HTTPException(status_code=400, detail=f"Downloaded file too large: {asset_id}")
-            handle.write(chunk)
-    logger.info("directus_asset_download_done asset_id=%s bytes=%s path=%s", asset_id, total, path)
-    return path
-
-
-def _resolve_media_input(value: str | None, suffix: str, media_kind: str):
-    if not value:
-        logger.info("media_resolve_skipped media_kind=%s reason=missing", media_kind)
-        return None, False
-    if os.path.exists(value):
-        logger.info("media_resolve_local media_kind=%s path=%s", media_kind, value)
-        return value, False
-    if is_url(value):
-        try:
-            logger.info("media_download_start media_kind=%s url=%s", media_kind, value)
-            path = download_temp_file(value, suffix)
-            logger.info("media_download_done media_kind=%s path=%s", media_kind, path)
-            return path, True
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Failed to download media: {value}") from exc
-    try:
-        logger.info("media_directus_asset_start media_kind=%s asset_id=%s", media_kind, value)
-        path = _download_directus_asset(value, suffix)
-        logger.info("media_directus_asset_done media_kind=%s path=%s", media_kind, path)
-        return path, True
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to resolve media: {value}") from exc
-
-
-def _safe_analyze(fn, path, label: str):
-    if not path:
-        logger.info("analyzer_skipped analyzer=%s reason=missing_input", label)
-        return {"score": None, "details": {"status": "missing"}}
-    try:
-        result = fn(path)
-    except Exception as exc:
-        logger.exception("analyzer_error analyzer=%s path=%s error=%s", label, path, exc)
-        return {"score": None, "details": {"status": "error"}}
-    if isinstance(result, dict) and "score" in result:
-        logger.info("analyzer_result analyzer=%s score=%s details=%s", label, result.get("score"), result.get("details"))
-        return result
-    logger.info("analyzer_result analyzer=%s score=%s", label, result)
-    return {"score": result, "details": {}}
-
-
-def _ensure_media_present(media: Media | None) -> None:
-    if not media or not any([media.image, media.audio, media.video]):
-        raise HTTPException(status_code=422, detail="At least one media input is required.")
 
 
 def _model_to_dict(model: BaseModel | None) -> dict:
@@ -210,29 +165,6 @@ def _model_to_dict(model: BaseModel | None) -> dict:
     if hasattr(model, "model_dump"):
         return model.model_dump()
     return model.dict()
-
-
-def _merge_media(request_media: Media | None, scan_context: dict) -> Media:
-    request_values = _model_to_dict(request_media)
-    directus_values = scan_context.get("resolved_media", {})
-    return Media(
-        image=request_values.get("image") or directus_values.get("image"),
-        audio=request_values.get("audio") or directus_values.get("audio"),
-        video=request_values.get("video") or directus_values.get("video"),
-    )
-
-
-def _merge_task(request_task: Task | None, scan_context: dict) -> Task | None:
-    if request_task:
-        return request_task
-    task_metrics = scan_context.get("task_metrics")
-    if not isinstance(task_metrics, dict):
-        return None
-    return Task(
-        reaction_time=task_metrics.get("reaction_time"),
-        errors=task_metrics.get("errors"),
-        attempts=task_metrics.get("attempts"),
-    )
 
 
 def _scan_timestamp(scan_context: dict) -> str:
@@ -244,73 +176,120 @@ def _scan_timestamp(scan_context: dict) -> str:
     )
 
 
+def _safe_string(value: Any, max_len: int = 255, fallback: str | None = None) -> str | None:
+    return sanitize_text(value, fallback=fallback, max_len=max_len)
+
+
 def _log_step(scan_id: str, step: str, **details: Any) -> None:
     if details:
-        logger.info("scan_id=%s step=%s details=%s", scan_id, step, details)
+        logger.info("scan_id=%s step=%s details=%s", scan_id, step, sanitize_payload(details))
         return
     logger.info("scan_id=%s step=%s", scan_id, step)
 
 
-def _safe_string(value: Any, max_len: int = 500) -> str:
-    text = str(value)
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 3] + "..."
+def _build_scan_result_response(
+    *,
+    ok: bool,
+    scan_id: str,
+    status: str | None = None,
+    error: str | None = None,
+    current_status: str | None = None,
+    status_code: int = 200,
+) -> JSONResponse:
+    payload: dict[str, Any] = {"ok": ok, "scan_id": scan_id}
+    if status is not None:
+        payload["status"] = status
+    if error is not None:
+        payload["error"] = error
+    if current_status is not None:
+        payload["current_status"] = current_status
+    return JSONResponse(status_code=status_code, content=payload)
 
 
-def _mark_scan_failed(scan_id: str, reason: str) -> dict[str, str]:
-    payload = {
-        "status": "failed",
-        "failure_reason": _safe_string(reason, max_len=255),
-        "completed_at": _utc_now(),
+def _model_health() -> dict[str, Any]:
+    model_path = ml_runtime.model_path
+    return {
+        "status": "ok",
+        "model_version": MODEL_VERSION,
+        "ml_loaded": ml_runtime.is_loaded(),
+        "ml_error": ml_runtime.error,
+        "configured_model_path": model_path,
+        "model_file_exists": bool(model_path and os.path.exists(model_path)),
+        "directus_configured": directus.is_configured(),
+        "validation": {
+            "require_video": VALIDATION_POLICY.require_video,
+            "require_audio": VALIDATION_POLICY.require_audio,
+            "require_face": VALIDATION_POLICY.require_face,
+            "require_image": VALIDATION_POLICY.require_image,
+            "require_phrase_match": VALIDATION_POLICY.require_phrase_match,
+            "phrase_match_threshold": VALIDATION_POLICY.phrase_match_threshold,
+        },
     }
+
+
+def _should_convert_audio(path: str) -> bool:
+    _, ext = os.path.splitext(path)
+    return ext.lower() not in [".wav", ".wave"]
+
+
+def _convert_audio_to_wav(path: str) -> str:
+    if shutil.which("ffmpeg") is None:
+        raise ProcessingError(FAILURE_REASON_ANALYSIS_EXCEPTION, "ffmpeg not installed")
+    fd, out = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    cmd = ["ffmpeg", "-y", "-i", path, "-ac", "1", "-ar", "16000", out]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return out
+
+
+def _download_directus_asset(asset_id: str, suffix: str) -> str:
+    if not directus.is_configured():
+        raise ProcessingError(FAILURE_REASON_DIRECTUS_DOWNLOAD_FAILED, "Directus credentials are not configured")
+    url = f"{directus.base_url}/assets/{asset_id}"
+    response = requests.get(url, headers=directus_auth_headers(url), timeout=(10, 30), stream=True)
+    response.raise_for_status()
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    total = 0
+    with os.fdopen(fd, "wb") as handle:
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                remove_temp_file(path)
+                raise ProcessingError(FAILURE_REASON_DIRECTUS_DOWNLOAD_FAILED, f"Downloaded file too large: {asset_id}")
+            handle.write(chunk)
+    return path
+
+
+def _resolve_media_input(
+    value: str | None,
+    suffix: str,
+    media_kind: str,
+    *,
+    allow_url: bool = True,
+    allow_local_path: bool = True,
+) -> tuple[str | None, bool]:
+    if not value:
+        return None, False
+    if allow_local_path and os.path.exists(value):
+        return value, False
     try:
-        directus.update_wellness_scan(scan_id, payload)
-        _log_step(scan_id, "directus_mark_failed_done", payload=payload)
-        return {"wellness_scan": "failed_updated"}
+        if allow_url and is_url(value):
+            path = download_temp_file(value, suffix)
+            return path, True
+        if is_url(value) or os.path.isabs(value) or any(sep in value for sep in ["/", "\\"]):
+            raise ProcessingError(
+                FAILURE_REASON_DIRECTUS_DOWNLOAD_FAILED,
+                f"{media_kind} must reference a Directus file id",
+            )
+        path = _download_directus_asset(value, suffix)
+        return path, True
     except Exception as exc:
-        logger.exception("scan_id=%s step=directus_mark_failed_error error=%s", scan_id, exc)
-        return {"wellness_scan": f"failed:{exc}"}
-
-
-def _analyze_media(media: Media):
-    _ensure_media_present(media)
-    temp_files = []
-
-    image_path, is_temp = _resolve_media_input(media.image, ".jpg", "image")
-    if is_temp:
-        temp_files.append(image_path)
-
-    audio_path, is_temp = _resolve_media_input(media.audio, ".bin", "audio")
-    if is_temp:
-        temp_files.append(audio_path)
-
-    if audio_path:
-        try:
-            if _should_convert_audio(audio_path):
-                logger.info("audio_convert_start path=%s", audio_path)
-                converted = _convert_audio_to_wav(audio_path)
-                temp_files.append(converted)
-                audio_path = converted
-                logger.info("audio_convert_done path=%s", audio_path)
-        except Exception:
-            return {
-                "camera": {"score": None, "details": {"status": "load_failed"}},
-                "video": {"score": None, "details": {"status": "load_failed"}},
-                "voice": {"score": None, "details": {"status": "load_failed"}},
-            }, temp_files
-
-    video_path, is_temp = _resolve_media_input(media.video, ".mp4", "video")
-    if is_temp:
-        temp_files.append(video_path)
-
-    logger.info("analyzers_start image=%s audio=%s video=%s", bool(image_path), bool(audio_path), bool(video_path))
-    camera = _safe_analyze(analyze_face, image_path, "image")
-    video = _safe_analyze(analyze_video, video_path, "video")
-    voice = _safe_analyze(analyze_audio, audio_path, "audio")
-    logger.info("analyzers_done camera_score=%s video_score=%s voice_score=%s", camera.get("score"), video.get("score"), voice.get("score"))
-
-    return {"camera": camera, "video": video, "voice": voice}, temp_files
+        raise ProcessingError(
+            FAILURE_REASON_DIRECTUS_DOWNLOAD_FAILED,
+            f"{media_kind} download failed: {exc}",
+        ) from exc
 
 
 def _resolve_scan_context(scan_id: str) -> dict:
@@ -323,13 +302,24 @@ def _resolve_scan_context(scan_id: str) -> dict:
         raise HTTPException(status_code=404, detail="wellness_scans record not found") from exc
 
 
-def _identifier_payload(req: ScanRequest, scan_context: dict) -> dict:
-    return {
-        "user_id": _relation_id(scan_context.get("user")),
-        "member_id": req.member_id or _relation_id(scan_context.get("member")),
-        "business_profile_id": req.business_profile_id or _relation_id(scan_context.get("business_profile")),
-        "department_id": req.department_id or _relation_id(scan_context.get("department")),
-    }
+def _merge_media(scan_context: dict) -> Media:
+    directus_values = scan_context.get("resolved_media", {})
+    return Media(
+        image=directus_values.get("image"),
+        audio=directus_values.get("audio"),
+        video=directus_values.get("video"),
+    )
+
+
+def _merge_task(scan_context: dict) -> Task | None:
+    task_metrics = scan_context.get("task_metrics")
+    if not isinstance(task_metrics, dict):
+        return None
+    return Task(
+        reaction_time=task_metrics.get("reaction_time"),
+        errors=task_metrics.get("errors"),
+        attempts=task_metrics.get("attempts"),
+    )
 
 
 def _baseline_for_member(member_id: str | None, business_profile_id: str | None) -> dict | None:
@@ -342,15 +332,144 @@ def _baseline_for_member(member_id: str | None, business_profile_id: str | None)
         return None
 
 
-def _quality_failure_response(scan_id: str, quality_result: dict, diagnostics: dict, writeback_status: dict) -> dict:
+def _identifier_payload(scan_context: dict) -> dict:
     return {
-        "ok": True,
+        "user_id": _relation_id(scan_context.get("user")),
+        "member_id": _relation_id(scan_context.get("member")),
+        "business_profile_id": _relation_id(scan_context.get("business_profile")),
+        "department_id": _relation_id(scan_context.get("department")),
+    }
+
+
+def _expected_phrase(scan_context: dict) -> str | None:
+    return _safe_string(scan_context.get("expected_phrase"), max_len=500)
+
+
+def _wellness_scan_update_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    filtered = directus.filter_payload_fields("wellness_scans", payload)
+    fallback_field = directus.first_supported_field("wellness_scans", ["failure_message", "user_message"])
+    if "failure_message" in payload and "failure_message" not in filtered and fallback_field:
+        filtered[fallback_field] = payload["failure_message"]
+    return sanitize_payload(filtered)
+
+
+def _scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    filtered = directus.filter_payload_fields("scan_results", payload)
+    metadata_field = directus.first_supported_field("scan_results", ["internal_analysis", "analysis_metadata"])
+    if metadata_field and metadata_field not in filtered:
+        extras = {}
+        for key in [
+            "spoken_transcript",
+            "expected_phrase",
+            "phrase_match_score",
+            "audio_quality_score",
+            "video_quality_score",
+            "image_quality_score",
+            "validation_warnings",
+        ]:
+            if key in payload:
+                extras[key] = payload[key]
+        if extras:
+            filtered[metadata_field] = extras
+    return sanitize_payload(filtered)
+
+
+def _safe_analyze(fn, path: str | None, missing_warning: str) -> dict:
+    if not path:
+        return {"score": None, "details": {"status": "missing", "warnings": [missing_warning]}}
+    try:
+        result = fn(path)
+        return result if isinstance(result, dict) else {"score": None, "details": {"status": "invalid"}}
+    except Exception as exc:
+        logger.exception("analyzer_error path=%s error=%s", path, exc)
+    return {"score": None, "details": {"status": "error", "warnings": [missing_warning]}}
+
+
+def _analyze_audio_file(path: str | None) -> dict:
+    from audio import analyze_audio
+
+    return analyze_audio(path)
+
+
+def _transcribe_audio_file(path: str) -> str:
+    from audio import transcribe_audio
+
+    return transcribe_audio(path)
+
+
+def _analyze_video_file(path: str | None) -> dict:
+    from video import analyze_video
+
+    return analyze_video(path)
+
+
+def _analyze_face_image(path: str | None) -> dict:
+    from vision import analyze_face
+
+    return analyze_face(path)
+
+
+def _analyze_media(scan_id: str, media: Media) -> tuple[dict, list[str]]:
+    if not any([media.image, media.audio, media.video]):
+        raise ProcessingError(FAILURE_REASON_MISSING_MEDIA, "No media linked to scan")
+
+    temp_files: list[str] = []
+    image_path, image_temp = _resolve_media_input(media.image, ".jpg", "image")
+    audio_path, audio_temp = _resolve_media_input(media.audio, ".bin", "audio")
+    video_path, video_temp = _resolve_media_input(media.video, ".mp4", "video")
+    for path, is_temp in [(image_path, image_temp), (audio_path, audio_temp), (video_path, video_temp)]:
+        if path and is_temp:
+            temp_files.append(path)
+
+    if audio_path and _should_convert_audio(audio_path):
+        converted = _convert_audio_to_wav(audio_path)
+        temp_files.append(converted)
+        audio_path = converted
+
+    _log_step(scan_id, "video_analysis_start", has_video=bool(video_path))
+    video = _safe_analyze(_analyze_video_file, video_path, "video_missing")
+    _log_step(scan_id, "video_analysis_done", score=video.get("score"))
+
+    _log_step(scan_id, "audio_analysis_start", has_audio=bool(audio_path))
+    voice = _safe_analyze(_analyze_audio_file, audio_path, "audio_missing")
+    _log_step(scan_id, "audio_analysis_done", score=voice.get("score"))
+
+    _log_step(scan_id, "image_analysis_start", has_image=bool(image_path))
+    camera = _safe_analyze(_analyze_face_image, image_path, "image_missing")
+    _log_step(scan_id, "image_analysis_done", score=camera.get("score"))
+
+    return {"camera": camera, "video": video, "voice": voice}, temp_files
+
+
+def _mark_scan_failed(scan_id: str, reason: str, message: str | None = None) -> dict[str, str]:
+    payload = _wellness_scan_update_payload(
+        {
+            "status": SCAN_STATUS_FAILED,
+            "failure_reason": _safe_string(reason, fallback=FAILURE_REASON_ANALYSIS_EXCEPTION),
+            "failure_message": _safe_string(message or failure_message(reason), max_len=500),
+            "completed_at": _utc_now(),
+            "ai_model_version": MODEL_VERSION,
+        }
+    )
+    try:
+        directus.update_wellness_scan(scan_id, payload)
+        _log_step(scan_id, "directus_writeback_done", writeback_status={"wellness_scan": "failed_updated"})
+        return {"wellness_scan": "failed_updated"}
+    except Exception as exc:
+        logger.exception("scan_id=%s step=directus_mark_failed_error error=%s", scan_id, exc)
+        return {"wellness_scan": f"failed:{exc}"}
+
+
+def _quality_failure_response(scan_id: str, quality_result: dict, diagnostics: dict, writeback_status: dict) -> dict:
+    explanation = "Available media was too weak for a reliable result. A re-scan is recommended."
+    if diagnostics.get("quality", {}).get("media_quality", {}).get("image", {}).get("usable") and not diagnostics.get("quality", {}).get("media_quality", {}).get("video", {}).get("usable") and not diagnostics.get("quality", {}).get("media_quality", {}).get("audio", {}).get("usable"):
+        explanation = "Only thumbnail data was available, so this result has limited confidence."
+    return {
         "status": "failed",
-        "scan_id": scan_id,
         "retake_required": True,
-        "failure_reason": quality_result.get("failure_reason") or "low_quality_media",
+        "failure_reason": quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA,
         "readiness_score": None,
-        "risk_level": None,
+        "risk_level": "unknown",
         "confidence": None,
         "camera_confidence": None,
         "voice_confidence": None,
@@ -360,8 +479,8 @@ def _quality_failure_response(scan_id: str, quality_result: dict, diagnostics: d
         "face_metrics": None,
         "voice_metrics": None,
         "reaction_metrics": None,
-        "explanation": "Scan quality was too weak for a reliable readiness result.",
-        "suggested_action": quality_result["suggested_action"],
+        "explanation": explanation,
+        "suggested_action": "rescan_recommended",
         "ai_model_version": MODEL_VERSION,
         "diagnostics": diagnostics,
         "writeback_status": writeback_status,
@@ -369,69 +488,98 @@ def _quality_failure_response(scan_id: str, quality_result: dict, diagnostics: d
 
 
 def _build_scan_result_payload(scan_id: str, result: dict, internal_analysis: dict) -> dict:
-    return {
+    payload = {
         "scan_id": scan_id,
-        "readiness_score": result["readiness_score"],
-        "risk_level": result["risk_level"],
-        "confidence": result["confidence"],
-        "camera_confidence": result["camera_confidence"],
-        "voice_confidence": result["voice_confidence"],
-        "task_performance_score": result["task_performance_score"],
-        "explanation": result["explanation"],
-        "suggested_action": result["suggested_action"],
-        "ai_model_version": result["ai_model_version"],
-        "confidence_drift": result["confidence_drift"],
-        "baseline_used": result["baseline_used"],
-        "face_metrics": result["face_metrics"],
-        "voice_metrics": result["voice_metrics"],
-        "reaction_metrics": result["reaction_metrics"],
-        "internal_analysis": internal_analysis,
+        "readiness_score": result.get("readiness_score"),
+        "risk_level": result.get("risk_level"),
+        "confidence": result.get("confidence"),
+        "camera_confidence": result.get("camera_confidence"),
+        "voice_confidence": result.get("voice_confidence"),
+        "task_performance_score": result.get("task_performance_score"),
+        "explanation": _safe_string(result.get("explanation"), max_len=500, fallback="Analysis completed."),
+        "suggested_action": _safe_string(result.get("suggested_action"), max_len=100, fallback="review_required"),
+        "ai_model_version": _safe_string(result.get("ai_model_version"), max_len=100, fallback=MODEL_VERSION),
+        "confidence_drift": result.get("confidence_drift"),
+        "baseline_used": result.get("baseline_used"),
+        "face_metrics": result.get("face_metrics"),
+        "voice_metrics": result.get("voice_metrics"),
+        "reaction_metrics": result.get("reaction_metrics"),
+        "spoken_transcript": result.get("spoken_transcript"),
+        "expected_phrase": result.get("expected_phrase"),
+        "phrase_match_score": result.get("phrase_match_score"),
+        "audio_quality_score": result.get("audio_quality_score"),
+        "video_quality_score": result.get("video_quality_score"),
+        "image_quality_score": result.get("image_quality_score"),
+        "validation_warnings": result.get("validation_warnings"),
     }
+    supported_optional = directus.supports_fields(
+        "scan_results",
+        OPTIONAL_SCAN_RESULT_FIELDS
+        + [
+            "spoken_transcript",
+            "expected_phrase",
+            "phrase_match_score",
+            "audio_quality_score",
+            "video_quality_score",
+            "image_quality_score",
+            "validation_warnings",
+        ],
+    )
+    if "analysis_metadata" in supported_optional:
+        payload["analysis_metadata"] = internal_analysis
+    if "media_quality" in supported_optional:
+        payload["media_quality"] = internal_analysis.get("quality", {}).get("media_quality")
+    if "warnings" in supported_optional:
+        payload["warnings"] = internal_analysis.get("warnings")
+    if "modality_scores" in supported_optional:
+        payload["modality_scores"] = result.get("modality_scores")
+    if "fusion_details" in supported_optional:
+        payload["fusion_details"] = result.get("fusion_details")
+    if "internal_analysis" in supported_optional:
+        payload["internal_analysis"] = internal_analysis
+    return _scan_result_payload(payload)
 
 
 def _write_quality_failure(scan_id: str, quality_result: dict) -> dict:
-    try:
-        return _mark_scan_failed(
-            scan_id,
-            quality_result.get("failure_reason") or "low_quality_media",
-        )
-    except Exception as exc:
-        logger.warning("writeback_failure_failed scan_id=%s error=%s", scan_id, exc)
-        return {"wellness_scan": f"failed:{exc}"}
+    return _mark_scan_failed(
+        scan_id,
+        quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA,
+    )
 
 
 def _write_success(
     *,
     scan_id: str,
-    request_id: str | None,
     scan_context: dict,
     identifiers: dict,
     result: dict,
     internal_analysis: dict,
 ) -> dict:
     status: dict[str, Any] = {}
-
     try:
-        scan_result = directus.create_scan_result(
-            _build_scan_result_payload(scan_id, result, internal_analysis)
-        )
-        status["scan_result"] = _relation_id(scan_result.get("id")) or "created"
+        write_mode, scan_result = directus.upsert_scan_result(scan_id, _build_scan_result_payload(scan_id, result, internal_analysis))
+        status["scan_result"] = f"{write_mode}:{_relation_id(scan_result.get('id')) or 'ok'}"
     except Exception as exc:
-        logger.warning("scan_result_write_failed scan_id=%s error=%s", scan_id, exc)
-        status["scan_result"] = f"failed:{exc}"
+        logger.exception("scan_result_write_failed scan_id=%s error=%s", scan_id, exc)
+        raise ProcessingError(FAILURE_REASON_WRITEBACK_FAILED, str(exc)) from exc
 
     try:
         directus.update_wellness_scan(
             scan_id,
-            {
-                "status": "completed",
+            _wellness_scan_update_payload(
+                {
+                "status": SCAN_STATUS_COMPLETED,
                 "completed_at": _utc_now(),
-            },
+                "failure_reason": None,
+                "failure_message": None,
+                "ai_model_version": MODEL_VERSION,
+                }
+            ),
         )
         status["wellness_scan"] = "updated"
     except Exception as exc:
-        logger.warning("wellness_scan_update_failed scan_id=%s error=%s", scan_id, exc)
-        status["wellness_scan"] = f"failed:{exc}"
+        logger.exception("wellness_scan_update_failed scan_id=%s error=%s", scan_id, exc)
+        raise ProcessingError(FAILURE_REASON_WRITEBACK_FAILED, str(exc)) from exc
 
     member_id = identifiers.get("member_id")
     if member_id:
@@ -440,8 +588,8 @@ def _write_success(
                 member_id,
                 {
                     "last_scan_at": _utc_now(),
-                    "last_readiness_score": result["readiness_score"],
-                    "last_risk_level": result["risk_level"],
+                    "last_readiness_score": result.get("readiness_score"),
+                    "last_risk_level": result.get("risk_level"),
                 },
             )
             status["member"] = "updated"
@@ -451,7 +599,7 @@ def _write_success(
 
     try:
         scan_request = directus.update_scan_request_if_needed(
-            request_id=request_id,
+            request_id=None,
             scan_context=scan_context,
             scan_id=scan_id,
         )
@@ -463,7 +611,7 @@ def _write_success(
     try:
         alert = directus.create_alert_if_needed(
             risk_level=result["risk_level"],
-            confidence=float(result["confidence"]),
+            confidence=float(result["confidence"] or 0.0),
             scan_id=scan_id,
             member_id=identifiers.get("member_id"),
             business_profile_id=identifiers.get("business_profile_id"),
@@ -471,152 +619,172 @@ def _write_success(
             user_id=identifiers.get("user_id"),
         )
         status["alert"] = "created" if alert else "skipped"
-        notification_user_id = None
-        if alert and notification_user_id:
-            notification = directus.create_notification(
-                user_id=notification_user_id,
-                business_profile_id=identifiers.get("business_profile_id"),
-                alert_id=_relation_id(alert.get("id")),
-                scan_id=scan_id,
-                member_id=identifiers.get("member_id"),
-                risk_level=result["risk_level"],
-            )
-            status["notification"] = "created" if notification else "skipped"
-        else:
-            status["notification"] = "skipped"
     except Exception as exc:
         logger.warning("alert_write_failed scan_id=%s error=%s", scan_id, exc)
         status["alert"] = f"failed:{exc}"
-        status["notification"] = f"failed:{exc}"
-
     return status
 
 
-def _process_scan_sync(req: ScanRequest) -> ScanResultResponse:
-    _log_step(req.scan_id, "background_process_begin", request_id=req.request_id)
-    scan_context = _resolve_scan_context(req.scan_id)
-    _log_step(req.scan_id, "directus_scan_context_loaded", status=scan_context.get("status"))
+def _process_scan_sync(scan_id: str) -> dict[str, Any]:
+    _log_step(scan_id, "validation_start")
+    scan_context = _resolve_scan_context(scan_id)
+    _log_step(scan_id, "scan_context_loaded", status=scan_context.get("status"))
 
-    media = _merge_media(req.media, scan_context)
-    task = _merge_task(req.task, scan_context)
-    identifiers = _identifier_payload(req, scan_context)
-    media_row = scan_context.get("scan_media")
-
-    try:
-        directus.update_wellness_scan(req.scan_id, {"status": "processing"})
-        _log_step(req.scan_id, "directus_processing_status_updated")
-    except Exception as exc:
-        logger.exception("scan_id=%s step=directus_processing_status_update_error error=%s", req.scan_id, exc)
-
-    logger.info(
-        "process_scan_started scan_id=%s media_row_found=%s video_file_id=%s audio_file_id=%s member_id=%s business_profile_id=%s",
-        req.scan_id,
-        media_row is not None,
-        _relation_id((media_row or {}).get("video_file")),
-        _relation_id((media_row or {}).get("audio_file")),
-        identifiers.get("member_id"),
-        identifiers.get("business_profile_id"),
+    media_row = scan_context.get("scan_media") or directus.get_scan_media(scan_id)
+    _log_step(
+        scan_id,
+        "scan_media_loaded",
+        media_found=media_row is not None,
+        video_file_id=_relation_id((media_row or {}).get("video_file")),
+        audio_file_id=_relation_id((media_row or {}).get("audio_file")),
+        thumbnail_id=_relation_id((media_row or {}).get("thumbnail")),
     )
 
+    if media_row is None:
+        validation_result = fail_validation(FAILURE_REASON_MISSING_MEDIA)
+        _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"])
+        _log_step(scan_id, "directus_writeback_start")
+        _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+        return {"status": SCAN_STATUS_FAILED, **validation_result}
+
+    if not ml_runtime.is_loaded():
+        validation_result = fail_validation(FAILURE_REASON_MODEL_NOT_LOADED)
+        _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"])
+        _log_step(scan_id, "directus_writeback_start")
+        _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+        return {"status": SCAN_STATUS_FAILED, **validation_result}
+
+    media = _merge_media(scan_context)
+    task = _merge_task(scan_context)
+    identifiers = _identifier_payload(scan_context)
+    baseline = _baseline_for_member(identifiers.get("member_id"), identifiers.get("business_profile_id"))
+    baseline_used = baseline_ready_for_scoring(baseline)
+    baseline_status = baseline_status_payload(baseline)
+    expected_phrase = _expected_phrase(scan_context)
+
     temp_files: list[str] = []
+    transcript: str | None = None
+    phrase_score: float | None = None
     try:
-        _log_step(req.scan_id, "media_analysis_start", media=_model_to_dict(media))
-        signals, temp_files = _analyze_media(media)
-        _log_step(req.scan_id, "media_analysis_done", temp_files=len(temp_files))
-    except HTTPException as exc:
-        logger.exception("scan_id=%s step=media_analysis_http_error error=%s", req.scan_id, exc.detail)
-        diagnostics = {
-            "scan_id": req.scan_id,
-            "media_row_found": media_row is not None,
-            "video_file_id": _relation_id((media_row or {}).get("video_file")),
-            "audio_file_id": _relation_id((media_row or {}).get("audio_file")),
-            "member": identifiers.get("member_id"),
-            "business_profile": identifiers.get("business_profile_id"),
-            "quality_status": "failed",
-        }
-        writeback_status = _write_quality_failure(
-            req.scan_id,
-            {
-                "status": "failed",
-                "failure_reason": "low_quality_media",
-                "suggested_action": "Please retake the scan in better lighting with clear face, voice, and reaction input.",
-            },
-        )
-        return ScanResultResponse(**_quality_failure_response(
-            req.scan_id,
-            {
-                "status": "failed",
-                "failure_reason": "low_quality_media",
-                "suggested_action": "Please retake the scan in better lighting with clear face, voice, and reaction input.",
-            },
-            diagnostics,
-            writeback_status,
-        ))
-
-    try:
-        _log_step(req.scan_id, "quality_assessment_start")
-        quality_result = assess_quality(signals, task)
-        _log_step(req.scan_id, "quality_assessment_done", quality_status=quality_result.get("status"))
-
-        _log_step(req.scan_id, "baseline_fetch_start")
-        baseline = _baseline_for_member(identifiers.get("member_id"), identifiers.get("business_profile_id"))
-        baseline_status = baseline_status_payload(baseline)
-        baseline_used = baseline_ready_for_scoring(baseline)
-        _log_step(req.scan_id, "baseline_fetch_done", baseline_used=baseline_used)
-
-        _log_step(req.scan_id, "feature_extraction_start")
-        feature_map, _ = features_from_signals(signals, task=task)
-        feature_vector = vector_from_features(feature_map)
-        _log_step(req.scan_id, "feature_extraction_done", feature_count=len(feature_vector))
-
-        _log_step(req.scan_id, "ml_predict_start", ml_loaded=ml_runtime.is_loaded())
-        ml_result = ml_runtime.predict(feature_vector) if ml_runtime.is_loaded() else None
-        _log_step(req.scan_id, "ml_predict_done", ml_result=ml_result)
-
-        diagnostics = {
-            "scan_id": req.scan_id,
-            "media_row_found": media_row is not None,
-            "video_file_id": _relation_id((media_row or {}).get("video_file")),
-            "audio_file_id": _relation_id((media_row or {}).get("audio_file")),
-            "member": identifiers.get("member_id"),
-            "business_profile": identifiers.get("business_profile_id"),
-            "baseline_scan_count": int((baseline or {}).get("scan_count", 0)),
-            "quality_status": quality_result["status"],
-            "signals": signals,
-            "baseline_status": baseline_status,
-            "ml": ml_result,
-        }
-
-        logger.info(
-            "quality_result scan_id=%s member_id=%s baseline_scan_count=%s quality_status=%s",
-            req.scan_id,
-            identifiers.get("member_id"),
-            diagnostics["baseline_scan_count"],
-            quality_result["status"],
+        _log_step(scan_id, "media_download_start")
+        image_path, image_temp = _resolve_media_input(media.image, ".jpg", "image", allow_url=False, allow_local_path=False)
+        audio_path, audio_temp = _resolve_media_input(media.audio, ".bin", "audio", allow_url=False, allow_local_path=False)
+        video_path, video_temp = _resolve_media_input(media.video, ".mp4", "video", allow_url=False, allow_local_path=False)
+        for path, is_temp in [(image_path, image_temp), (audio_path, audio_temp), (video_path, video_temp)]:
+            if path and is_temp:
+                temp_files.append(path)
+        if audio_path and _should_convert_audio(audio_path):
+            converted = _convert_audio_to_wav(audio_path)
+            temp_files.append(converted)
+            audio_path = converted
+        resolved_media = Media(image=image_path, audio=audio_path, video=video_path)
+        _log_step(
+            scan_id,
+            "media_download_done",
+            has_video=bool(video_path),
+            has_audio=bool(audio_path),
+            has_image=bool(image_path),
         )
 
+        _log_step(scan_id, "video_validation_start")
+        video_result = _safe_analyze(_analyze_video_file, resolved_media.video, "video_missing")
+        _log_step(scan_id, "video_validation_done", quality_score=((video_result.get("details") or {}).get("visual_quality_score")))
+
+        _log_step(scan_id, "face_validation_start")
+        video_details = (video_result.get("details") or {})
+        image_result = None
+        if resolved_media.image:
+            image_result = _safe_analyze(_analyze_face_image, resolved_media.image, "image_missing")
+        _log_step(
+            scan_id,
+            "face_validation_done",
+            video_face_ratio=video_details.get("face_or_subject_visibility") or video_details.get("face_rate"),
+            image_face_detected=((image_result or {}).get("details") or {}).get("face_detected"),
+        )
+
+        _log_step(scan_id, "audio_validation_start")
+        audio_result = _safe_analyze(_analyze_audio_file, resolved_media.audio, "audio_missing")
+        _log_step(scan_id, "audio_validation_done", quality_score=((audio_result.get("details") or {}).get("audio_quality_score")))
+
+        _log_step(scan_id, "phrase_validation_start")
+        if VALIDATION_POLICY.require_phrase_match or expected_phrase:
+            if expected_phrase:
+                try:
+                    transcript = _transcribe_audio_file(resolved_media.audio) if resolved_media.audio else None
+                except Exception as exc:
+                    logger.warning("scan_id=%s step=phrase_transcription_error error=%s", scan_id, exc)
+                    transcript = None
+        phrase_validation = validate_scan_inputs(
+            policy=VALIDATION_POLICY,
+            media=resolved_media,
+            video_result=video_result,
+            audio_result=audio_result,
+            image_result=image_result,
+            expected_phrase=expected_phrase,
+            transcript=transcript,
+        )
+        phrase_score = phrase_validation["quality_scores"].get("phrase_match")
+        _log_step(scan_id, "phrase_validation_done", transcript_present=bool(transcript), phrase_match_score=phrase_score)
+
+        _log_step(scan_id, "image_validation_start")
+        _log_step(
+            scan_id,
+            "image_validation_done",
+            quality_score=((image_result or {}).get("details") or {}).get("image_quality_score"),
+        )
+
+        if not phrase_validation["passed"]:
+            _log_step(scan_id, "validation_failed", reason=phrase_validation["failure_reason"], scores=phrase_validation["quality_scores"])
+            _log_step(scan_id, "directus_writeback_start")
+            _mark_scan_failed(scan_id, phrase_validation["failure_reason"], phrase_validation["failure_message"])
+            return {"status": SCAN_STATUS_FAILED, **phrase_validation}
+
+        raw_signals = {
+            "camera": image_result or {"score": None, "details": {"status": "missing"}},
+            "video": video_result,
+            "voice": audio_result,
+        }
+        quality_result = assess_quality(raw_signals, task)
         if not quality_result["passed"]:
-            _log_step(req.scan_id, "quality_failed")
-            writeback_status = _write_quality_failure(req.scan_id, quality_result)
-            return ScanResultResponse(**_quality_failure_response(req.scan_id, quality_result, diagnostics, writeback_status))
+            validation_result = fail_validation(
+                quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA,
+                scores=phrase_validation["quality_scores"],
+                warnings=quality_result.get("warnings"),
+            )
+            _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=validation_result["quality_scores"])
+            _log_step(scan_id, "directus_writeback_start")
+            _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            return {"status": SCAN_STATUS_FAILED, **validation_result}
 
-        _log_step(req.scan_id, "result_compute_start")
+        _log_step(scan_id, "validation_passed", scores=phrase_validation["quality_scores"])
+        _log_step(scan_id, "analysis_start")
+        feature_map, _ = features_from_signals(raw_signals, task=task)
+        feature_vector = vector_from_features(feature_map)
+        ml_result = ml_runtime.predict(feature_vector)
         result = compute_result(
-            camera_score=signals["camera"].get("score"),
-            video_score=signals["video"].get("score"),
-            voice_score=signals["voice"].get("score"),
+            signals=raw_signals,
             task=task,
-            previous_confidence=req.previous_confidence,
+            previous_confidence=None,
             baseline=baseline,
             baseline_used=baseline_used,
             quality=quality_result,
             ml_result=ml_result,
         )
-        _log_step(req.scan_id, "result_compute_done", risk_level=result.get("risk_level"), confidence=result.get("confidence"))
+        result.update(
+            {
+                "spoken_transcript": transcript,
+                "expected_phrase": expected_phrase,
+                "phrase_match_score": phrase_score,
+                "audio_quality_score": phrase_validation["quality_scores"].get("audio"),
+                "video_quality_score": phrase_validation["quality_scores"].get("video"),
+                "image_quality_score": phrase_validation["quality_scores"].get("image"),
+                "validation_warnings": phrase_validation.get("warnings"),
+            }
+        )
+        _log_step(scan_id, "analysis_done", risk_level=result.get("risk_level"), confidence=result.get("confidence"))
 
         if identifiers.get("member_id") and identifiers.get("business_profile_id"):
             try:
-                _log_step(req.scan_id, "baseline_write_start")
                 baseline_payload = baseline_signal_payload(
                     baseline,
                     face_score=result["face_metrics"]["face_score"],
@@ -626,96 +794,60 @@ def _process_scan_sync(req: ScanRequest) -> ScanResultResponse:
                 )
                 baseline_payload["member"] = identifiers["member_id"]
                 baseline_payload["business_profile"] = identifiers["business_profile_id"]
-                updated_baseline = directus.upsert_employee_baseline(
-                    _relation_id((baseline or {}).get("id")),
-                    baseline_payload,
-                )
-                diagnostics["baseline_status_after"] = baseline_status_payload(updated_baseline)
-                _log_step(req.scan_id, "baseline_write_done")
+                directus.upsert_employee_baseline(_relation_id((baseline or {}).get("id")), baseline_payload)
             except Exception as exc:
-                logger.exception(
-                    "scan_id=%s step=baseline_write_error member_id=%s error=%s",
-                    req.scan_id,
-                    identifiers.get("member_id"),
-                    exc,
-                )
-                diagnostics["baseline_write_error"] = str(exc)
+                logger.warning("baseline_write_failed scan_id=%s error=%s", scan_id, exc)
 
-        internal_analysis = {
-            "quality": quality_result,
-            "baseline_status_before": baseline_status,
-            "ml": ml_result,
-            "signals": signals,
-            "scan_context": {
-                "scan_id": req.scan_id,
-                "member": identifiers.get("member_id"),
-                "business_profile": identifiers.get("business_profile_id"),
-                "department": identifiers.get("department_id"),
-                "user": identifiers.get("user_id"),
-                "media_row_found": media_row is not None,
-                "video_file_id": _relation_id((media_row or {}).get("video_file")),
-                "audio_file_id": _relation_id((media_row or {}).get("audio_file")),
-            },
-        }
+        internal_analysis = sanitize_payload(
+            {
+                "quality": quality_result,
+                "signals": raw_signals,
+                "ml": ml_result,
+                "baseline_status_before": baseline_status,
+                "validation": phrase_validation,
+            }
+        )
 
-        _log_step(req.scan_id, "directus_writeback_start")
+        _log_step(scan_id, "directus_writeback_start")
         writeback_status = _write_success(
-            scan_id=req.scan_id,
-            request_id=req.request_id,
+            scan_id=scan_id,
             scan_context=scan_context,
             identifiers=identifiers,
             result=result,
             internal_analysis=internal_analysis,
         )
-        _log_step(req.scan_id, "directus_writeback_done", writeback_status=writeback_status)
-
-        logger.info(
-            "process_scan_completed scan_id=%s member_id=%s baseline_scan_count=%s quality_status=%s risk_level=%s confidence=%.3f result_writeback=%s",
-            req.scan_id,
-            identifiers.get("member_id"),
-            diagnostics["baseline_scan_count"],
-            quality_result["status"],
-            result["risk_level"],
-            float(result["confidence"]),
-            writeback_status.get("scan_result"),
-        )
-
-        response = dict(result)
-        response["ok"] = True
-        response["scan_id"] = req.scan_id
-        response["diagnostics"] = diagnostics
-        response["writeback_status"] = writeback_status
-        return ScanResultResponse(**response)
+        _log_step(scan_id, "directus_writeback_done", writeback_status=writeback_status)
+        return {"status": SCAN_STATUS_COMPLETED, "failure_reason": None, "writeback_status": writeback_status}
+    except ProcessingError as exc:
+        validation_result = fail_validation(exc.reason)
+        _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"])
+        _log_step(scan_id, "directus_writeback_start")
+        _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+        return {"status": SCAN_STATUS_FAILED, **validation_result}
     finally:
         for path in temp_files:
             remove_temp_file(path)
-        _log_step(req.scan_id, "temp_files_cleanup_done", temp_files=len(temp_files))
 
 
-def process_scan_background(req: ScanRequest) -> None:
+def process_scan_background(scan_id: str) -> None:
     try:
-        result = _process_scan_sync(req)
+        result = _process_scan_sync(scan_id)
         _log_step(
-            req.scan_id,
+            scan_id,
             "background_process_done",
-            final_status=result.status,
-            failure_reason=result.failure_reason,
+            final_status=result.get("status"),
+            failure_reason=result.get("failure_reason"),
         )
     except Exception as exc:
-        logger.error("BACKGROUND ERROR scan_id=%s error=%s", req.scan_id, exc)
+        logger.error("BACKGROUND ERROR scan_id=%s error=%s", scan_id, exc)
         logger.error(traceback.format_exc())
-        _mark_scan_failed(req.scan_id, f"processing_exception: {exc}")
+        _log_step(scan_id, "directus_writeback_start")
+        _mark_scan_failed(scan_id, FAILURE_REASON_ANALYSIS_EXCEPTION, failure_message(FAILURE_REASON_ANALYSIS_EXCEPTION))
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "model_version": MODEL_VERSION,
-        "ml_loaded": ml_runtime.is_loaded(),
-        "ml_error": ml_runtime.error,
-        "directus_configured": directus.is_configured(),
-    }
+    return _model_health()
 
 
 @app.get("/debug/scan/{scan_id}")
@@ -754,24 +886,21 @@ def baseline_status(
 
 @app.post("/baseline")
 def set_baseline(req: BaselineRequest):
-    signals, temp_files = _analyze_media(req.media)
+    signals, temp_files = _analyze_media("baseline", req.media)
     try:
         quality_result = assess_quality(signals, req.task)
         if not quality_result["passed"]:
-            raise HTTPException(status_code=422, detail=quality_result["failure_reason"] or "low_quality_media")
-
-        baseline = _baseline_for_member(req.member_id, req.business_profile_id)
+            raise HTTPException(status_code=422, detail=quality_result["failure_reason"] or FAILURE_REASON_LOW_QUALITY_MEDIA)
         result = compute_result(
-            camera_score=signals["camera"].get("score"),
-            video_score=signals["video"].get("score"),
-            voice_score=signals["voice"].get("score"),
+            signals=signals,
             task=req.task,
             previous_confidence=None,
-            baseline=baseline,
+            baseline=None,
             baseline_used=False,
             quality=quality_result,
             ml_result=None,
         )
+        baseline = _baseline_for_member(req.member_id, req.business_profile_id)
         payload = baseline_signal_payload(
             baseline,
             face_score=result["face_metrics"]["face_score"],
@@ -794,12 +923,59 @@ def set_baseline(req: BaselineRequest):
             remove_temp_file(path)
 
 
-@app.post("/process", response_model=ProcessResponse, status_code=202)
+@app.post("/process")
 def process_scan(req: ScanRequest, background_tasks: BackgroundTasks):
-    logger.info("RECEIVED /process scan_id=%s", req.scan_id)
-    background_tasks.add_task(process_scan_background, req)
-    return {
-        "ok": True,
-        "status": "accepted",
-        "scan_id": req.scan_id,
-    }
+    scan_id = (req.scan_id or "").strip()
+    logger.info("RECEIVED /process scan_id=%s", scan_id)
+    if not scan_id:
+        return _build_scan_result_response(ok=False, scan_id=scan_id, error="invalid_scan_id", status_code=422)
+
+    try:
+        scan_context = _resolve_scan_context(scan_id)
+    except HTTPException as exc:
+        error = "scan_not_found" if exc.status_code == 404 else "scan_context_failed"
+        return _build_scan_result_response(ok=False, scan_id=scan_id, error=error, status_code=exc.status_code)
+
+    current_status = (scan_context.get("status") or "").strip()
+    if current_status == SCAN_STATUS_PENDING:
+        return _build_scan_result_response(
+            ok=False,
+            scan_id=scan_id,
+            error="scan_not_ready",
+            current_status=current_status,
+            status_code=409,
+        )
+    if current_status == SCAN_STATUS_PROCESSING:
+        return _build_scan_result_response(ok=True, scan_id=scan_id, status="already_processing", status_code=202)
+    if current_status == SCAN_STATUS_COMPLETED:
+        return _build_scan_result_response(ok=True, scan_id=scan_id, status="already_completed", status_code=200)
+    if current_status == SCAN_STATUS_FAILED:
+        return _build_scan_result_response(ok=True, scan_id=scan_id, status="already_failed", status_code=200)
+    if current_status != SCAN_STATUS_MEDIA_READY:
+        return _build_scan_result_response(
+            ok=False,
+            scan_id=scan_id,
+            error="invalid_scan_status",
+            current_status=current_status,
+            status_code=409,
+        )
+
+    update_payload = _wellness_scan_update_payload(
+        {
+            "status": SCAN_STATUS_PROCESSING,
+            "processing_started_at": _utc_now(),
+            "failure_reason": None,
+            "failure_message": None,
+        }
+    )
+    if "processing_attempts" in scan_context:
+        update_payload["processing_attempts"] = int(scan_context.get("processing_attempts") or 0) + 1
+
+    try:
+        directus.update_wellness_scan(scan_id, update_payload)
+    except Exception as exc:
+        logger.exception("processing_state_update_failed scan_id=%s error=%s", scan_id, exc)
+        return _build_scan_result_response(ok=False, scan_id=scan_id, error="processing_state_update_failed", status_code=500)
+
+    background_tasks.add_task(process_scan_background, scan_id)
+    return _build_scan_result_response(ok=True, scan_id=scan_id, status="accepted", status_code=202)

@@ -5,6 +5,7 @@ import os
 from typing import Any
 
 import requests
+from requests import HTTPError
 
 try:
     import httpx
@@ -22,6 +23,23 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _is_unique_conflict(exc: Exception, *, field_name: str) -> bool:
+    if not isinstance(exc, HTTPError):
+        return False
+    response = exc.response
+    if response is None or response.status_code not in {400, 409}:
+        return False
+    body = ""
+    try:
+        body = response.text or ""
+    except Exception:
+        body = ""
+    normalized = body.lower()
+    if "duplicate key" in normalized or "unique constraint" in normalized:
+        return True
+    return "duplicate" in normalized and field_name.lower() in normalized
+
+
 class DirectusClient:
     def __init__(
         self,
@@ -32,6 +50,7 @@ class DirectusClient:
         self.base_url = (base_url or os.getenv("DIRECTUS_URL", "")).rstrip("/")
         self.token = token or os.getenv("DIRECTUS_TOKEN")
         self.timeout = int(os.getenv("DIRECTUS_TIMEOUT", timeout))
+        self._field_cache: dict[str, set[str] | None] = {}
 
     def is_configured(self) -> bool:
         return bool(self.base_url and self.token)
@@ -127,7 +146,60 @@ class DirectusClient:
             params[key] = value
         return self._request("GET", f"/items/{collection}", params=params)
 
+    def get_collection_fields(self, collection: str) -> set[str] | None:
+        if collection in self._field_cache:
+            return self._field_cache[collection]
+        try:
+            rows = self._request("GET", f"/fields/{collection}")
+        except Exception:
+            self._field_cache[collection] = None
+            return None
+        fields = {
+            row.get("field")
+            for row in (rows or [])
+            if isinstance(row, dict) and row.get("field")
+        }
+        self._field_cache[collection] = fields or None
+        return self._field_cache[collection]
+
+    def supports_fields(self, collection: str, field_names: list[str]) -> set[str]:
+        available = self.get_collection_fields(collection)
+        if not available:
+            return set()
+        return {field for field in field_names if field in available}
+
+    def filter_payload_fields(self, collection: str, payload: dict[str, Any]) -> dict[str, Any]:
+        available = self.get_collection_fields(collection)
+        if not available:
+            return payload
+        return {key: value for key, value in payload.items() if key in available}
+
+    def first_supported_field(self, collection: str, candidates: list[str]) -> str | None:
+        available = self.get_collection_fields(collection)
+        if not available:
+            return None
+        for name in candidates:
+            if name in available:
+                return name
+        return None
+
     def get_scan_context(self, scan_id: Any) -> dict:
+        optional_scan_fields = sorted(
+            self.supports_fields(
+                "wellness_scans",
+                [
+                    "ai_model_version",
+                    "failure_message",
+                    "failure_reason",
+                    "expected_phrase",
+                    "processing_attempts",
+                    "processing_started_at",
+                    "user_message",
+                    "validation_warnings",
+                    "spoken_transcript",
+                ],
+            )
+        )
         scan = self.get_item(
             "wellness_scans",
             scan_id,
@@ -144,7 +216,8 @@ class DirectusClient:
                 "request_source",
                 "date_created",
                 "date_updated",
-            ],
+            ]
+            + optional_scan_fields,
         )
         media_rows = self.list_items(
             "scan_media",
@@ -174,6 +247,29 @@ class DirectusClient:
         }
         return scan
 
+    def get_scan_media(self, scan_id: Any) -> dict | None:
+        media_rows = self.list_items(
+            "scan_media",
+            filters={
+                "filter[scan_id][_eq]": scan_id,
+                "filter[is_deleted][_neq]": "true",
+            },
+            fields=[
+                "id",
+                "scan_id",
+                "video_file",
+                "audio_file",
+                "thumbnail",
+                "duration_seconds",
+                "business_profile",
+                "is_deleted",
+                "date_created",
+            ],
+            limit=1,
+            sort="-date_created",
+        )
+        return media_rows[0] if media_rows else None
+
     def get_employee_baseline(self, member_id: Any, business_profile_id: Any) -> dict | None:
         rows = self.list_items(
             "employee_baselines",
@@ -194,11 +290,51 @@ class DirectusClient:
     def create_scan_result(self, payload: dict) -> dict:
         return self.create_item("scan_results", payload)
 
+    def get_scan_result_by_scan_id(self, scan_id: Any) -> dict | None:
+        rows = self.list_items(
+            "scan_results",
+            filters={"filter[scan_id][_eq]": scan_id},
+            fields=["*"],
+            limit=1,
+            sort="-date_created",
+        )
+        return rows[0] if rows else None
+
+    def upsert_scan_result(self, scan_id: Any, payload: dict) -> tuple[str, dict]:
+        existing = self.get_scan_result_by_scan_id(scan_id)
+        if existing:
+            item_id = _relation_id(existing.get("id"))
+            return "updated", self.update_item("scan_results", item_id, payload)
+        create_error: Exception | None = None
+        try:
+            return "created", self.create_item("scan_results", payload)
+        except Exception as exc:
+            if not _is_unique_conflict(exc, field_name="scan_id"):
+                raise
+            create_error = exc
+        existing = self.get_scan_result_by_scan_id(scan_id)
+        if existing:
+            item_id = _relation_id(existing.get("id"))
+            return "updated_after_conflict", self.update_item("scan_results", item_id, payload)
+        raise create_error or RuntimeError("scan_results upsert failed after duplicate conflict")
+
     def update_wellness_scan(self, scan_id: Any, payload: dict) -> dict:
         return self.update_item("wellness_scans", scan_id, payload)
 
     def update_member_last_result(self, member_id: Any, payload: dict) -> dict:
         return self.update_item("business_profile_members", member_id, payload)
+
+    def get_latest_scan_result_for_member(self, member_id: Any) -> dict | None:
+        if not member_id:
+            return None
+        rows = self.list_items(
+            "scan_results",
+            filters={"filter[member][_eq]": member_id},
+            fields=["id", "scan_id", "confidence", "risk_level", "date_created"],
+            limit=1,
+            sort="-date_created",
+        )
+        return rows[0] if rows else None
 
     def find_matching_scan_request(self, scan_context: dict) -> dict | None:
         request_source = scan_context.get("request_source")

@@ -1,44 +1,27 @@
-#vision.py
-import cv2
 import math
-import mediapipe as mp
+
 import numpy as np
 
-from config import MIN_EAR
+from utils import clamp01, clean_warning_codes, safe_number
 
-mp_face = mp.solutions.face_mesh.FaceMesh(static_image_mode=True)
+try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
 
+try:
+    import mediapipe as mp
+except Exception:  # pragma: no cover
+    mp = None
+
+
+LOW_LIGHT_THRESHOLD = 75.0
+BLUR_THRESHOLD = 60.0
+MIN_RESOLUTION = 256 * 256
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-LOW_LIGHT_THRESHOLD = 70.0
-BLUR_THRESHOLD = 40.0
 
-
-def _apply_gamma(bgr, gamma: float):
-    if gamma <= 0:
-        return bgr
-    inv = 1.0 / gamma
-    table = (np.arange(256) / 255.0) ** inv
-    table = np.clip(table * 255.0, 0, 255).astype("uint8")
-    return cv2.LUT(bgr, table)
-
-
-def _enhance_bgr(bgr):
-    # Improve low-light and contrast before face mesh.
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l2 = clahe.apply(l)
-    lab = cv2.merge((l2, a, b))
-    bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    mean_v = float(np.mean(gray))
-    if mean_v < LOW_LIGHT_THRESHOLD:
-        bgr = _apply_gamma(bgr, 1.6)
-    elif mean_v > 200:
-        bgr = _apply_gamma(bgr, 0.85)
-    return bgr, mean_v
+mp_face = mp.solutions.face_mesh.FaceMesh(static_image_mode=True) if mp else None
 
 
 def _dist(a, b) -> float:
@@ -54,62 +37,115 @@ def _eye_aspect_ratio(landmarks, idxs) -> float:
     return vertical / (2.0 * horizontal)
 
 
+def _brightness_score(gray: np.ndarray) -> float:
+    mean_v = float(np.mean(gray))
+    return clamp01(mean_v / 160.0, 0.0) or 0.0
+
+
+def _sharpness_from_blur(blur_var: float) -> float:
+    return clamp01(blur_var / 180.0, 0.0) or 0.0
+
+
 def analyze_face(image_path: str) -> dict:
     if not image_path:
-        return {"score": None, "details": {"status": "missing"}}
+        return {
+            "score": None,
+            "details": {
+                "status": "missing",
+                "image_warnings": ["image_missing"],
+            },
+        }
+
+    if cv2 is None:
+        return {
+            "score": None,
+            "details": {
+                "status": "invalid_image",
+                "image_warnings": ["image_missing"],
+            },
+        }
+
     img = cv2.imread(image_path)
     if img is None:
-        return {"score": None, "details": {"status": "invalid_image"}}
+        return {
+            "score": None,
+            "details": {
+                "status": "invalid_image",
+                "image_warnings": ["image_missing"],
+            },
+        }
 
-    try:
-        enhanced, mean_v = _enhance_bgr(img)
-        rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
-        res = mp_face.process(rgb)
-    except Exception:
-        return {"score": None, "details": {"status": "processing_error"}}
-
+    height, width = img.shape[:2]
+    resolution = {"width": int(width), "height": int(height)}
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    brightness_raw = float(np.mean(gray))
+    blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    brightness_score = _brightness_score(gray)
+    sharpness_score = _sharpness_from_blur(blur_var)
+    blur_score = 1.0 - sharpness_score
+    warnings: list[str] = []
+    subject_visibility = 0.0
+    face_detected = False
+    landmark_confidence = None
+    avg_ear = None
+    eyes_closed = None
 
-    if not res.multi_face_landmarks:
-        return {
-            "score": 0.4,
-            "details": {
-                "face_detected": False,
-                "avg_brightness": round(mean_v, 2),
-                "blur_var": round(blur, 2),
-                "low_light": mean_v < LOW_LIGHT_THRESHOLD,
-                "blurry": blur < BLUR_THRESHOLD,
-            },
-        }
+    if width * height < MIN_RESOLUTION:
+        warnings.append("image_low_resolution")
+    if brightness_raw < LOW_LIGHT_THRESHOLD:
+        warnings.append("image_too_dark")
+    if blur_var < BLUR_THRESHOLD:
+        warnings.append("image_blurry")
 
-    landmarks = res.multi_face_landmarks[0].landmark
-    left_ear = _eye_aspect_ratio(landmarks, LEFT_EYE)
-    right_ear = _eye_aspect_ratio(landmarks, RIGHT_EYE)
-    avg_ear = (left_ear + right_ear) / 2.0
-    if avg_ear < MIN_EAR:
-        return {
-            "score": 0.35,
-            "details": {
-                "face_detected": True,
-                "avg_ear": round(avg_ear, 4),
-                "eyes_closed": True,
-                "avg_brightness": round(mean_v, 2),
-                "blur_var": round(blur, 2),
-                "low_light": mean_v < LOW_LIGHT_THRESHOLD,
-                "blurry": blur < BLUR_THRESHOLD,
-            },
-        }
+    if mp_face is None:
+        warnings.append("subject_not_visible")
+    else:
+        try:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            res = mp_face.process(rgb)
+            if res.multi_face_landmarks:
+                face_detected = True
+                subject_visibility = 1.0
+                landmark_confidence = 0.9
+                landmarks = res.multi_face_landmarks[0].landmark
+                avg_ear = (_eye_aspect_ratio(landmarks, LEFT_EYE) + _eye_aspect_ratio(landmarks, RIGHT_EYE)) / 2.0
+                eyes_closed = avg_ear < 0.18
+                if eyes_closed:
+                    subject_visibility = 0.85
+            else:
+                warnings.append("subject_not_visible")
+        except Exception:
+            warnings.append("subject_not_visible")
 
-    return {
-        "score": 0.9,
-        "details": {
-            "face_detected": True,
-            "avg_ear": round(avg_ear, 4),
-            "eyes_closed": False,
-            "avg_brightness": round(mean_v, 2),
-            "blur_var": round(blur, 2),
-            "low_light": mean_v < LOW_LIGHT_THRESHOLD,
-            "blurry": blur < BLUR_THRESHOLD,
-        },
+    quality_components = [
+        brightness_score,
+        sharpness_score,
+        clamp01(subject_visibility, 0.0) or 0.0,
+        1.0 if width * height >= MIN_RESOLUTION else 0.45,
+    ]
+    image_quality_score = round(sum(quality_components) / len(quality_components), 4)
+    image_confidence = round(
+        max(0.0, min(image_quality_score * (0.95 if face_detected else 0.55), 1.0)),
+        4,
+    )
+
+    details = {
+        "status": "ok",
+        "resolution": resolution,
+        "brightness_score": safe_number(brightness_score),
+        "blur_score": safe_number(blur_score),
+        "sharpness_score": safe_number(sharpness_score),
+        "subject_visibility": safe_number(subject_visibility),
+        "image_quality_score": safe_number(image_quality_score),
+        "image_confidence": safe_number(image_confidence),
+        "image_warnings": clean_warning_codes(warnings),
+        "face_detected": face_detected,
+        "landmark_detection_confidence": safe_number(landmark_confidence),
+        "avg_brightness": safe_number(brightness_raw, 2),
+        "blur_var": safe_number(blur_var, 2),
+        "avg_ear": safe_number(avg_ear),
+        "eyes_closed": eyes_closed,
+        "low_light": brightness_raw < LOW_LIGHT_THRESHOLD,
+        "blurry": blur_var < BLUR_THRESHOLD,
     }
+    return {"score": details["image_confidence"], "details": details}
