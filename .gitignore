@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 data/baselines.json
 models/*.pt
+.venv/
+venv/
+.pytest_cache/

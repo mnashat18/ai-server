@@ -1,8 +1,3 @@
-from audio import analyze_audio
-from video import analyze_video
-from vision import analyze_face
-
-
 FEATURE_ORDER = [
     "camera_score",
     "face_detected",
@@ -73,16 +68,16 @@ def features_from_signals(signals: dict, task=None) -> tuple[dict, dict]:
         "avg_ear": _get_detail(camera_details, "avg_ear", 0.0),
         "eyes_closed": _bool(camera_details.get("eyes_closed")),
         "audio_score": float(audio_score) if audio_score is not None else 0.0,
-        "audio_energy": _get_detail(audio_details, "energy", 0.0),
-        "audio_zcr": _get_detail(audio_details, "zcr", 0.0),
-        "audio_centroid": _get_detail(audio_details, "centroid", 0.0),
-        "audio_duration": _get_detail(audio_details, "duration_sec", 0.0),
+        "audio_energy": _get_detail(audio_details, "rms_energy", _get_detail(audio_details, "energy", 0.0)),
+        "audio_zcr": _get_detail(audio_details, "zero_crossing_rate", _get_detail(audio_details, "zcr", 0.0)),
+        "audio_centroid": _get_detail(audio_details, "spectral_centroid", _get_detail(audio_details, "centroid", 0.0)),
+        "audio_duration": _get_detail(audio_details, "duration_seconds", _get_detail(audio_details, "duration_sec", 0.0)),
         "audio_silent": _bool(audio_details.get("silent")),
         "video_score": float(video_score) if video_score is not None else 0.0,
         "video_sway_std": _get_detail(video_details, "sway_std", 0.0),
-        "video_face_rate": _get_detail(video_details, "face_rate", 0.0),
+        "video_face_rate": _get_detail(video_details, "face_or_subject_visibility", _get_detail(video_details, "face_rate", 0.0)),
         "video_face_frames": _get_detail(video_details, "face_frames", 0.0),
-        "video_sampled_frames": _get_detail(video_details, "sampled_frames", 0.0),
+        "video_sampled_frames": _get_detail(video_details, "sampled_frames", _get_detail(video_details, "frame_count", 0.0)),
         "missing_camera": _bool(camera_score is None),
         "missing_audio": _bool(audio_score is None),
         "missing_video": _bool(video_score is None),
@@ -96,6 +91,10 @@ def vector_from_features(feature_map: dict) -> list[float]:
 
 
 def features_from_media(media, task=None) -> tuple[dict, dict]:
+    from audio import analyze_audio
+    from video import analyze_video
+    from vision import analyze_face
+
     image_path = media.get("image") if isinstance(media, dict) else getattr(media, "image", None)
     audio_path = media.get("audio") if isinstance(media, dict) else getattr(media, "audio", None)
     video_path = media.get("video") if isinstance(media, dict) else getattr(media, "video", None)

@@ -2,39 +2,27 @@ from __future__ import annotations
 
 from typing import Any
 
-from config import (
-    BASELINE_MIN_DRIFT,
-    BASELINE_STD_MULTIPLIER,
-    LOW_CONFIDENCE_THRESHOLD,
-    ML_WEIGHT,
-    MODEL_VERSION,
-    READINESS_FACE_WEIGHT,
-    READINESS_ML_BLEND,
-    READINESS_REACTION_WEIGHT,
-    READINESS_VOICE_WEIGHT,
-    TASK_ERR_GOOD,
-    TASK_ERR_MED,
-    TASK_RT_GOOD,
-    TASK_RT_MED,
-)
+from config import MODEL_VERSION
+from utils import clamp01, clean_warning_codes, safe_number, sanitize_text
+
+VALID_RISK_LEVELS = {"stable", "low_focus", "elevated_fatigue", "high_risk", "unknown"}
+VALID_ACTIONS = {
+    "continue_normal_activity",
+    "review_required",
+    "rescan_recommended",
+    "rest_advised",
+    "manager_review",
+}
+BASE_WEIGHTS = {
+    "video": 0.45,
+    "audio": 0.35,
+    "image": 0.15,
+    "task": 0.05,
+}
 
 
-def _clamp(value: float | None, default: float | None = None) -> float | None:
-    if value is None:
-        return default
-    try:
-        return max(0.0, min(float(value), 1.0))
-    except (TypeError, ValueError):
-        return default
-
-
-def _weighted_average(scores: dict[str, float], weights: dict[str, float]) -> float:
-    if not scores:
-        return 0.0
-    total_weight = sum(weights[k] for k in scores)
-    if total_weight <= 0:
-        return 0.0
-    return sum(scores[k] * weights[k] for k in scores) / total_weight
+def clamp_confidence(value: float | None) -> float | None:
+    return clamp01(value)
 
 
 def _task_value(task: Any, key: str):
@@ -45,139 +33,278 @@ def _task_value(task: Any, key: str):
     return getattr(task, key, None)
 
 
-def bucket_score_low(value, good, medium):
-    if value <= good:
-        return 1.0
-    if value <= medium:
-        return 0.6
-    return 0.3
-
-
-def compute_task_score(task) -> float | None:
+def compute_task_score(task: Any) -> float | None:
     if not task:
         return None
-    scores = []
     reaction_time = _task_value(task, "reaction_time")
     errors = _task_value(task, "errors")
     attempts = _task_value(task, "attempts")
-
+    scores: list[float] = []
     if reaction_time is not None:
-        scores.append(bucket_score_low(float(reaction_time), TASK_RT_GOOD, TASK_RT_MED))
+        rt = float(reaction_time)
+        scores.append(0.92 if rt <= 0.55 else 0.72 if rt <= 0.85 else 0.45 if rt <= 1.15 else 0.22)
     if errors is not None:
-        scores.append(bucket_score_low(int(errors), TASK_ERR_GOOD, TASK_ERR_MED))
+        err = int(errors)
+        scores.append(0.95 if err == 0 else 0.75 if err <= 1 else 0.5 if err <= 3 else 0.2)
     if attempts is not None:
-        scores.append(1.0 if int(attempts) >= 3 else 0.6 if int(attempts) >= 1 else 0.3)
+        att = int(attempts)
+        scores.append(0.95 if att >= 3 else 0.6 if att >= 1 else 0.2)
     if not scores:
         return None
-    return round(sum(scores) / len(scores), 3)
-
-
-def _combine_face_score(camera_score: float | None, video_score: float | None) -> float | None:
-    present = {}
-    weights = {}
-    if camera_score is not None:
-        present["camera"] = camera_score
-        weights["camera"] = 0.45
-    if video_score is not None:
-        present["video"] = video_score
-        weights["video"] = 0.55
-    if not present:
-        return None
-    return round(_weighted_average(present, weights), 3)
+    return round(sum(scores) / len(scores), 4)
 
 
 def _baseline_stat(baseline: dict | None, key: str) -> dict | None:
-    if not baseline:
-        return None
-    value = baseline.get(key)
+    value = (baseline or {}).get(key)
     return value if isinstance(value, dict) else None
 
 
 def _baseline_drift(current: float | None, stat: dict | None) -> dict | None:
     if current is None or not stat or stat.get("avg") is None:
         return None
-    avg = float(stat.get("avg"))
-    std = stat.get("std")
-    threshold = max(BASELINE_MIN_DRIFT, float(std or 0.0) * BASELINE_STD_MULTIPLIER)
-    drift = round(float(current) - avg, 3)
+    avg = float(stat["avg"])
+    std = float(stat.get("std") or 0.0)
+    threshold = max(0.1, std * 1.5)
+    drift = round(float(current) - avg, 4)
     return {
-        "current": round(float(current), 3),
-        "baseline_avg": round(avg, 3),
-        "baseline_std": round(float(std), 3) if std is not None else None,
-        "drift": drift,
-        "threshold": round(threshold, 3),
+        "current": safe_number(current),
+        "baseline_avg": safe_number(avg),
+        "baseline_std": safe_number(std),
+        "drift": safe_number(drift),
+        "threshold": safe_number(threshold),
         "below_threshold": drift <= (-threshold),
     }
 
 
-def _explanation(risk_level: str, drift_flags: list[str], baseline_used: bool) -> str:
-    if risk_level == "high_risk":
-        if baseline_used:
-            return "Readiness dropped clearly below the employee's typical pattern across multiple signals."
-        return "Multiple signals point to reduced readiness with strong agreement."
-    if risk_level == "elevated_fatigue":
-        if baseline_used:
-            return "Current signals are below the employee's usual readiness pattern and suggest elevated fatigue."
-        return "Current signals suggest elevated fatigue with moderate agreement."
-    if risk_level == "low_focus":
-        if baseline_used and drift_flags:
-            return "A mild drop from the employee's normal pattern suggests lower focus right now."
-        return "Signals suggest a mild dip in focus, but not a broad readiness drop."
-    return "Signals are within the expected readiness range."
+def _normalize_weights(weight_map: dict[str, float]) -> dict[str, float]:
+    total = sum(max(weight, 0.0) for weight in weight_map.values())
+    if total <= 0:
+        return {}
+    return {name: weight / total for name, weight in weight_map.items() if weight > 0}
 
 
-def _suggested_action(risk_level: str, confidence: float, quality_weak: bool) -> str:
+def _signal_score(analysis: dict, score_key: str) -> float | None:
+    details = analysis.get("details", {}) if isinstance(analysis, dict) else {}
+    return clamp01(details.get(score_key) if score_key in details else analysis.get("score"))
+
+
+def _signal_warnings(analysis: dict, key: str) -> list[str]:
+    details = analysis.get("details", {}) if isinstance(analysis, dict) else {}
+    return clean_warning_codes(details.get(key) or [])
+
+
+def _signal_present(analysis: dict) -> bool:
+    if not isinstance(analysis, dict):
+        return False
+    details = analysis.get("details", {})
+    return analysis.get("score") is not None or details.get("status") not in {None, "missing"}
+
+
+def _build_signal_profiles(signals: dict, task_score: float | None) -> dict[str, dict]:
+    video = signals.get("video", {}) or {}
+    audio = signals.get("voice", {}) or {}
+    image = signals.get("camera", {}) or {}
+    return {
+        "video": {
+            "present": _signal_present(video),
+            "score": _signal_score(video, "visual_confidence"),
+            "quality": _signal_score(video, "visual_quality_score"),
+            "warnings": _signal_warnings(video, "visual_warnings"),
+        },
+        "audio": {
+            "present": _signal_present(audio),
+            "score": _signal_score(audio, "audio_confidence"),
+            "quality": _signal_score(audio, "audio_quality_score"),
+            "warnings": _signal_warnings(audio, "audio_warnings"),
+        },
+        "image": {
+            "present": _signal_present(image),
+            "score": _signal_score(image, "image_confidence"),
+            "quality": _signal_score(image, "image_quality_score"),
+            "warnings": _signal_warnings(image, "image_warnings"),
+        },
+        "task": {
+            "present": task_score is not None,
+            "score": task_score,
+            "quality": task_score,
+            "warnings": [],
+        },
+    }
+
+
+def _adaptive_weights(profiles: dict[str, dict]) -> dict[str, float]:
+    weighted: dict[str, float] = {}
+    for name, profile in profiles.items():
+        if not profile["present"] or profile["score"] is None:
+            continue
+        quality = profile["quality"] if profile["quality"] is not None else profile["score"]
+        warning_penalty = min(len(profile["warnings"]) * 0.12, 0.45)
+        weighted[name] = BASE_WEIGHTS[name] * max(0.05, (quality or 0.0) - warning_penalty)
+    return _normalize_weights(weighted)
+
+
+def _agreement_factor(profiles: dict[str, dict]) -> tuple[float, float]:
+    scores = [profile["score"] for profile in profiles.values() if profile["present"] and profile["score"] is not None]
+    if len(scores) < 2:
+        return 0.0, 0.0
+    spread = max(scores) - min(scores)
+    return max(0.0, 0.18 - spread * 0.18), min(spread * 0.45, 0.25)
+
+
+def _confidence_from_profiles(
+    *,
+    fused_score: float,
+    profiles: dict[str, dict],
+    weights: dict[str, float],
+    quality: dict,
+    baseline_used: bool,
+    ml_result: dict | None,
+) -> tuple[float, dict]:
+    available = [name for name, profile in profiles.items() if profile["present"] and profile["score"] is not None and name != "task"]
+    major_available = [name for name in available if name in {"video", "audio"}]
+    agreement_bonus, conflict_penalty = _agreement_factor(profiles)
+    quality_multiplier = float((quality or {}).get("confidence_multiplier") or 0.3)
+    coverage = len(available) / 3.0
+    missing_major_penalty = 0.18 if len(major_available) == 1 else 0.32 if len(major_available) == 0 else 0.0
+    warning_penalty = min(len((quality or {}).get("warnings") or []) * 0.03, 0.18)
+    ml_confidence = clamp01((ml_result or {}).get("confidence"))
+
+    confidence = (
+        0.32 * fused_score
+        + 0.22 * quality_multiplier
+        + 0.18 * coverage
+        + agreement_bonus
+        + (0.06 if baseline_used else 0.0)
+        + (0.05 * ml_confidence if ml_confidence is not None else 0.0)
+        - missing_major_penalty
+        - warning_penalty
+        - conflict_penalty
+    )
+
+    ceiling = 0.98
+    if len(available) == 1:
+        ceiling = 0.55
+        if "image" in available:
+            ceiling = 0.35
+    elif len(major_available) < 2:
+        ceiling = 0.78
+    if (quality or {}).get("weak"):
+        ceiling = min(ceiling, 0.72)
+    if conflict_penalty > 0.12:
+        ceiling = min(ceiling, 0.68)
+
+    confidence = min(clamp01(confidence, 0.0) or 0.0, ceiling)
+    return round(confidence, 4), {
+        "weights": {name: safe_number(value) for name, value in weights.items()},
+        "agreement_bonus": safe_number(agreement_bonus),
+        "conflict_penalty": safe_number(conflict_penalty),
+        "quality_multiplier": safe_number(quality_multiplier),
+        "coverage": safe_number(coverage),
+        "missing_major_penalty": safe_number(missing_major_penalty),
+        "warning_penalty": safe_number(warning_penalty),
+        "ceiling": safe_number(ceiling),
+        "ml_confidence": safe_number(ml_confidence),
+    }
+
+
+def _risk_level(readiness_score: int, confidence: float, baseline_flags: list[str], quality_failed: bool) -> str:
+    if quality_failed or confidence < 0.3:
+        return "unknown"
+    if readiness_score < 35 and (confidence >= 0.62 or len(baseline_flags) >= 2):
+        return "high_risk"
+    if readiness_score < 52 and (confidence >= 0.5 or baseline_flags):
+        return "elevated_fatigue"
+    if readiness_score < 68:
+        return "low_focus"
+    return "stable"
+
+
+def _suggested_action(risk_level: str, confidence: float, quality: dict) -> str:
+    if quality.get("status") == "failed":
+        return "rescan_recommended"
     if risk_level == "high_risk":
-        return "Pause demanding work, retake the scan after a short break, and escalate if the next scan stays high risk."
+        return "manager_review"
     if risk_level == "elevated_fatigue":
-        return "Take a short break and consider a follow-up scan before continuing demanding work."
+        return "rest_advised"
     if risk_level == "low_focus":
-        return "A quick reset or short break is recommended before the next demanding task."
-    if quality_weak or confidence < 0.65:
-        return "Readiness looks stable, but a clearer retake can improve confidence."
-    return "No action needed."
+        return "review_required" if confidence >= 0.45 else "rescan_recommended"
+    if confidence < 0.45 or quality.get("weak"):
+        return "rescan_recommended"
+    return "continue_normal_activity"
+
+
+def _explanation(profiles: dict[str, dict], quality: dict, risk_level: str, confidence: float) -> str:
+    positives: list[str] = []
+    negatives: list[str] = []
+    if profiles["video"]["score"] is not None and (profiles["video"]["quality"] or 0.0) >= 0.55:
+        positives.append("Video quality was acceptable")
+    if profiles["audio"]["score"] is not None and (profiles["audio"]["quality"] or 0.0) >= 0.55:
+        positives.append("voice signal was clear")
+    if profiles["image"]["score"] is not None and (profiles["image"]["quality"] or 0.0) >= 0.55:
+        positives.append("thumbnail quality was usable")
+    if "audio_too_noisy" in quality.get("warnings", []):
+        negatives.append("Audio was noisy")
+    if "video_blurry" in quality.get("warnings", []) or "image_blurry" in quality.get("warnings", []):
+        negatives.append("video was partially blurred")
+    if "subject_not_visible" in quality.get("warnings", []):
+        negatives.append("subject visibility was limited")
+    if profiles["video"]["present"] is False and profiles["audio"]["present"] is False and profiles["image"]["present"]:
+        negatives.append("Only thumbnail data was available")
+
+    lead = ". ".join(part for part in [", ".join(positives) if positives else None, ", ".join(negatives) if negatives else None] if part)
+    if not lead:
+        lead = "Media signals were mixed"
+    if risk_level == "stable":
+        tail = "Both signals suggest stable readiness with moderate confidence." if confidence >= 0.5 else "Confidence was reduced because the available signals were limited."
+    elif risk_level == "low_focus":
+        tail = "The fused result suggests a mild reduction in readiness."
+    elif risk_level == "elevated_fatigue":
+        tail = "The fused result suggests elevated fatigue and should be reviewed."
+    elif risk_level == "high_risk":
+        tail = "The fused result suggests a high-risk state that merits review."
+    else:
+        tail = "A re-scan is recommended for a more reliable result."
+    return sanitize_text(f"{lead}. {tail}", fallback="A re-scan is recommended for a more reliable result.", max_len=500) or "A re-scan is recommended for a more reliable result."
 
 
 def compute_result(
     *,
-    camera_score: float | None,
-    video_score: float | None,
-    voice_score: float | None,
-    task=None,
+    signals: dict,
+    task: Any = None,
     previous_confidence: float | None = None,
     baseline: dict | None = None,
     baseline_used: bool = False,
     quality: dict | None = None,
     ml_result: dict | None = None,
 ) -> dict:
-    camera_score = _clamp(camera_score)
-    video_score = _clamp(video_score)
-    voice_score = _clamp(voice_score)
-    reaction_score = compute_task_score(task)
-    face_score = _combine_face_score(camera_score, video_score)
+    quality = quality or {}
+    task_score = compute_task_score(task)
+    profiles = _build_signal_profiles(signals, task_score)
+    weights = _adaptive_weights(profiles)
 
-    modality_scores = {}
-    weights = {}
-    if face_score is not None:
-        modality_scores["face"] = face_score
-        weights["face"] = READINESS_FACE_WEIGHT
-    if voice_score is not None:
-        modality_scores["voice"] = voice_score
-        weights["voice"] = READINESS_VOICE_WEIGHT
-    if reaction_score is not None:
-        modality_scores["reaction"] = reaction_score
-        weights["reaction"] = READINESS_REACTION_WEIGHT
+    fused_score = 0.0
+    for name, weight in weights.items():
+        score = profiles[name]["score"]
+        if score is not None:
+            fused_score += score * weight
 
-    readiness = _weighted_average(modality_scores, weights)
-    ml_confidence = ml_result.get("confidence") if isinstance(ml_result, dict) else None
+    ml_confidence = clamp01((ml_result or {}).get("confidence"))
     if ml_confidence is not None:
-        readiness = (readiness * (1 - READINESS_ML_BLEND)) + (float(ml_confidence) * READINESS_ML_BLEND)
+        fused_score = (fused_score * 0.84) + (ml_confidence * 0.16)
+    fused_score = clamp01(fused_score, 0.0) or 0.0
+
+    image_score = profiles["image"]["score"]
+    video_score = profiles["video"]["score"]
+    face_score = None
+    if image_score is not None and video_score is not None:
+        face_score = round((image_score * 0.4) + (video_score * 0.6), 4)
+    else:
+        face_score = image_score if image_score is not None else video_score
 
     face_drift = _baseline_drift(face_score, _baseline_stat(baseline, "face_avg")) if baseline_used else None
-    voice_drift = _baseline_drift(voice_score, _baseline_stat(baseline, "voice_avg")) if baseline_used else None
-    reaction_drift = _baseline_drift(reaction_score, _baseline_stat(baseline, "reaction_avg")) if baseline_used else None
-
-    drift_flags = [
+    voice_drift = _baseline_drift(profiles["audio"]["score"], _baseline_stat(baseline, "voice_avg")) if baseline_used else None
+    reaction_drift = _baseline_drift(task_score, _baseline_stat(baseline, "reaction_avg")) if baseline_used else None
+    baseline_flags = [
         name
         for name, drift in {
             "face": face_drift,
@@ -187,49 +314,34 @@ def compute_result(
         if drift and drift.get("below_threshold")
     ]
 
-    if baseline_used and drift_flags:
-        readiness -= 0.06 * len(drift_flags)
+    if baseline_flags:
+        fused_score = max(0.0, fused_score - (0.03 * len(baseline_flags)))
 
-    quality_multiplier = float((quality or {}).get("confidence_multiplier", 1.0))
-    readiness = max(0.0, min(readiness, 1.0))
+    confidence, calibration = _confidence_from_profiles(
+        fused_score=fused_score,
+        profiles=profiles,
+        weights=weights,
+        quality=quality,
+        baseline_used=baseline_used,
+        ml_result=ml_result,
+    )
+    readiness_score = int(round((clamp01(fused_score, 0.0) or 0.0) * 100))
+    risk_level = _risk_level(readiness_score, confidence, baseline_flags, quality.get("status") == "failed")
+    if risk_level not in VALID_RISK_LEVELS:
+        risk_level = "unknown"
+    suggested_action = _suggested_action(risk_level, confidence, quality)
+    if suggested_action not in VALID_ACTIONS:
+        suggested_action = "rescan_recommended"
+    explanation = _explanation(profiles, quality, risk_level, confidence)
 
-    coverage = len(modality_scores) / 3.0
-    baseline_bonus = 0.1 if baseline_used else 0.0
-    confidence = min(1.0, max(0.0, (0.45 * quality_multiplier) + (0.35 * coverage) + baseline_bonus))
-    if drift_flags and baseline_used:
-        confidence = min(1.0, confidence + 0.05)
-    if (quality or {}).get("weak"):
-        confidence = max(0.0, confidence - 0.08)
-    confidence = round(confidence, 3)
-
-    readiness_score = int(round(max(0.0, min(1.0, readiness)) * 100))
-    previous = previous_confidence if previous_confidence is not None else confidence
-    confidence_drift = round(confidence - float(previous), 3)
-
-    low_modalities = sum(1 for score in modality_scores.values() if score < 0.45)
-    medium_modalities = sum(1 for score in modality_scores.values() if score < 0.6)
-
-    if baseline_used:
-        if len(drift_flags) >= 2 and readiness_score < 45:
-            risk_level = "high_risk"
-        elif len(drift_flags) >= 2 or (len(drift_flags) == 1 and readiness_score < 55):
-            risk_level = "elevated_fatigue"
-        elif len(drift_flags) == 1 or (medium_modalities >= 2 and readiness_score < 65):
-            risk_level = "low_focus"
-        else:
-            risk_level = "stable"
-    else:
-        if low_modalities >= 2 and readiness_score < 40 and confidence >= LOW_CONFIDENCE_THRESHOLD:
-            risk_level = "high_risk"
-        elif medium_modalities >= 2 and readiness_score < 52 and confidence >= LOW_CONFIDENCE_THRESHOLD:
-            risk_level = "elevated_fatigue"
-        elif medium_modalities >= 1 and readiness_score < 65 and confidence >= LOW_CONFIDENCE_THRESHOLD:
-            risk_level = "low_focus"
-        else:
-            risk_level = "stable"
-
-    explanation = _explanation(risk_level, drift_flags, baseline_used)
-    suggested_action = _suggested_action(risk_level, confidence, bool((quality or {}).get("weak")))
+    previous = clamp01(previous_confidence, confidence)
+    confidence_drift = safe_number(confidence - (previous if previous is not None else confidence))
+    modality_scores = {
+        "video": safe_number(profiles["video"]["score"]),
+        "audio": safe_number(profiles["audio"]["score"]),
+        "image": safe_number(profiles["image"]["score"]),
+        "task": safe_number(task_score),
+    }
 
     return {
         "status": "completed",
@@ -237,25 +349,24 @@ def compute_result(
         "failure_reason": None,
         "readiness_score": readiness_score,
         "risk_level": risk_level,
-        "overall_state": risk_level,
-        "confidence": confidence,
-        "camera_confidence": round(face_score or 0.0, 3),
-        "voice_confidence": round(voice_score or 0.0, 3),
-        "task_performance_score": int(round((reaction_score or 0.0) * 100)),
+        "confidence": safe_number(confidence),
+        "camera_confidence": safe_number(face_score),
+        "voice_confidence": safe_number(profiles["audio"]["score"]),
+        "task_performance_score": int(round((task_score or 0.0) * 100)) if task_score is not None else None,
         "baseline_used": baseline_used,
         "confidence_drift": confidence_drift,
         "face_metrics": {
-            "camera_score": camera_score,
-            "video_score": video_score,
-            "face_score": face_score,
+            "image_score": safe_number(image_score),
+            "video_score": safe_number(video_score),
+            "face_score": safe_number(face_score),
             "baseline_drift": face_drift,
         },
         "voice_metrics": {
-            "voice_score": voice_score,
+            "voice_score": safe_number(profiles["audio"]["score"]),
             "baseline_drift": voice_drift,
         },
         "reaction_metrics": {
-            "reaction_score": reaction_score,
+            "reaction_score": safe_number(task_score),
             "reaction_time": _task_value(task, "reaction_time"),
             "errors": _task_value(task, "errors"),
             "attempts": _task_value(task, "attempts"),
@@ -264,12 +375,12 @@ def compute_result(
         "explanation": explanation,
         "suggested_action": suggested_action,
         "ai_model_version": MODEL_VERSION,
-        "confidence_components": {
-            "modality_scores": modality_scores,
-            "quality_multiplier": quality_multiplier,
-            "baseline_used": baseline_used,
-            "drift_flags": drift_flags,
-            "ml_confidence": ml_confidence,
-            "ml_weight": ML_WEIGHT if ml_confidence is not None else 0.0,
+        "modality_scores": modality_scores,
+        "fusion_details": {
+            "signal_profiles": profiles,
+            "adaptive_weights": calibration["weights"],
+            "baseline_flags": baseline_flags,
+            "fused_score": safe_number(fused_score),
+            "calibration": calibration,
         },
     }

@@ -1,12 +1,17 @@
 #config.py
+import os
 import random
 import numpy as np
-import torch
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None
 
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
-torch.manual_seed(SEED)
+if torch is not None:
+    torch.manual_seed(SEED)
 
 MODEL_VERSION = "1.2.0"
 
@@ -36,9 +41,9 @@ BASELINE_EVENING_START_HOUR = 17
 BASELINE_ALPHA = 0.25
 BASELINE_DRIFT_THRESHOLD = 0.12
 BASELINE_DRIFT_PENALTY = 0.05
-BASELINE_PATH = "data/baselines.json"
-ML_MODEL_PATH = "models/latest.pt"
-MAX_DOWNLOAD_BYTES = 20000000
+BASELINE_PATH = os.getenv("BASELINE_PATH", "data/baselines.json")
+ML_MODEL_PATH = os.getenv("ML_MODEL_PATH", "models/latest.pt")
+MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", "20000000"))
 
 MIN_AUDIO_DURATION_SEC = 1.5
 MIN_TASK_ATTEMPTS = 3

@@ -10,16 +10,32 @@ Expected runtime flow:
 
 1. Mobile or backend creates a `wellness_scans` item in Directus.
 2. Media assets are linked in `scan_media`.
-3. Mobile calls `POST /process` with `scan_id` and optional overrides.
-4. The AI server resolves scan context from Directus, downloads assets, runs quality gating and readiness scoring, updates personalized baseline, writes `scan_results`, updates `wellness_scans`, updates `business_profile_members`, and optionally creates `alerts` / `notifications`.
+3. Mobile calls `POST /process` with only `scan_id`.
+4. The AI server reads `wellness_scans` by `scan_id`, accepts only `media_ready`, marks the scan `processing`, returns `202`, then continues in the background.
+5. Background processing resolves `scan_media` from Directus, downloads Directus assets by file ID, validates media quality, runs scoring, writes exactly one `scan_results` row, and marks `wellness_scans` as `completed` or `failed`.
 
 ## Environment
 
 - `DIRECTUS_URL`
 - `DIRECTUS_TOKEN`
+- `DIRECTUS_TIMEOUT`
 - `PORT`
+- `ML_MODEL_PATH`
+- `MAX_DOWNLOAD_BYTES`
+- `REQUIRE_VIDEO`
+- `REQUIRE_AUDIO`
+- `REQUIRE_FACE`
+- `REQUIRE_IMAGE`
+- `REQUIRE_PHRASE_MATCH`
+- `PHRASE_MATCH_THRESHOLD`
+- `MIN_VIDEO_SECONDS`
+- `MIN_AUDIO_SECONDS`
+- `MIN_FACE_VISIBLE_RATIO`
+- `MIN_VIDEO_QUALITY`
+- `MIN_AUDIO_QUALITY`
+- `MIN_IMAGE_QUALITY`
 
-If `models/latest.pt` exists, ML prediction is blended into readiness scoring.
+`ML_MODEL_PATH` defaults to `models/latest.pt`. If the configured model file is present and loadable, ML prediction is blended into readiness scoring. If the model or transcription stack is unavailable, scans fail cleanly instead of crashing the server.
 
 ## Endpoints
 
@@ -33,26 +49,11 @@ If `models/latest.pt` exists, ML prediction is blended into readiness scoring.
 
 ```json
 {
-  "scan_id": "wellness-scan-id",
-  "request_id": "scan-request-id-optional",
-  "member_id": "business-profile-member-id",
-  "business_profile_id": "business-profile-id",
-  "department_id": "department-id",
-  "previous_confidence": 0.71,
-  "media": {
-    "image": "directus-image-asset-id",
-    "audio": "directus-audio-asset-id",
-    "video": "directus-video-asset-id"
-  },
-  "task": {
-    "reaction_time": 0.72,
-    "errors": 1,
-    "attempts": 5
-  }
+  "scan_id": "wellness-scan-id"
 }
 ```
 
-If `media` is omitted, the service will try to resolve assets from `scan_media` using `scan_id`.
+The backend ignores old request-body overrides such as `media`, `task`, `previous_confidence`, `member_id`, `business_profile_id`, `department_id`, and client media URLs. `/process` trusts Directus `wellness_scans` and `scan_media` only.
 
 ## First real test
 
@@ -111,3 +112,49 @@ Training still expects a JSONL manifest at `data/manifest.jsonl`.
 ```bash
 python -m ml.train --manifest data/manifest.jsonl --out models/latest.pt
 ```
+
+## Directus expectations
+
+- `wellness_scans.status` must use only: `pending`, `media_ready`, `processing`, `completed`, `failed`
+- `scan_media.scan_id` must point to the target `wellness_scans` row
+- `scan_media.video_file`, `scan_media.audio_file`, and `scan_media.thumbnail` should store Directus file IDs, not client URLs
+- `scan_results.scan_id` must be unique at the database level
+
+Optional Directus fields are supported when present and skipped when absent:
+
+- `wellness_scans.failure_message`
+- `wellness_scans.user_message`
+- `wellness_scans.expected_phrase`
+- `wellness_scans.processing_attempts`
+- `wellness_scans.processing_started_at`
+- `wellness_scans.ai_model_version`
+- `scan_results.internal_analysis`
+- `scan_results.analysis_metadata`
+- `scan_results.spoken_transcript`
+- `scan_results.expected_phrase`
+- `scan_results.phrase_match_score`
+- `scan_results.validation_warnings`
+- `scan_results.audio_quality_score`
+- `scan_results.video_quality_score`
+- `scan_results.image_quality_score`
+
+## Deployment SQL
+
+Apply [2026_06_05_scan_results_unique_scan_id.sql](</d:/flutter/last/ai-server/sql/2026_06_05_scan_results_unique_scan_id.sql>) before deployment. It:
+
+- removes duplicate `scan_results` rows, keeping the newest row per `scan_id`
+- adds the `scan_results_scan_id_unique` unique constraint on `scan_results.scan_id`
+
+If you are applying this through Directus:
+
+1. Open the Directus project connected to the deployment database.
+2. Open the SQL runner or run the SQL directly against Postgres.
+3. Execute `sql/2026_06_05_scan_results_unique_scan_id.sql`.
+4. Verify `scan_results` no longer has duplicate `scan_id` values.
+5. Verify the `scan_results_scan_id_unique` constraint exists.
+
+## scan_requests / notifications
+
+Previous backend behavior updated `scan_requests` on successful AI completion for `manager_request` and `bulk_request` scans. That path has been restored after successful result writeback so manager/bulk request records can still close without relying on Directus Flow.
+
+Notifications were not restored. In the old code they were already effectively disabled because no notification target user was resolved. The current mobile result flow in this repository reads scan state from `wellness_scans` and `scan_results`; there is no evidence here that mobile depends on notification creation. Future notification delivery should be handled by a dedicated backend or business-event flow after result persistence, not inline inside `/process`.

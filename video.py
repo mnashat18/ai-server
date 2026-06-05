@@ -1,202 +1,218 @@
-#video.py
-import cv2
-import mediapipe as mp
 import numpy as np
 
-from config import MIN_SWAY_STD, VIDEO_FRAME_STRIDE, VIDEO_MAX_FRAMES
+from utils import clamp01, clean_warning_codes, safe_number
 
-mp_face = mp.solutions.face_mesh.FaceMesh(static_image_mode=False)
-LOW_LIGHT_THRESHOLD = 70.0
-BLUR_THRESHOLD = 40.0
-QUALITY_LOW_LIGHT_RATE = 0.6
-QUALITY_BLUR_RATE = 0.6
-NEUTRAL_SCORE = 0.5
-MAX_FRAME_SIDE = 640
+try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
 
-
-def _blend_with_neutral(score: float, quality_weight: float) -> float:
-    weight = max(0.0, min(quality_weight, 1.0))
-    return NEUTRAL_SCORE + (score - NEUTRAL_SCORE) * weight
+try:
+    import mediapipe as mp
+except Exception:  # pragma: no cover
+    mp = None
 
 
-def _resize_for_speed(bgr, max_side: int = MAX_FRAME_SIDE):
-    h, w = bgr.shape[:2]
-    if max(h, w) <= max_side:
-        return bgr
-    scale = max_side / float(max(h, w))
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    return cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+LOW_LIGHT_THRESHOLD = 75.0
+BLUR_THRESHOLD = 65.0
+MIN_DURATION_SEC = 1.5
+MIN_RESOLUTION = (480, 360)
+MAX_SAMPLED_FRAMES = 180
+FRAME_STRIDE = 3
+
+mp_face = mp.solutions.face_mesh.FaceMesh(static_image_mode=False) if mp else None
 
 
-def _quality_info(sampled: int, low_light_frames: int, blurry_frames: int):
-    if sampled <= 0:
-        return 0.0, ["no_frames"], 0.0, 0.0
-    low_light_rate = low_light_frames / sampled
-    blurry_rate = blurry_frames / sampled
-    flags = []
-    if low_light_rate >= QUALITY_LOW_LIGHT_RATE:
-        flags.append("low_light")
-    if blurry_rate >= QUALITY_BLUR_RATE:
-        flags.append("blurry")
-    if flags:
-        quality_weight = max(0.0, min(1.0 - max(low_light_rate, blurry_rate), 1.0))
-    else:
-        quality_weight = 1.0
-    return quality_weight, flags, low_light_rate, blurry_rate
+def _resolution_score(width: int, height: int) -> float:
+    if width >= 1280 and height >= 720:
+        return 1.0
+    if width >= MIN_RESOLUTION[0] and height >= MIN_RESOLUTION[1]:
+        return 0.7
+    if width > 0 and height > 0:
+        return 0.4
+    return 0.0
 
 
-def _apply_gamma(bgr, gamma: float):
-    if gamma <= 0:
-        return bgr
-    inv = 1.0 / gamma
-    table = (np.arange(256) / 255.0) ** inv
-    table = np.clip(table * 255.0, 0, 255).astype("uint8")
-    return cv2.LUT(bgr, table)
-
-
-def _enhance_bgr(bgr):
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l2 = clahe.apply(l)
-    lab = cv2.merge((l2, a, b))
-    bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    mean_v = float(np.mean(gray))
-    if mean_v < LOW_LIGHT_THRESHOLD:
-        bgr = _apply_gamma(bgr, 1.6)
-    elif mean_v > 200:
-        bgr = _apply_gamma(bgr, 0.85)
-    return bgr, mean_v
+def _landmark_visibility(frame) -> tuple[bool, float | None]:
+    if mp_face is None:
+        return False, None
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    res = mp_face.process(rgb)
+    if res.multi_face_landmarks:
+        return True, 0.9
+    return False, 0.0
 
 
 def analyze_video(video_path: str) -> dict:
     if not video_path:
-        return {"score": None, "details": {"status": "missing"}}
+        return {
+            "score": None,
+            "details": {
+                "status": "missing",
+                "visual_warnings": ["video_missing"],
+            },
+        }
+
+    if cv2 is None:
+        return {
+            "score": None,
+            "details": {
+                "status": "open_failed",
+                "visual_warnings": ["video_missing"],
+            },
+        }
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return {"score": None, "details": {"status": "open_failed"}}
+        return {
+            "score": None,
+            "details": {
+                "status": "open_failed",
+                "visual_warnings": ["video_missing"],
+            },
+        }
 
-    sway = []
-    frames = 0
-    sampled = 0
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    duration_seconds = (frame_count / fps) if fps and frame_count else 0.0
+
+    sampled_frames = 0
+    usable_frames = 0
     face_frames = 0
     low_light_frames = 0
     blurry_frames = 0
-    brightness_vals = []
-    blur_vals = []
-    max_frames = VIDEO_MAX_FRAMES
+    landmark_confidences: list[float] = []
+    brightness_values: list[float] = []
+    blur_values: list[float] = []
+    camera_motion: list[float] = []
+    prev_gray = None
+    warnings: list[str] = []
 
     try:
-        while cap.isOpened() and frames < max_frames:
-            ret, frame = cap.read()
-            if not ret:
+        while cap.isOpened() and sampled_frames < MAX_SAMPLED_FRAMES:
+            ok, frame = cap.read()
+            if not ok:
                 break
 
-            frames += 1
-            sampled += 1
-            try:
-                frame = _resize_for_speed(frame)
-                enhanced, mean_v = _enhance_bgr(frame)
-                gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
-                blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-                brightness_vals.append(mean_v)
-                blur_vals.append(blur)
-                if mean_v < LOW_LIGHT_THRESHOLD:
-                    low_light_frames += 1
-                if blur < BLUR_THRESHOLD:
-                    blurry_frames += 1
-
-                rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
-                res = mp_face.process(rgb)
-            except Exception:
+            current_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            if current_index % FRAME_STRIDE != 0:
                 continue
 
-            if res.multi_face_landmarks:
-                face_frames += 1
-                nose = res.multi_face_landmarks[0].landmark[1]
-                sway.append(nose.x)
+            sampled_frames += 1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            brightness = float(np.mean(gray))
+            blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            brightness_values.append(brightness)
+            blur_values.append(blur_var)
 
-            if VIDEO_FRAME_STRIDE > 1:
-                for _ in range(VIDEO_FRAME_STRIDE - 1):
-                    if frames >= max_frames:
-                        break
-                    if not cap.grab():
-                        break
-                    frames += 1
+            is_bright_enough = brightness >= LOW_LIGHT_THRESHOLD
+            is_sharp_enough = blur_var >= BLUR_THRESHOLD
+            if not is_bright_enough:
+                low_light_frames += 1
+            if not is_sharp_enough:
+                blurry_frames += 1
+
+            if prev_gray is not None:
+                diff = cv2.absdiff(prev_gray, gray)
+                camera_motion.append(float(np.mean(diff)))
+            prev_gray = gray
+
+            face_visible, landmark_confidence = _landmark_visibility(frame)
+            if landmark_confidence is not None:
+                landmark_confidences.append(float(landmark_confidence))
+            if face_visible:
+                face_frames += 1
+
+            usable = is_bright_enough and is_sharp_enough and face_visible
+            if usable:
+                usable_frames += 1
     finally:
         cap.release()
 
-    quality_weight, quality_flags, low_light_rate, blurry_rate = _quality_info(
-        sampled,
-        low_light_frames,
-        blurry_frames,
+    if duration_seconds and duration_seconds < MIN_DURATION_SEC:
+        warnings.append("video_too_short")
+    if width < MIN_RESOLUTION[0] or height < MIN_RESOLUTION[1]:
+        warnings.append("video_low_resolution")
+
+    avg_brightness = float(np.mean(brightness_values)) if brightness_values else 0.0
+    avg_blur = float(np.mean(blur_values)) if blur_values else 0.0
+    brightness_score = clamp01(avg_brightness / 160.0, 0.0) or 0.0
+    sharpness_score = clamp01(avg_blur / 180.0, 0.0) or 0.0
+    blur_score = 1.0 - sharpness_score
+    low_light_ratio = (low_light_frames / sampled_frames) if sampled_frames else 1.0
+    blurry_ratio = (blurry_frames / sampled_frames) if sampled_frames else 1.0
+    usable_frame_ratio = (usable_frames / sampled_frames) if sampled_frames else 0.0
+    face_visibility = (face_frames / sampled_frames) if sampled_frames else 0.0
+    motion_mean = float(np.mean(camera_motion)) if camera_motion else 0.0
+    motion_std = float(np.std(camera_motion)) if camera_motion else 0.0
+    motion_stability_score = float(np.clip(1.0 - min(motion_std / 32.0, 1.0), 0.0, 1.0))
+    landmark_detection_confidence = (
+        float(np.mean(landmark_confidences)) if landmark_confidences else (0.0 if mp_face else None)
     )
 
-    if len(sway) < 5:
-        raw_score = 0.4
-        score = _blend_with_neutral(raw_score, quality_weight) if quality_flags else raw_score
-        return {
-            "score": round(score, 2),
-            "details": {
-                "frames": frames,
-                "sampled_frames": sampled,
-                "face_frames": face_frames,
-                "avg_brightness": round(float(np.mean(brightness_vals)), 2) if brightness_vals else 0.0,
-                "avg_blur_var": round(float(np.mean(blur_vals)), 2) if blur_vals else 0.0,
-                "low_light_frames": low_light_frames,
-                "blurry_frames": blurry_frames,
-                "low_light_rate": round(low_light_rate, 3),
-                "blurry_rate": round(blurry_rate, 3),
-                "quality_flags": quality_flags,
-                "quality_weight": round(quality_weight, 3),
-                "raw_score": round(raw_score, 2),
-            },
-        }
+    if avg_brightness < LOW_LIGHT_THRESHOLD:
+        warnings.append("video_too_dark")
+    if avg_blur < BLUR_THRESHOLD:
+        warnings.append("video_blurry")
+    if motion_stability_score < 0.4:
+        warnings.append("unstable_camera")
+    if usable_frame_ratio < 0.3:
+        warnings.append("insufficient_usable_frames")
+    if face_visibility < 0.25:
+        warnings.append("subject_not_visible")
+    if mp_face is not None and face_frames == 0:
+        warnings.append("landmark_detection_failed")
 
-    instability = np.std(sway) * 3
-    if instability < MIN_SWAY_STD:
-        raw_score = 0.3
-        score = _blend_with_neutral(raw_score, quality_weight) if quality_flags else raw_score
-        return {
-            "score": round(score, 2),
-            "details": {
-                "frames": frames,
-                "sampled_frames": sampled,
-                "face_frames": face_frames,
-                "sway_std": float(np.std(sway)),
-                "low_light_frames": low_light_frames,
-                "blurry_frames": blurry_frames,
-                "low_light_rate": round(low_light_rate, 3),
-                "blurry_rate": round(blurry_rate, 3),
-                "quality_flags": quality_flags,
-                "quality_weight": round(quality_weight, 3),
-                "raw_score": round(raw_score, 2),
-            },
-        }
+    visual_quality_score = float(
+        np.clip(
+            0.2 * brightness_score
+            + 0.2 * sharpness_score
+            + 0.2 * motion_stability_score
+            + 0.25 * usable_frame_ratio
+            + 0.15 * _resolution_score(width, height),
+            0.0,
+            1.0,
+        )
+    )
+    visual_confidence = float(
+        np.clip(
+            0.55 * visual_quality_score
+            + 0.25 * face_visibility
+            + 0.2 * (landmark_detection_confidence if landmark_detection_confidence is not None else 0.35),
+            0.0,
+            1.0,
+        )
+    )
 
-    raw_score = 1 - min(instability, 1)
-    score = _blend_with_neutral(raw_score, quality_weight) if quality_flags else raw_score
-    face_rate = (face_frames / sampled) if sampled else 0.0
-    return {
-        "score": round(max(0, score), 2),
-        "details": {
-            "frames": frames,
-            "sampled_frames": sampled,
-            "face_frames": face_frames,
-            "face_rate": round(face_rate, 3),
-            "sway_std": float(np.std(sway)),
-            "avg_brightness": round(float(np.mean(brightness_vals)), 2) if brightness_vals else 0.0,
-            "avg_blur_var": round(float(np.mean(blur_vals)), 2) if blur_vals else 0.0,
-            "low_light_frames": low_light_frames,
-            "blurry_frames": blurry_frames,
-            "low_light_rate": round(low_light_rate, 3),
-            "blurry_rate": round(blurry_rate, 3),
-            "quality_flags": quality_flags,
-            "quality_weight": round(quality_weight, 3),
-            "raw_score": round(raw_score, 2),
-        },
+    details = {
+        "status": "ok",
+        "frame_count": frame_count,
+        "duration_seconds": safe_number(duration_seconds, 3),
+        "fps": safe_number(fps, 3),
+        "resolution": {"width": width, "height": height},
+        "brightness_score": safe_number(brightness_score),
+        "blur_score": safe_number(blur_score),
+        "sharpness_score": safe_number(sharpness_score),
+        "motion_stability_score": safe_number(motion_stability_score),
+        "usable_frame_ratio": safe_number(usable_frame_ratio),
+        "face_or_subject_visibility": safe_number(face_visibility),
+        "landmark_detection_confidence": safe_number(landmark_detection_confidence),
+        "visual_confidence": safe_number(visual_confidence),
+        "visual_quality_score": safe_number(visual_quality_score),
+        "visual_warnings": clean_warning_codes(warnings),
+        "frames": frame_count,
+        "sampled_frames": sampled_frames,
+        "face_frames": face_frames,
+        "face_rate": safe_number(face_visibility),
+        "sway_std": safe_number(motion_std),
+        "avg_brightness": safe_number(avg_brightness, 2),
+        "avg_blur_var": safe_number(avg_blur, 2),
+        "low_light_frames": low_light_frames,
+        "blurry_frames": blurry_frames,
+        "low_light_rate": safe_number(low_light_ratio),
+        "blurry_rate": safe_number(blurry_ratio),
+        "quality_flags": clean_warning_codes(warnings),
     }
+    return {"score": details["visual_confidence"], "details": details}
