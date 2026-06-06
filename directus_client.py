@@ -250,6 +250,28 @@ class DirectusClient:
                 parsed.append({"value": raw, "label": raw})
         return parsed
 
+    def get_field_max_length(self, collection: str, field_name: str) -> int | None:
+        definition = self.get_field_definition(collection, field_name)
+        if not definition:
+            return None
+        schema = definition.get("schema") or {}
+        for key in ["max_length", "length"]:
+            value = schema.get(key)
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+        meta = definition.get("meta") or {}
+        for key in ["max_length", "length"]:
+            value = meta.get(key)
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def is_field_required(self, collection: str, field_name: str) -> bool | None:
         definition = self.get_field_definition(collection, field_name)
         if not definition:

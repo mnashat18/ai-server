@@ -153,6 +153,10 @@ If you are applying this through Directus:
 4. Verify `scan_results` no longer has duplicate `scan_id` values.
 5. Verify the `scan_results_scan_id_unique` constraint exists.
 
+Apply [2026_06_06_scan_results_ai_model_version_length.sql](</d:/flutter/last/ai-server/sql/2026_06_06_scan_results_ai_model_version_length.sql>) before deployment. It:
+
+- updates `scan_results.ai_model_version` to `varchar(100)` so it can store `Conntinuity Intelligence Engine v1.2`
+
 ## scan_requests / notifications
 
 Previous backend behavior updated `scan_requests` on successful AI completion for `manager_request` and `bulk_request` scans. That path has been restored after successful result writeback so manager/bulk request records can still close without relying on Directus Flow.
