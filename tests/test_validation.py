@@ -433,6 +433,109 @@ class MainPayloadTests(unittest.TestCase):
 
         self.assertEqual(set(payload.keys()), supported_fields)
 
+    def test_scan_results_ai_model_version_full_value_preserved_when_schema_allows(self):
+        with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=lambda collection, payload: payload,
+        ), patch.object(main.directus, "first_supported_field", return_value=None), patch.object(
+            main.directus,
+            "get_field_choices",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=False,
+        ), patch.object(
+            main.directus,
+            "get_field_max_length",
+            side_effect=lambda collection, field: 100 if field == "ai_model_version" else None,
+        ):
+            payload = main._build_scan_result_payload(
+                "scan-1",
+                {
+                    "readiness_score": 75,
+                    "risk_level": "stable",
+                    "confidence": 0.8,
+                    "explanation": "ok",
+                    "suggested_action": "continue_normal_activity",
+                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                },
+                {"quality": {}},
+            )
+
+        self.assertEqual(payload["ai_model_version"], "Conntinuity Intelligence Engine v1.2")
+
+    def test_optional_overlong_string_field_is_skipped_with_warning(self):
+        with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=lambda collection, payload: payload,
+        ), patch.object(main.directus, "first_supported_field", return_value=None), patch.object(
+            main.directus,
+            "get_field_choices",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=False,
+        ), patch.object(
+            main.directus,
+            "get_field_max_length",
+            side_effect=lambda collection, field: 10 if field == "spoken_transcript" else None,
+        ):
+            with self.assertLogs("ai-server", level="WARNING") as logs:
+                payload = main._build_scan_result_payload(
+                    "scan-1",
+                    {
+                        "readiness_score": 75,
+                        "risk_level": "stable",
+                        "confidence": 0.8,
+                        "explanation": "ok",
+                        "suggested_action": "continue_normal_activity",
+                        "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                        "spoken_transcript": "this transcript is too long",
+                    },
+                    {"quality": {}},
+                )
+
+        self.assertNotIn("spoken_transcript", payload)
+        self.assertIn("field=spoken_transcript", "\n".join(logs.output))
+
+    def test_required_overlong_string_field_raises_clear_schema_error_before_post(self):
+        with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=lambda collection, payload: payload,
+        ), patch.object(main.directus, "first_supported_field", return_value=None), patch.object(
+            main.directus,
+            "get_field_choices",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=True,
+        ), patch.object(
+            main.directus,
+            "get_field_max_length",
+            side_effect=lambda collection, field: 10 if field == "ai_model_version" else None,
+        ):
+            with self.assertRaises(main.SchemaValidationError) as ctx:
+                main._build_scan_result_payload(
+                    "scan-1",
+                    {
+                        "readiness_score": 75,
+                        "risk_level": "stable",
+                        "confidence": 0.8,
+                        "explanation": "ok",
+                        "suggested_action": "continue_normal_activity",
+                        "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    },
+                    {"quality": {}},
+                )
+
+        self.assertIn("scan_results.ai_model_version exceeds Directus max length", str(ctx.exception))
+
     def test_invalid_numeric_values_are_removed_from_scan_results_payload(self):
         with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
             main.directus,
@@ -671,6 +774,32 @@ class MainPayloadTests(unittest.TestCase):
         self.assertEqual(update_payload["failure_reason"], None)
         self.assertEqual(update_payload["ai_model_version"], "Conntinuity Intelligence Engine v1.2")
         self.assertIn("completed_at", update_payload)
+
+    def test_wellness_scan_completed_update_skips_optional_overlong_ai_model_version(self):
+        with patch.object(main.directus, "filter_payload_fields", side_effect=lambda collection, payload: payload), patch.object(
+            main.directus,
+            "first_supported_field",
+            return_value=None,
+        ), patch.object(
+            main.directus,
+            "get_field_max_length",
+            side_effect=lambda collection, field: 10 if field == "ai_model_version" else None,
+        ):
+            with self.assertLogs("ai-server", level="WARNING") as logs:
+                payload = main._wellness_scan_update_payload(
+                    {
+                        "status": "completed",
+                        "completed_at": "2026-06-06T12:00:00Z",
+                        "failure_reason": None,
+                        "failure_message": None,
+                        "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    }
+                )
+
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["completed_at"], "2026-06-06T12:00:00Z")
+        self.assertNotIn("ai_model_version", payload)
+        self.assertIn("field=ai_model_version", "\n".join(logs.output))
 
     def test_baseline_403_does_not_fail_scan_completion(self):
         scan_context = {

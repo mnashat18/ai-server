@@ -128,6 +128,34 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("payload_keys=['confidence', 'risk_level', 'scan_id']", combined)
         self.assertIn("Invalid payload", combined)
 
+    def test_directus_value_too_long_body_is_logged(self):
+        client = DirectusClient(base_url="http://example.com", token="x")
+        response = requests.Response()
+        response.status_code = 400
+        response.url = "http://example.com/items/scan_results"
+        response._content = (
+            b'{"errors":[{"message":"Value \\"Conntinuity Intelligence Engine v1.2\\" for field '
+            b'\\"ai_model_version\\" in collection \\"scan_results\\" is too long.",'
+            b'"extensions":{"collection":"scan_results","field":"ai_model_version",'
+            b'"value":"Conntinuity Intelligence Engine v1.2","code":"VALUE_TOO_LONG"}}]}'
+        )
+
+        with unittest.mock.patch("directus_client.requests.request", return_value=response):
+            with self.assertLogs("ai-server", level="ERROR") as logs:
+                with self.assertRaises(requests.HTTPError):
+                    client.create_item(
+                        "scan_results",
+                        {
+                            "scan_id": "scan-1",
+                            "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                        },
+                    )
+
+        combined = "\n".join(logs.output)
+        self.assertIn("VALUE_TOO_LONG", combined)
+        self.assertIn("ai_model_version", combined)
+        self.assertIn("Conntinuity Intelligence Engine v1.2", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

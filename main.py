@@ -175,6 +175,21 @@ class ProcessingError(RuntimeError):
         self.message = message or reason
 
 
+class SchemaValidationError(ProcessingError):
+    def __init__(self, collection: str, field_name: str, actual_length: int, max_length: int):
+        super().__init__(
+            FAILURE_REASON_WRITEBACK_FAILED,
+            (
+                f"{collection}.{field_name} exceeds Directus max length "
+                f"({actual_length}>{max_length})"
+            ),
+        )
+        self.collection = collection
+        self.field_name = field_name
+        self.actual_length = actual_length
+        self.max_length = max_length
+
+
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -209,6 +224,34 @@ def _scan_timestamp(scan_context: dict) -> str:
 
 def _safe_string(value: Any, max_len: int = 255, fallback: str | None = None) -> str | None:
     return sanitize_text(value, fallback=fallback, max_len=max_len)
+
+
+def _field_length_checked_string(
+    collection: str,
+    field_name: str,
+    value: Any,
+    *,
+    fallback: str | None = None,
+    default_max_len: int = 65535,
+    required: bool = False,
+) -> str | None:
+    text = sanitize_text(value, fallback=fallback, max_len=default_max_len)
+    if text is None:
+        return None
+    max_length = directus.get_field_max_length(collection, field_name)
+    if max_length is None or len(text) <= max_length:
+        return text
+    logger.warning(
+        "directus_field_too_long collection=%s field=%s max_length=%s actual_length=%s required=%s",
+        collection,
+        field_name,
+        max_length,
+        len(text),
+        required,
+    )
+    if required:
+        raise SchemaValidationError(collection, field_name, len(text), max_length)
+    return None
 
 
 def _normalize_choice_token(value: Any) -> str:
@@ -310,8 +353,39 @@ def _schema_aware_scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]
         if field_name in candidate:
             candidate[field_name] = _coerce_scan_result_choice(field_name, candidate.get(field_name))
 
-    candidate["explanation"] = _safe_string(candidate.get("explanation"), max_len=500, fallback="Analysis completed.")
-    candidate["ai_model_version"] = _safe_string(candidate.get("ai_model_version"), max_len=100, fallback=MODEL_VERSION)
+    candidate["explanation"] = _field_length_checked_string(
+        "scan_results",
+        "explanation",
+        candidate.get("explanation"),
+        fallback="Analysis completed.",
+        default_max_len=65535,
+        required=True,
+    )
+    candidate["suggested_action"] = _field_length_checked_string(
+        "scan_results",
+        "suggested_action",
+        candidate.get("suggested_action"),
+        default_max_len=255,
+        required=True,
+    )
+    candidate["ai_model_version"] = _field_length_checked_string(
+        "scan_results",
+        "ai_model_version",
+        candidate.get("ai_model_version"),
+        fallback=MODEL_VERSION,
+        default_max_len=65535,
+        required=True,
+    )
+
+    for field_name in ["spoken_transcript", "expected_phrase"]:
+        if field_name in candidate:
+            candidate[field_name] = _field_length_checked_string(
+                "scan_results",
+                field_name,
+                candidate.get(field_name),
+                default_max_len=65535,
+                required=False,
+            )
 
     filtered = _scan_result_payload(candidate)
 
@@ -496,15 +570,43 @@ def _expected_phrase(scan_context: dict) -> str | None:
 
 
 def _wellness_scan_update_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    filtered = directus.filter_payload_fields("wellness_scans", payload)
+    original = dict(payload)
+    candidate = dict(payload)
+    if "failure_reason" in candidate:
+        candidate["failure_reason"] = _field_length_checked_string(
+            "wellness_scans",
+            "failure_reason",
+            candidate.get("failure_reason"),
+            default_max_len=255,
+            required=False,
+        )
+    if "failure_message" in candidate:
+        candidate["failure_message"] = _field_length_checked_string(
+            "wellness_scans",
+            "failure_message",
+            candidate.get("failure_message"),
+            default_max_len=65535,
+            required=False,
+        )
+    if "ai_model_version" in candidate:
+        candidate["ai_model_version"] = _field_length_checked_string(
+            "wellness_scans",
+            "ai_model_version",
+            candidate.get("ai_model_version"),
+            fallback=MODEL_VERSION,
+            default_max_len=65535,
+            required=False,
+        )
+
+    filtered = directus.filter_payload_fields("wellness_scans", candidate)
     fallback_field = directus.first_supported_field("wellness_scans", ["failure_message", "user_message"])
-    if "failure_message" in payload and "failure_message" not in filtered and fallback_field:
-        filtered[fallback_field] = payload["failure_message"]
+    if "failure_message" in candidate and "failure_message" not in filtered and fallback_field:
+        filtered[fallback_field] = candidate["failure_message"]
     cleaned = sanitize_payload(filtered)
     for field_name in ["failure_reason", "failure_message", "completed_at", "ai_model_version", "status"]:
-        if field_name in filtered and filtered[field_name] is None:
+        if field_name in filtered and filtered[field_name] is None and original.get(field_name) is None:
             cleaned[field_name] = None
-    if fallback_field and fallback_field in filtered and filtered[fallback_field] is None:
+    if fallback_field and fallback_field in filtered and filtered[fallback_field] is None and original.get("failure_message") is None:
         cleaned[fallback_field] = None
     return cleaned
 
@@ -652,16 +754,16 @@ def _build_scan_result_payload(scan_id: str, result: dict, internal_analysis: di
         "camera_confidence": result.get("camera_confidence"),
         "voice_confidence": result.get("voice_confidence"),
         "task_performance_score": result.get("task_performance_score"),
-        "explanation": _safe_string(result.get("explanation"), max_len=500, fallback="Analysis completed."),
-        "suggested_action": _safe_string(result.get("suggested_action"), max_len=100, fallback="review_required"),
-        "ai_model_version": _safe_string(result.get("ai_model_version"), max_len=100, fallback=MODEL_VERSION),
+        "explanation": sanitize_text(result.get("explanation"), fallback="Analysis completed.", max_len=65535),
+        "suggested_action": sanitize_text(result.get("suggested_action"), fallback="review_required", max_len=255),
+        "ai_model_version": sanitize_text(result.get("ai_model_version"), fallback=MODEL_VERSION, max_len=65535),
         "confidence_drift": result.get("confidence_drift"),
         "baseline_used": result.get("baseline_used"),
         "face_metrics": result.get("face_metrics"),
         "voice_metrics": result.get("voice_metrics"),
         "reaction_metrics": result.get("reaction_metrics"),
-        "spoken_transcript": result.get("spoken_transcript"),
-        "expected_phrase": result.get("expected_phrase"),
+        "spoken_transcript": sanitize_text(result.get("spoken_transcript"), max_len=65535),
+        "expected_phrase": sanitize_text(result.get("expected_phrase"), max_len=65535),
         "phrase_match_score": result.get("phrase_match_score"),
         "audio_quality_score": result.get("audio_quality_score"),
         "video_quality_score": result.get("video_quality_score"),
