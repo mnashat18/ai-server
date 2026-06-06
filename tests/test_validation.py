@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -357,7 +357,15 @@ class MainPayloadTests(unittest.TestCase):
             main.directus,
             "filter_payload_fields",
             side_effect=lambda collection, payload: payload,
-        ), patch.object(main.directus, "first_supported_field", return_value=None):
+        ), patch.object(main.directus, "first_supported_field", return_value=None), patch.object(
+            main.directus,
+            "get_field_choices",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=False,
+        ):
             payload = main._build_scan_result_payload(
                 "scan-1",
                 {
@@ -382,6 +390,154 @@ class MainPayloadTests(unittest.TestCase):
             )
         serialized = str(payload)
         self.assertNotIn("undefined", serialized)
+
+    def test_scan_results_payload_contains_only_supported_fields(self):
+        supported_fields = {
+            "scan_id",
+            "readiness_score",
+            "risk_level",
+            "confidence",
+            "explanation",
+            "suggested_action",
+            "ai_model_version",
+        }
+        with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=lambda collection, payload: {key: value for key, value in payload.items() if key in supported_fields},
+        ), patch.object(main.directus, "first_supported_field", return_value=None), patch.object(
+            main.directus,
+            "get_field_choices",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=False,
+        ):
+            payload = main._build_scan_result_payload(
+                "scan-1",
+                {
+                    "readiness_score": 75,
+                    "risk_level": "stable",
+                    "confidence": 0.8,
+                    "camera_confidence": 0.7,
+                    "voice_confidence": 0.7,
+                    "task_performance_score": 90,
+                    "explanation": "ok",
+                    "suggested_action": "continue_normal_activity",
+                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "validation_warnings": ["video_blurry"],
+                },
+                {"quality": {}},
+            )
+
+        self.assertEqual(set(payload.keys()), supported_fields)
+
+    def test_invalid_numeric_values_are_removed_from_scan_results_payload(self):
+        with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=lambda collection, payload: payload,
+        ), patch.object(main.directus, "first_supported_field", return_value=None), patch.object(
+            main.directus,
+            "get_field_choices",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=False,
+        ):
+            payload = main._build_scan_result_payload(
+                "scan-1",
+                {
+                    "readiness_score": "80",
+                    "risk_level": "stable",
+                    "confidence": "bad",
+                    "camera_confidence": float("nan"),
+                    "voice_confidence": float("inf"),
+                    "task_performance_score": 80.4,
+                    "explanation": "ok",
+                    "suggested_action": "continue_normal_activity",
+                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "confidence_drift": "-0.25",
+                },
+                {"quality": {}},
+            )
+
+        self.assertEqual(payload["readiness_score"], 80)
+        self.assertEqual(payload["task_performance_score"], 80)
+        self.assertEqual(payload["confidence_drift"], -0.25)
+        self.assertNotIn("confidence", payload)
+        self.assertNotIn("camera_confidence", payload)
+        self.assertNotIn("voice_confidence", payload)
+
+    def test_risk_level_mapping_uses_directus_choices(self):
+        def fake_choices(collection, field_name):
+            if field_name == "risk_level":
+                return [{"value": "Stable", "label": "Stable"}]
+            return []
+
+        with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=lambda collection, payload: payload,
+        ), patch.object(main.directus, "first_supported_field", return_value=None), patch.object(
+            main.directus,
+            "get_field_choices",
+            side_effect=fake_choices,
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=False,
+        ):
+            payload = main._build_scan_result_payload(
+                "scan-1",
+                {
+                    "readiness_score": 75,
+                    "risk_level": "stable",
+                    "confidence": 0.8,
+                    "explanation": "ok",
+                    "suggested_action": "continue_normal_activity",
+                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                },
+                {"quality": {}},
+            )
+
+        self.assertEqual(payload["risk_level"], "Stable")
+
+    def test_missing_optional_scan_result_fields_are_skipped(self):
+        supported_optional = {"internal_analysis"}
+        with patch.object(main.directus, "supports_fields", return_value=supported_optional), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=lambda collection, payload: payload,
+        ), patch.object(main.directus, "first_supported_field", return_value="internal_analysis"), patch.object(
+            main.directus,
+            "get_field_choices",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=False,
+        ):
+            payload = main._build_scan_result_payload(
+                "scan-1",
+                {
+                    "readiness_score": 75,
+                    "risk_level": "stable",
+                    "confidence": 0.8,
+                    "explanation": "ok",
+                    "suggested_action": "continue_normal_activity",
+                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                },
+                {"quality": {}, "validation": {"warnings": []}},
+            )
+
+        self.assertIn("internal_analysis", payload)
+        self.assertNotIn("audio_quality_score", payload)
+        self.assertNotIn("video_quality_score", payload)
+        self.assertNotIn("image_quality_score", payload)
+        self.assertNotIn("validation_warnings", payload)
 
     def test_idempotency_already_processing(self):
         client = TestClient(main.app)
@@ -467,6 +623,113 @@ class MainPayloadTests(unittest.TestCase):
             scan_context={"request_source": "manager_request", "member": "member-1", "business_profile": "bp-1"},
             scan_id="scan-123",
         )
+
+    def test_write_success_marks_wellness_scan_completed_after_scan_result_write(self):
+        with patch.object(main.directus, "upsert_scan_result", return_value=("created", {"id": "result-1"})), patch.object(
+            main.directus,
+            "update_wellness_scan",
+            return_value={},
+        ) as update_scan_mock, patch.object(
+            main.directus,
+            "update_member_last_result",
+            return_value={},
+        ), patch.object(
+            main.directus,
+            "update_scan_request_if_needed",
+            return_value=None,
+        ), patch.object(
+            main.directus,
+            "create_alert_if_needed",
+            return_value=None,
+        ):
+            status = main._write_success(
+                scan_id="scan-123",
+                scan_context={},
+                identifiers={"member_id": None, "business_profile_id": None, "department_id": None, "user_id": None},
+                result={
+                    "readiness_score": 80,
+                    "risk_level": "stable",
+                    "confidence": 0.8,
+                    "camera_confidence": 0.8,
+                    "voice_confidence": 0.8,
+                    "task_performance_score": 80,
+                    "explanation": "ok",
+                    "suggested_action": "continue_normal_activity",
+                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "confidence_drift": 0.0,
+                    "baseline_used": False,
+                    "face_metrics": {"face_score": 0.8},
+                    "voice_metrics": {"voice_score": 0.8},
+                    "reaction_metrics": {"reaction_score": 0.8},
+                },
+                internal_analysis={"quality": {}},
+            )
+
+        self.assertEqual(status["wellness_scan"], "updated")
+        update_payload = update_scan_mock.call_args[0][1]
+        self.assertEqual(update_payload["status"], "completed")
+        self.assertEqual(update_payload["failure_reason"], None)
+        self.assertEqual(update_payload["ai_model_version"], "Conntinuity Intelligence Engine v1.2")
+        self.assertIn("completed_at", update_payload)
+
+    def test_baseline_403_does_not_fail_scan_completion(self):
+        scan_context = {
+            "status": "media_ready",
+            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
+            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
+            "task_metrics": {},
+            "member": "member-1",
+            "business_profile": "bp-1",
+        }
+        response = MagicMock()
+        response.status_code = 403
+        response._content = b'{"errors":[{"message":"forbidden"}]}'
+        baseline_error = main.requests.HTTPError(response=response)
+
+        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value=scan_context["scan_media"],
+        ), patch.object(
+            main.ml_runtime,
+            "is_loaded",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "local_model_required",
+            return_value=False,
+        ), patch.object(
+            main,
+            "_resolve_media_input",
+            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+        ), patch.object(
+            main,
+            "_safe_analyze",
+            side_effect=[_video_result(), _image_result(), _audio_result()],
+        ), patch.object(
+            main,
+            "_transcribe_audio_file",
+            return_value="hello world",
+        ), patch.object(
+            main,
+            "_expected_phrase",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_baseline_for_member",
+            return_value={"id": "baseline-1"},
+        ), patch.object(
+            main.directus,
+            "upsert_employee_baseline",
+            side_effect=baseline_error,
+        ), patch.object(
+            main,
+            "_write_success",
+            return_value={"scan_result": "created:1", "wellness_scan": "updated"},
+        ):
+            result = main._process_scan_sync("scan-123")
+
+        self.assertEqual(result["status"], "completed")
 
 
 if __name__ == "__main__":

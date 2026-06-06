@@ -103,6 +103,31 @@ class PipelineTests(unittest.TestCase):
         client.create_item.assert_called_once()
         client.update_item.assert_called_once()
 
+    def test_directus_400_logs_response_body(self):
+        client = DirectusClient(base_url="http://example.com", token="x")
+        response = requests.Response()
+        response.status_code = 400
+        response.url = "http://example.com/items/scan_results"
+        response._content = b'{"errors":[{"message":"Invalid payload. Invalid one-to-many update structure: risk_level"}]}'
+
+        with unittest.mock.patch("directus_client.requests.request", return_value=response):
+            with self.assertLogs("ai-server", level="ERROR") as logs:
+                with self.assertRaises(requests.HTTPError):
+                    client.create_item(
+                        "scan_results",
+                        {
+                            "scan_id": "scan-1",
+                            "risk_level": "stable",
+                            "confidence": 0.8,
+                        },
+                    )
+
+        combined = "\n".join(logs.output)
+        self.assertIn("status_code=400", combined)
+        self.assertIn("/items/scan_results", combined)
+        self.assertIn("payload_keys=['confidence', 'risk_level', 'scan_id']", combined)
+        self.assertIn("Invalid payload", combined)
+
 
 if __name__ == "__main__":
     unittest.main()
