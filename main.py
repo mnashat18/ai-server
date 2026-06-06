@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 import os
 import shutil
 import subprocess
@@ -71,6 +72,36 @@ OPTIONAL_SCAN_RESULT_FIELDS = [
     "fusion_details",
     "internal_analysis",
 ]
+
+SCAN_RESULT_NUMERIC_FIELDS: dict[str, bool] = {
+    "readiness_score": True,
+    "confidence": False,
+    "camera_confidence": False,
+    "voice_confidence": False,
+    "task_performance_score": True,
+    "confidence_drift": False,
+    "phrase_match_score": False,
+    "audio_quality_score": False,
+    "video_quality_score": False,
+    "image_quality_score": False,
+}
+
+SCAN_RESULT_CHOICE_ALIASES: dict[str, dict[str, list[str]]] = {
+    "risk_level": {
+        "stable": ["Stable"],
+        "low_focus": ["Low Focus"],
+        "elevated_fatigue": ["Elevated Fatigue"],
+        "high_risk": ["High Risk"],
+        "unknown": ["Unknown"],
+    },
+    "suggested_action": {
+        "continue_normal_activity": ["Continue Normal Activity"],
+        "review_required": ["Review Required"],
+        "rescan_recommended": ["Rescan Recommended"],
+        "rest_advised": ["Rest Advised"],
+        "manager_review": ["Manager Review"],
+    },
+}
 
 
 class Media(BaseModel):
@@ -178,6 +209,124 @@ def _scan_timestamp(scan_context: dict) -> str:
 
 def _safe_string(value: Any, max_len: int = 255, fallback: str | None = None) -> str | None:
     return sanitize_text(value, fallback=fallback, max_len=max_len)
+
+
+def _normalize_choice_token(value: Any) -> str:
+    text = _safe_string(value, max_len=255, fallback="") or ""
+    normalized = []
+    for char in text.lower():
+        normalized.append(char if char.isalnum() else "_")
+    compact = "".join(normalized).strip("_")
+    while "__" in compact:
+        compact = compact.replace("__", "_")
+    return compact
+
+
+def _safe_numeric(value: Any, *, integer: bool) -> int | float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(numeric) or math.isinf(numeric):
+        return None
+    if integer:
+        return int(round(numeric))
+    return round(numeric, 6)
+
+
+def _coerce_scan_result_choice(field_name: str, value: Any) -> Any:
+    text = _safe_string(value, max_len=255)
+    if text is None:
+        return None
+    choices = directus.get_field_choices("scan_results", field_name)
+    if not choices:
+        return text
+
+    normalized_allowed: dict[str, Any] = {}
+    allowed_values: list[Any] = []
+    for choice in choices:
+        actual = choice.get("value")
+        label = choice.get("label")
+        if actual is None:
+            continue
+        allowed_values.append(actual)
+        for token in [actual, label]:
+            normalized = _normalize_choice_token(token)
+            if normalized:
+                normalized_allowed[normalized] = actual
+
+    normalized_text = _normalize_choice_token(text)
+    if text in allowed_values:
+        return text
+    if normalized_text in normalized_allowed:
+        return normalized_allowed[normalized_text]
+
+    for alias in SCAN_RESULT_CHOICE_ALIASES.get(field_name, {}).get(text, []):
+        normalized_alias = _normalize_choice_token(alias)
+        if normalized_alias in normalized_allowed:
+            mapped = normalized_allowed[normalized_alias]
+            logger.info(
+                "scan_result_choice_mapped field=%s source=%s mapped=%s allowed=%s",
+                field_name,
+                text,
+                mapped,
+                allowed_values,
+            )
+            return mapped
+
+    logger.warning(
+        "scan_result_choice_unmapped field=%s value=%s allowed=%s",
+        field_name,
+        text,
+        allowed_values,
+    )
+    return None
+
+
+def _scan_result_scan_id_value(scan_id: Any) -> str | int | None:
+    value = _relation_id(scan_id)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = _safe_string(value, max_len=255)
+    return text
+
+
+def _schema_aware_scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    candidate = dict(payload)
+
+    candidate["scan_id"] = _scan_result_scan_id_value(candidate.get("scan_id"))
+
+    for field_name, integer in SCAN_RESULT_NUMERIC_FIELDS.items():
+        if field_name in candidate:
+            candidate[field_name] = _safe_numeric(candidate.get(field_name), integer=integer)
+
+    for field_name in ["risk_level", "suggested_action"]:
+        if field_name in candidate:
+            candidate[field_name] = _coerce_scan_result_choice(field_name, candidate.get(field_name))
+
+    candidate["explanation"] = _safe_string(candidate.get("explanation"), max_len=500, fallback="Analysis completed.")
+    candidate["ai_model_version"] = _safe_string(candidate.get("ai_model_version"), max_len=100, fallback=MODEL_VERSION)
+
+    filtered = _scan_result_payload(candidate)
+
+    required_missing: list[str] = []
+    for field_name in ["scan_id", "risk_level", "confidence", "readiness_score", "explanation", "suggested_action", "ai_model_version"]:
+        if field_name not in filtered:
+            required = directus.is_field_required("scan_results", field_name)
+            if required:
+                required_missing.append(field_name)
+    if required_missing:
+        raise ProcessingError(
+            FAILURE_REASON_WRITEBACK_FAILED,
+            f"scan_results required fields missing after schema validation: {', '.join(required_missing)}",
+        )
+    return filtered
 
 
 def _log_step(scan_id: str, step: str, **details: Any) -> None:
@@ -351,7 +500,13 @@ def _wellness_scan_update_payload(payload: dict[str, Any]) -> dict[str, Any]:
     fallback_field = directus.first_supported_field("wellness_scans", ["failure_message", "user_message"])
     if "failure_message" in payload and "failure_message" not in filtered and fallback_field:
         filtered[fallback_field] = payload["failure_message"]
-    return sanitize_payload(filtered)
+    cleaned = sanitize_payload(filtered)
+    for field_name in ["failure_reason", "failure_message", "completed_at", "ai_model_version", "status"]:
+        if field_name in filtered and filtered[field_name] is None:
+            cleaned[field_name] = None
+    if fallback_field and fallback_field in filtered and filtered[fallback_field] is None:
+        cleaned[fallback_field] = None
+    return cleaned
 
 
 def _scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -538,7 +693,7 @@ def _build_scan_result_payload(scan_id: str, result: dict, internal_analysis: di
         payload["fusion_details"] = result.get("fusion_details")
     if "internal_analysis" in supported_optional:
         payload["internal_analysis"] = internal_analysis
-    return _scan_result_payload(payload)
+    return _schema_aware_scan_result_payload(payload)
 
 
 def _write_quality_failure(scan_id: str, quality_result: dict) -> dict:

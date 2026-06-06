@@ -7,10 +7,15 @@ from typing import Any
 import requests
 from requests import HTTPError
 
+from logger import get_logger
+
 try:
     import httpx
 except Exception:  # pragma: no cover
     httpx = None
+
+
+logger = get_logger()
 
 
 def _relation_id(value: Any) -> Any:
@@ -51,6 +56,7 @@ class DirectusClient:
         self.token = token or os.getenv("DIRECTUS_TOKEN")
         self.timeout = int(os.getenv("DIRECTUS_TIMEOUT", timeout))
         self._field_cache: dict[str, set[str] | None] = {}
+        self._field_meta_cache: dict[str, dict[str, dict[str, Any]] | None] = {}
 
     def is_configured(self) -> bool:
         return bool(self.base_url and self.token)
@@ -84,7 +90,16 @@ class DirectusClient:
             json=json,
             timeout=self.timeout,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except HTTPError:
+            self._log_http_error(
+                method=method,
+                path=path,
+                response=response,
+                payload=json,
+            )
+            raise
         data = response.json()
         return data.get("data", data)
 
@@ -108,9 +123,48 @@ class DirectusClient:
                 params=params,
                 json=json,
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except Exception:
+                self._log_http_error(
+                    method=method,
+                    path=path,
+                    response=response,
+                    payload=json,
+                )
+                raise
             data = response.json()
             return data.get("data", data)
+
+    def _response_body(self, response: Any) -> Any:
+        try:
+            body = response.json()
+            if body is not None:
+                return body
+        except Exception:
+            pass
+        try:
+            return response.text
+        except Exception:
+            return None
+
+    def _log_http_error(
+        self,
+        *,
+        method: str,
+        path: str,
+        response: Any,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        logger.error(
+            "directus_request_failed method=%s status_code=%s path=%s url=%s payload_keys=%s response_body=%s",
+            method,
+            getattr(response, "status_code", None),
+            path,
+            getattr(response, "url", self._url(path)),
+            sorted((payload or {}).keys()),
+            self._response_body(response),
+        )
 
     def get_item(self, collection: str, item_id: Any, fields: list[str] | None = None) -> dict | None:
         params = {"fields": ",".join(fields)} if fields else None
@@ -149,18 +203,64 @@ class DirectusClient:
     def get_collection_fields(self, collection: str) -> set[str] | None:
         if collection in self._field_cache:
             return self._field_cache[collection]
+        meta = self.get_collection_field_meta(collection)
+        if not meta:
+            self._field_cache[collection] = None
+            return None
+        self._field_cache[collection] = set(meta.keys()) or None
+        return self._field_cache[collection]
+
+    def get_collection_field_meta(self, collection: str) -> dict[str, dict[str, Any]] | None:
+        if collection in self._field_meta_cache:
+            return self._field_meta_cache[collection]
         try:
             rows = self._request("GET", f"/fields/{collection}")
         except Exception:
+            self._field_meta_cache[collection] = None
             self._field_cache[collection] = None
             return None
-        fields = {
-            row.get("field")
+        meta = {
+            row.get("field"): row
             for row in (rows or [])
             if isinstance(row, dict) and row.get("field")
         }
-        self._field_cache[collection] = fields or None
-        return self._field_cache[collection]
+        self._field_meta_cache[collection] = meta or None
+        self._field_cache[collection] = set(meta.keys()) or None
+        return self._field_meta_cache[collection]
+
+    def get_field_definition(self, collection: str, field_name: str) -> dict[str, Any] | None:
+        meta = self.get_collection_field_meta(collection)
+        if not meta:
+            return None
+        return meta.get(field_name)
+
+    def get_field_choices(self, collection: str, field_name: str) -> list[dict[str, Any]]:
+        definition = self.get_field_definition(collection, field_name) or {}
+        meta = definition.get("meta") or {}
+        options = meta.get("options") or {}
+        raw_choices = options.get("choices") or []
+        parsed: list[dict[str, Any]] = []
+        for raw in raw_choices:
+            if isinstance(raw, dict):
+                value = raw.get("value")
+                label = raw.get("text", raw.get("label", raw.get("name", value)))
+                if value is not None:
+                    parsed.append({"value": value, "label": label})
+            elif raw is not None:
+                parsed.append({"value": raw, "label": raw})
+        return parsed
+
+    def is_field_required(self, collection: str, field_name: str) -> bool | None:
+        definition = self.get_field_definition(collection, field_name)
+        if not definition:
+            return None
+        schema = definition.get("schema") or {}
+        if "is_nullable" in schema:
+            return not bool(schema.get("is_nullable"))
+        meta = definition.get("meta") or {}
+        if "required" in meta:
+            return bool(meta.get("required"))
+        return None
 
     def supports_fields(self, collection: str, field_names: list[str]) -> set[str]:
         available = self.get_collection_fields(collection)
