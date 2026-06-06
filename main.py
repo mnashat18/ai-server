@@ -570,6 +570,7 @@ def _expected_phrase(scan_context: dict) -> str | None:
 
 
 def _wellness_scan_update_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    directus.clear_schema_cache("wellness_scans")
     original = dict(payload)
     candidate = dict(payload)
     if "failure_reason" in candidate:

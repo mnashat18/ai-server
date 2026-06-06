@@ -58,6 +58,14 @@ class DirectusClient:
         self._field_cache: dict[str, set[str] | None] = {}
         self._field_meta_cache: dict[str, dict[str, dict[str, Any]] | None] = {}
 
+    def clear_schema_cache(self, collection: str | None = None) -> None:
+        if collection is None:
+            self._field_cache.clear()
+            self._field_meta_cache.clear()
+            return
+        self._field_cache.pop(collection, None)
+        self._field_meta_cache.pop(collection, None)
+
     def is_configured(self) -> bool:
         return bool(self.base_url and self.token)
 
@@ -306,6 +314,7 @@ class DirectusClient:
         return None
 
     def get_scan_context(self, scan_id: Any) -> dict:
+        self.clear_schema_cache("wellness_scans")
         optional_scan_fields = sorted(
             self.supports_fields(
                 "wellness_scans",

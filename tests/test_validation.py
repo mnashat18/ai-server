@@ -801,6 +801,39 @@ class MainPayloadTests(unittest.TestCase):
         self.assertNotIn("ai_model_version", payload)
         self.assertIn("field=ai_model_version", "\n".join(logs.output))
 
+    def test_wellness_scan_completed_update_skips_ai_model_version_when_field_missing(self):
+        def filter_missing_field(collection, payload):
+            return {key: value for key, value in payload.items() if key != "ai_model_version"}
+
+        with patch.object(main.directus, "filter_payload_fields", side_effect=filter_missing_field), patch.object(
+            main.directus,
+            "first_supported_field",
+            return_value="failure_message",
+        ), patch.object(
+            main.directus,
+            "get_field_max_length",
+            return_value=None,
+        ):
+            payload = main._wellness_scan_update_payload(
+                {
+                    "status": "completed",
+                    "completed_at": "2026-06-06T12:00:00Z",
+                    "failure_reason": None,
+                    "failure_message": None,
+                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                }
+            )
+
+        self.assertEqual(
+            payload,
+            {
+                "status": "completed",
+                "completed_at": "2026-06-06T12:00:00Z",
+                "failure_reason": None,
+                "failure_message": None,
+            },
+        )
+
     def test_baseline_403_does_not_fail_scan_completion(self):
         scan_context = {
             "status": "media_ready",
@@ -859,6 +892,69 @@ class MainPayloadTests(unittest.TestCase):
             result = main._process_scan_sync("scan-123")
 
         self.assertEqual(result["status"], "completed")
+
+    def test_missing_wellness_scan_ai_model_version_does_not_fail_completion(self):
+        def filter_missing_wellness_ai_model_version(collection, payload):
+            if collection == "wellness_scans":
+                return {key: value for key, value in payload.items() if key != "ai_model_version"}
+            return payload
+
+        with patch.object(main.directus, "upsert_scan_result", return_value=("created", {"id": "result-1"})) as upsert_mock, patch.object(
+            main.directus,
+            "update_wellness_scan",
+            return_value={},
+        ) as update_scan_mock, patch.object(
+            main.directus,
+            "update_scan_request_if_needed",
+            return_value=None,
+        ), patch.object(
+            main.directus,
+            "create_alert_if_needed",
+            return_value=None,
+        ), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=filter_missing_wellness_ai_model_version,
+        ), patch.object(
+            main.directus,
+            "first_supported_field",
+            side_effect=lambda collection, candidates: "failure_message" if collection == "wellness_scans" and "failure_message" in candidates else None,
+        ), patch.object(
+            main.directus,
+            "get_field_max_length",
+            return_value=None,
+        ):
+            status = main._write_success(
+                scan_id="scan-123",
+                scan_context={},
+                identifiers={"member_id": None, "business_profile_id": None, "department_id": None, "user_id": None},
+                result={
+                    "readiness_score": 80,
+                    "risk_level": "stable",
+                    "confidence": 0.8,
+                    "camera_confidence": 0.8,
+                    "voice_confidence": 0.8,
+                    "task_performance_score": 80,
+                    "explanation": "ok",
+                    "suggested_action": "continue_normal_activity",
+                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "confidence_drift": 0.0,
+                    "baseline_used": False,
+                    "face_metrics": {"face_score": 0.8},
+                    "voice_metrics": {"voice_score": 0.8},
+                    "reaction_metrics": {"reaction_score": 0.8},
+                },
+                internal_analysis={"quality": {}},
+            )
+
+        self.assertEqual(status["scan_result"], "created:result-1")
+        self.assertEqual(status["wellness_scan"], "updated")
+        upsert_payload = upsert_mock.call_args[0][1]
+        self.assertEqual(upsert_payload["ai_model_version"], "Conntinuity Intelligence Engine v1.2")
+        update_payload = update_scan_mock.call_args[0][1]
+        self.assertEqual(update_payload["status"], "completed")
+        self.assertEqual(update_payload["failure_reason"], None)
+        self.assertNotIn("ai_model_version", update_payload)
 
 
 if __name__ == "__main__":
