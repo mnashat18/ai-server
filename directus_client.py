@@ -45,6 +45,50 @@ def _is_unique_conflict(exc: Exception, *, field_name: str) -> bool:
     return "duplicate" in normalized and field_name.lower() in normalized
 
 
+def _payload_string_lengths(payload: dict[str, Any] | None) -> dict[str, int]:
+    if not isinstance(payload, dict):
+        return {}
+    return {key: len(value) for key, value in payload.items() if isinstance(value, str)}
+
+
+def _payload_field_types(payload: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        return {}
+    return {key: type(value).__name__ for key, value in payload.items()}
+
+
+def _payload_shape(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    summary: dict[str, Any] = {}
+    for key, value in payload.items():
+        item: dict[str, Any] = {"type": type(value).__name__}
+        if isinstance(value, str):
+            item["length"] = len(value)
+        elif isinstance(value, (list, dict)):
+            item["size"] = len(value)
+        summary[key] = item
+    return summary
+
+
+def _log_write_payload(collection: str, method: str, payload: dict[str, Any]) -> None:
+    if collection not in {"scan_results", "employee_baselines"}:
+        return
+    ai_model_version = payload.get("ai_model_version")
+    logger.info(
+        "directus_write_payload_ready collection=%s method=%s payload_keys=%s ai_model_version=%r ai_model_version_type=%s ai_model_version_len=%s payload_types=%s payload_string_lengths=%s payload_shape=%s",
+        collection,
+        method,
+        sorted(payload.keys()),
+        ai_model_version,
+        type(ai_model_version).__name__ if ai_model_version is not None else None,
+        len(ai_model_version) if isinstance(ai_model_version, str) else None,
+        _payload_field_types(payload),
+        _payload_string_lengths(payload),
+        _payload_shape(payload),
+    )
+
+
 class DirectusClient:
     def __init__(
         self,
@@ -164,13 +208,20 @@ class DirectusClient:
         response: Any,
         payload: dict[str, Any] | None,
     ) -> None:
+        ai_model_version = (payload or {}).get("ai_model_version")
         logger.error(
-            "directus_request_failed method=%s status_code=%s path=%s url=%s payload_keys=%s response_body=%s",
+            "directus_request_failed method=%s status_code=%s path=%s url=%s payload_keys=%s ai_model_version=%r ai_model_version_type=%s ai_model_version_len=%s payload_types=%s payload_string_lengths=%s payload_shape=%s response_body=%s",
             method,
             getattr(response, "status_code", None),
             path,
             getattr(response, "url", self._url(path)),
             sorted((payload or {}).keys()),
+            ai_model_version,
+            type(ai_model_version).__name__ if ai_model_version is not None else None,
+            len(ai_model_version) if isinstance(ai_model_version, str) else None,
+            _payload_field_types(payload),
+            _payload_string_lengths(payload),
+            _payload_shape(payload),
             self._response_body(response),
         )
 
@@ -183,9 +234,11 @@ class DirectusClient:
         return await self._arequest("GET", f"/items/{collection}/{item_id}", params=params)
 
     def create_item(self, collection: str, payload: dict) -> dict:
+        _log_write_payload(collection, "POST", payload)
         return self._request("POST", f"/items/{collection}", json=payload)
 
     def update_item(self, collection: str, item_id: Any, payload: dict) -> dict:
+        _log_write_payload(collection, "PATCH", payload)
         return self._request("PATCH", f"/items/{collection}/{item_id}", json=payload)
 
     def list_items(
@@ -278,6 +331,25 @@ class DirectusClient:
                     return int(value)
             except (TypeError, ValueError):
                 continue
+        return None
+
+    def get_field_schema_type(self, collection: str, field_name: str) -> str | None:
+        definition = self.get_field_definition(collection, field_name)
+        if not definition:
+            return None
+        schema = definition.get("schema") or {}
+        for key in ["data_type", "type"]:
+            value = schema.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+        meta = definition.get("meta") or {}
+        special = meta.get("special")
+        if isinstance(special, list):
+            joined = ",".join(str(item).strip().lower() for item in special if item)
+            if joined:
+                return joined
+        if isinstance(special, str) and special.strip():
+            return special.strip().lower()
         return None
 
     def is_field_required(self, collection: str, field_name: str) -> bool | None:

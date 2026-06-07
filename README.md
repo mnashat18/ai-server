@@ -155,7 +155,7 @@ If you are applying this through Directus:
 
 Apply [2026_06_06_scan_results_ai_model_version_length.sql](</d:/flutter/last/ai-server/sql/2026_06_06_scan_results_ai_model_version_length.sql>) before deployment. It:
 
-- updates `scan_results.ai_model_version` to `varchar(100)` so it can store `Conntinuity Intelligence Engine v1.2`
+- updates `scan_results.ai_model_version` to `varchar(100)` so it can safely store the server identifier `cie_v1_2`
 
 ## scan_requests / notifications
 

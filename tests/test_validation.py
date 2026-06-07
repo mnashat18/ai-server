@@ -50,7 +50,7 @@ if "ml.runtime" not in sys.modules:
             return self.require_local_model
 
         def predict(self, features):
-            return {"confidence": 0.8, "label": "Stable", "model_version": "Conntinuity Intelligence Engine v1.2"}
+            return {"confidence": 0.8, "label": "Stable", "model_version": "cie_v1_2"}
 
     fake_runtime.MLRuntime = _FakeMLRuntime
     sys.modules["ml.runtime"] = fake_runtime
@@ -272,7 +272,7 @@ class ValidationTests(unittest.TestCase):
 
 class MainPayloadTests(unittest.TestCase):
     def test_health_uses_configured_model_version_and_optional_local_model(self):
-        with patch.object(main, "MODEL_VERSION", "Conntinuity Intelligence Engine v1.2"), patch.object(
+        with patch.object(main, "MODEL_VERSION", "cie_v1_2"), patch.object(
             main.ml_runtime,
             "is_loaded",
             return_value=False,
@@ -297,7 +297,7 @@ class MainPayloadTests(unittest.TestCase):
         ):
             health = main.health()
 
-        self.assertEqual(health["model_version"], "Conntinuity Intelligence Engine v1.2")
+        self.assertEqual(health["model_version"], "cie_v1_2")
         self.assertFalse(health["ml_loaded"])
         self.assertIsNone(health["ml_error"])
         self.assertFalse(health["model_file_exists"])
@@ -425,7 +425,7 @@ class MainPayloadTests(unittest.TestCase):
                     "task_performance_score": 90,
                     "explanation": "ok",
                     "suggested_action": "continue_normal_activity",
-                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "ai_model_version": "cie_v1_2",
                     "validation_warnings": ["video_blurry"],
                 },
                 {"quality": {}},
@@ -433,7 +433,7 @@ class MainPayloadTests(unittest.TestCase):
 
         self.assertEqual(set(payload.keys()), supported_fields)
 
-    def test_scan_results_ai_model_version_full_value_preserved_when_schema_allows(self):
+    def test_scan_results_ai_model_version_is_forced_to_server_identifier(self):
         with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
             main.directus,
             "filter_payload_fields",
@@ -459,12 +459,12 @@ class MainPayloadTests(unittest.TestCase):
                     "confidence": 0.8,
                     "explanation": "ok",
                     "suggested_action": "continue_normal_activity",
-                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "ai_model_version": "some-ui-display-name",
                 },
                 {"quality": {}},
             )
 
-        self.assertEqual(payload["ai_model_version"], "Conntinuity Intelligence Engine v1.2")
+        self.assertEqual(payload["ai_model_version"], "cie_v1_2")
 
     def test_optional_overlong_string_field_is_skipped_with_warning(self):
         with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
@@ -493,7 +493,7 @@ class MainPayloadTests(unittest.TestCase):
                         "confidence": 0.8,
                         "explanation": "ok",
                         "suggested_action": "continue_normal_activity",
-                        "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                        "ai_model_version": "cie_v1_2",
                         "spoken_transcript": "this transcript is too long",
                     },
                     {"quality": {}},
@@ -502,7 +502,7 @@ class MainPayloadTests(unittest.TestCase):
         self.assertNotIn("spoken_transcript", payload)
         self.assertIn("field=spoken_transcript", "\n".join(logs.output))
 
-    def test_required_overlong_string_field_raises_clear_schema_error_before_post(self):
+    def test_required_overlong_string_field_is_truncated_before_post(self):
         with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
             main.directus,
             "filter_payload_fields",
@@ -518,23 +518,24 @@ class MainPayloadTests(unittest.TestCase):
         ), patch.object(
             main.directus,
             "get_field_max_length",
-            side_effect=lambda collection, field: 10 if field == "ai_model_version" else None,
+            side_effect=lambda collection, field: 10 if field == "explanation" else None,
         ):
-            with self.assertRaises(main.SchemaValidationError) as ctx:
-                main._build_scan_result_payload(
+            with self.assertLogs("ai-server", level="WARNING") as logs:
+                payload = main._build_scan_result_payload(
                     "scan-1",
                     {
                         "readiness_score": 75,
                         "risk_level": "stable",
                         "confidence": 0.8,
-                        "explanation": "ok",
+                        "explanation": "explanation that is too long",
                         "suggested_action": "continue_normal_activity",
-                        "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                        "ai_model_version": "ignored-ui-value",
                     },
                     {"quality": {}},
                 )
 
-        self.assertIn("scan_results.ai_model_version exceeds Directus max length", str(ctx.exception))
+        self.assertEqual(payload["explanation"], "explanatio")
+        self.assertIn("directus_field_truncated", "\n".join(logs.output))
 
     def test_invalid_numeric_values_are_removed_from_scan_results_payload(self):
         with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
@@ -561,7 +562,7 @@ class MainPayloadTests(unittest.TestCase):
                     "task_performance_score": 80.4,
                     "explanation": "ok",
                     "suggested_action": "continue_normal_activity",
-                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "ai_model_version": "cie_v1_2",
                     "confidence_drift": "-0.25",
                 },
                 {"quality": {}},
@@ -601,7 +602,7 @@ class MainPayloadTests(unittest.TestCase):
                     "confidence": 0.8,
                     "explanation": "ok",
                     "suggested_action": "continue_normal_activity",
-                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "ai_model_version": "cie_v1_2",
                 },
                 {"quality": {}},
             )
@@ -631,7 +632,7 @@ class MainPayloadTests(unittest.TestCase):
                     "confidence": 0.8,
                     "explanation": "ok",
                     "suggested_action": "continue_normal_activity",
-                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "ai_model_version": "cie_v1_2",
                 },
                 {"quality": {}, "validation": {"warnings": []}},
             )
@@ -758,7 +759,7 @@ class MainPayloadTests(unittest.TestCase):
                     "task_performance_score": 80,
                     "explanation": "ok",
                     "suggested_action": "continue_normal_activity",
-                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "ai_model_version": "cie_v1_2",
                     "confidence_drift": 0.0,
                     "baseline_used": False,
                     "face_metrics": {"face_score": 0.8},
@@ -772,10 +773,10 @@ class MainPayloadTests(unittest.TestCase):
         update_payload = update_scan_mock.call_args[0][1]
         self.assertEqual(update_payload["status"], "completed")
         self.assertEqual(update_payload["failure_reason"], None)
-        self.assertEqual(update_payload["ai_model_version"], "Conntinuity Intelligence Engine v1.2")
+        self.assertEqual(update_payload["ai_model_version"], "cie_v1_2")
         self.assertIn("completed_at", update_payload)
 
-    def test_wellness_scan_completed_update_skips_optional_overlong_ai_model_version(self):
+    def test_wellness_scan_completed_update_keeps_short_ai_model_version(self):
         with patch.object(main.directus, "filter_payload_fields", side_effect=lambda collection, payload: payload), patch.object(
             main.directus,
             "first_supported_field",
@@ -785,21 +786,19 @@ class MainPayloadTests(unittest.TestCase):
             "get_field_max_length",
             side_effect=lambda collection, field: 10 if field == "ai_model_version" else None,
         ):
-            with self.assertLogs("ai-server", level="WARNING") as logs:
-                payload = main._wellness_scan_update_payload(
-                    {
-                        "status": "completed",
-                        "completed_at": "2026-06-06T12:00:00Z",
-                        "failure_reason": None,
-                        "failure_message": None,
-                        "ai_model_version": "Conntinuity Intelligence Engine v1.2",
-                    }
-                )
+            payload = main._wellness_scan_update_payload(
+                {
+                    "status": "completed",
+                    "completed_at": "2026-06-06T12:00:00Z",
+                    "failure_reason": None,
+                    "failure_message": None,
+                    "ai_model_version": "too-long-ui-display-name",
+                }
+            )
 
         self.assertEqual(payload["status"], "completed")
         self.assertEqual(payload["completed_at"], "2026-06-06T12:00:00Z")
-        self.assertNotIn("ai_model_version", payload)
-        self.assertIn("field=ai_model_version", "\n".join(logs.output))
+        self.assertEqual(payload["ai_model_version"], "cie_v1_2")
 
     def test_wellness_scan_completed_update_skips_ai_model_version_when_field_missing(self):
         def filter_missing_field(collection, payload):
@@ -820,7 +819,7 @@ class MainPayloadTests(unittest.TestCase):
                     "completed_at": "2026-06-06T12:00:00Z",
                     "failure_reason": None,
                     "failure_message": None,
-                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "ai_model_version": "cie_v1_2",
                 }
             )
 
@@ -937,7 +936,7 @@ class MainPayloadTests(unittest.TestCase):
                     "task_performance_score": 80,
                     "explanation": "ok",
                     "suggested_action": "continue_normal_activity",
-                    "ai_model_version": "Conntinuity Intelligence Engine v1.2",
+                    "ai_model_version": "cie_v1_2",
                     "confidence_drift": 0.0,
                     "baseline_used": False,
                     "face_metrics": {"face_score": 0.8},
@@ -950,7 +949,7 @@ class MainPayloadTests(unittest.TestCase):
         self.assertEqual(status["scan_result"], "created:result-1")
         self.assertEqual(status["wellness_scan"], "updated")
         upsert_payload = upsert_mock.call_args[0][1]
-        self.assertEqual(upsert_payload["ai_model_version"], "Conntinuity Intelligence Engine v1.2")
+        self.assertEqual(upsert_payload["ai_model_version"], "cie_v1_2")
         update_payload = update_scan_mock.call_args[0][1]
         self.assertEqual(update_payload["status"], "completed")
         self.assertEqual(update_payload["failure_reason"], None)

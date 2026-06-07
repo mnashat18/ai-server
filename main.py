@@ -279,6 +279,74 @@ def _safe_numeric(value: Any, *, integer: bool) -> int | float | None:
     return round(numeric, 6)
 
 
+def _is_json_field(collection: str, field_name: str) -> bool:
+    schema_type = directus.get_field_schema_type(collection, field_name) or ""
+    return schema_type in {"json", "jsonb"} or "json" in schema_type
+
+
+def _truncate_string_to_schema(
+    collection: str,
+    field_name: str,
+    value: Any,
+    *,
+    fallback: str | None = None,
+    default_max_len: int = 65535,
+) -> str | None:
+    text = sanitize_text(value, fallback=fallback, max_len=default_max_len)
+    if text is None:
+        return None
+    max_length = directus.get_field_max_length(collection, field_name)
+    if max_length is None or len(text) <= max_length:
+        return text
+    logger.warning(
+        "directus_field_truncated collection=%s field=%s max_length=%s actual_length=%s",
+        collection,
+        field_name,
+        max_length,
+        len(text),
+    )
+    return text[:max_length]
+
+
+def _coerce_json_field(collection: str, field_name: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        schema_type = directus.get_field_schema_type(collection, field_name)
+        if not schema_type or _is_json_field(collection, field_name):
+            return value
+        logger.warning(
+            "directus_json_field_skipped collection=%s field=%s schema_type=%s value_type=%s",
+            collection,
+            field_name,
+            schema_type,
+            type(value).__name__,
+        )
+        return None
+    return value
+
+
+def _scan_result_payload_diagnostics(payload: dict[str, Any]) -> tuple[dict[str, int], dict[str, str]]:
+    string_lengths = {key: len(value) for key, value in payload.items() if isinstance(value, str)}
+    field_types = {key: type(value).__name__ for key, value in payload.items()}
+    return string_lengths, field_types
+
+
+def _log_scan_result_payload_ready(scan_id: str, payload: dict[str, Any]) -> None:
+    string_lengths, field_types = _scan_result_payload_diagnostics(payload)
+    ai_model_version = payload.get("ai_model_version")
+    logger.info(
+        "scan_id=%s step=scan_result_payload_ready ai_model_version=%r ai_model_version_type=%s ai_model_version_len=%s payload_keys=%s payload_types=%s payload_string_lengths=%s",
+        scan_id,
+        ai_model_version,
+        type(ai_model_version).__name__ if ai_model_version is not None else None,
+        len(str(ai_model_version)) if ai_model_version is not None else 0,
+        sorted(payload.keys()),
+        field_types,
+        string_lengths,
+    )
+
+
 def _coerce_scan_result_choice(field_name: str, value: Any) -> Any:
     text = _safe_string(value, max_len=255)
     if text is None:
@@ -353,13 +421,12 @@ def _schema_aware_scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]
         if field_name in candidate:
             candidate[field_name] = _coerce_scan_result_choice(field_name, candidate.get(field_name))
 
-    candidate["explanation"] = _field_length_checked_string(
+    candidate["explanation"] = _truncate_string_to_schema(
         "scan_results",
         "explanation",
         candidate.get("explanation"),
         fallback="Analysis completed.",
         default_max_len=65535,
-        required=True,
     )
     candidate["suggested_action"] = _field_length_checked_string(
         "scan_results",
@@ -371,9 +438,9 @@ def _schema_aware_scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]
     candidate["ai_model_version"] = _field_length_checked_string(
         "scan_results",
         "ai_model_version",
-        candidate.get("ai_model_version"),
+        MODEL_VERSION,
         fallback=MODEL_VERSION,
-        default_max_len=65535,
+        default_max_len=255,
         required=True,
     )
 
@@ -386,6 +453,21 @@ def _schema_aware_scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]
                 default_max_len=65535,
                 required=False,
             )
+
+    for field_name in [
+        "face_metrics",
+        "voice_metrics",
+        "reaction_metrics",
+        "analysis_metadata",
+        "media_quality",
+        "warnings",
+        "modality_scores",
+        "fusion_details",
+        "internal_analysis",
+        "validation_warnings",
+    ]:
+        if field_name in candidate:
+            candidate[field_name] = _coerce_json_field("scan_results", field_name, candidate.get(field_name))
 
     filtered = _scan_result_payload(candidate)
 
@@ -593,9 +675,9 @@ def _wellness_scan_update_payload(payload: dict[str, Any]) -> dict[str, Any]:
         candidate["ai_model_version"] = _field_length_checked_string(
             "wellness_scans",
             "ai_model_version",
-            candidate.get("ai_model_version"),
+            MODEL_VERSION,
             fallback=MODEL_VERSION,
-            default_max_len=65535,
+            default_max_len=255,
             required=False,
         )
 
@@ -757,7 +839,7 @@ def _build_scan_result_payload(scan_id: str, result: dict, internal_analysis: di
         "task_performance_score": result.get("task_performance_score"),
         "explanation": sanitize_text(result.get("explanation"), fallback="Analysis completed.", max_len=65535),
         "suggested_action": sanitize_text(result.get("suggested_action"), fallback="review_required", max_len=255),
-        "ai_model_version": sanitize_text(result.get("ai_model_version"), fallback=MODEL_VERSION, max_len=65535),
+        "ai_model_version": MODEL_VERSION,
         "confidence_drift": result.get("confidence_drift"),
         "baseline_used": result.get("baseline_used"),
         "face_metrics": result.get("face_metrics"),
@@ -816,7 +898,9 @@ def _write_success(
 ) -> dict:
     status: dict[str, Any] = {}
     try:
-        write_mode, scan_result = directus.upsert_scan_result(scan_id, _build_scan_result_payload(scan_id, result, internal_analysis))
+        scan_result_payload = _build_scan_result_payload(scan_id, result, internal_analysis)
+        _log_scan_result_payload_ready(scan_id, scan_result_payload)
+        write_mode, scan_result = directus.upsert_scan_result(scan_id, scan_result_payload)
         status["scan_result"] = f"{write_mode}:{_relation_id(scan_result.get('id')) or 'ok'}"
     except Exception as exc:
         logger.exception("scan_result_write_failed scan_id=%s error=%s", scan_id, exc)
@@ -1055,7 +1139,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
                 baseline_payload["business_profile"] = identifiers["business_profile_id"]
                 directus.upsert_employee_baseline(_relation_id((baseline or {}).get("id")), baseline_payload)
             except Exception as exc:
-                logger.warning("baseline_write_failed scan_id=%s error=%s", scan_id, exc)
+                logger.warning("baseline_write_failed scan_id=%s optional=true error=%s", scan_id, exc)
 
         internal_analysis = sanitize_payload(
             {
