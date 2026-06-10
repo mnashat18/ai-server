@@ -968,6 +968,13 @@ def _write_success(
     return status
 
 
+def _critical_validation_errors_allow_result(critical_errors: list[str] | None) -> bool:
+    errors = set(critical_errors or [])
+    if not errors:
+        return True
+    return errors.issubset({"missing_media", "unreadable_media"})
+
+
 def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     _log_step(scan_id, "validation_start")
     scan_context = _resolve_scan_context(scan_id)
@@ -984,11 +991,9 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     )
 
     if media_row is None:
-        validation_result = fail_validation(FAILURE_REASON_MISSING_MEDIA)
-        _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"])
-        _log_step(scan_id, "directus_writeback_start")
-        _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
-        return {"status": SCAN_STATUS_FAILED, **validation_result}
+        scan_context["scan_media"] = None
+        scan_context["resolved_media"] = {"image": None, "audio": None, "video": None}
+        _log_step(scan_id, "media_missing_continue_with_unknown_result")
 
     if ml_runtime.local_model_required() and not ml_runtime.is_loaded():
         validation_result = fail_validation(FAILURE_REASON_MODEL_NOT_LOADED)
@@ -1076,30 +1081,36 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             quality_score=((image_result or {}).get("details") or {}).get("image_quality_score"),
         )
 
-        if not phrase_validation["passed"]:
-            _log_step(scan_id, "validation_failed", reason=phrase_validation["failure_reason"], scores=phrase_validation["quality_scores"])
-            _log_step(scan_id, "directus_writeback_start")
-            _mark_scan_failed(scan_id, phrase_validation["failure_reason"], phrase_validation["failure_message"])
-            return {"status": SCAN_STATUS_FAILED, **phrase_validation}
-
         raw_signals = {
             "camera": image_result or {"score": None, "details": {"status": "missing"}},
             "video": video_result,
             "voice": audio_result,
         }
         quality_result = assess_quality(raw_signals, task)
-        if not quality_result["passed"]:
-            validation_result = fail_validation(
-                quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA,
-                scores=phrase_validation["quality_scores"],
-                warnings=quality_result.get("warnings"),
-            )
-            _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=validation_result["quality_scores"])
+        combined_warnings = []
+        combined_warnings.extend(quality_result.get("warnings") or [])
+        combined_warnings.extend(phrase_validation.get("warnings") or [])
+        combined_warnings.extend(phrase_validation.get("critical_errors") or [])
+        if "unreadable_media" in (phrase_validation.get("critical_errors") or []):
+            combined_warnings.append("missing_media")
+        quality_result["warnings"] = list(dict.fromkeys(warning for warning in combined_warnings if warning))
+        if phrase_validation.get("warnings") or phrase_validation.get("critical_errors"):
+            quality_result["weak"] = True
+            quality_result["status"] = "weak"
+        if phrase_validation.get("failure_reason") in {"missing_media", "unreadable_media"}:
+            quality_result["failure_reason"] = "missing_media"
+            quality_result["retake_required"] = True
+            quality_result["suggested_action"] = "rescan_recommended"
+
+        critical_errors = phrase_validation.get("critical_errors") or []
+        if critical_errors and not _critical_validation_errors_allow_result(critical_errors):
+            validation_result = fail_validation(critical_errors[0], warnings=quality_result.get("warnings"))
+            _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=phrase_validation["quality_scores"])
             _log_step(scan_id, "directus_writeback_start")
             _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
             return {"status": SCAN_STATUS_FAILED, **validation_result}
 
-        _log_step(scan_id, "validation_passed", scores=phrase_validation["quality_scores"])
+        _log_step(scan_id, "validation_passed", scores=phrase_validation["quality_scores"], warnings=quality_result.get("warnings"))
         _log_step(scan_id, "analysis_start")
         feature_map, _ = features_from_signals(raw_signals, task=task)
         feature_vector = vector_from_features(feature_map)
@@ -1121,7 +1132,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
                 "audio_quality_score": phrase_validation["quality_scores"].get("audio"),
                 "video_quality_score": phrase_validation["quality_scores"].get("video"),
                 "image_quality_score": phrase_validation["quality_scores"].get("image"),
-                "validation_warnings": phrase_validation.get("warnings"),
+                "validation_warnings": quality_result.get("warnings"),
             }
         )
         _log_step(scan_id, "analysis_done", risk_level=result.get("risk_level"), confidence=result.get("confidence"))

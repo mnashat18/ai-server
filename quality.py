@@ -22,7 +22,8 @@ def _signal_summary(name: str, result: dict | None, usable_threshold: float, war
     details = result.get("details", {}) if isinstance(result, dict) else {}
     score = clamp01(result.get("score"))
     warnings = clean_warning_codes(details.get(warning_key) or [])
-    present = details.get("status") not in {"missing", None} or score is not None
+    missing_statuses = {"missing", "open_failed", "load_failed", "empty_audio", "invalid", "invalid_image", "error", None}
+    present = details.get("status") not in missing_statuses or score is not None
     usable = bool(score is not None and score >= usable_threshold and len(warnings) < 3)
     weak = bool(score is not None and not usable)
     return {
@@ -42,6 +43,8 @@ def assess_quality(signals: dict, task: Any = None) -> dict:
     image = _signal_summary("image", signals.get("camera"), 0.38, "image_warnings")
 
     warnings = clean_warning_codes(video["warnings"] + audio["warnings"] + image["warnings"])
+    weak_modalities = [signal["name"] for signal in [video, audio, image] if signal["weak"]]
+    missing_modalities = [signal["name"] for signal in [video, audio, image] if not signal["present"]]
     usable_modalities = sum(1 for signal in [video, audio, image] if signal["usable"])
     present_modalities = sum(1 for signal in [video, audio, image] if signal["present"])
     strong_modalities = sum(1 for signal in [video, audio, image] if (signal["score"] or 0.0) >= 0.72)
@@ -75,20 +78,20 @@ def assess_quality(signals: dict, task: Any = None) -> dict:
     retake_required = False
     if present_modalities == 0:
         failure_reason = FAILURE_REASON_MISSING_MEDIA
-        status = "failed"
+        status = "weak"
         retake_required = True
     elif usable_modalities == 0:
         failure_reason = FAILURE_REASON_LOW_QUALITY_MEDIA
-        status = "failed"
+        status = "weak"
         retake_required = True
     elif usable_modalities == 1 and strong_modalities == 0:
         failure_reason = FAILURE_REASON_LOW_QUALITY_MEDIA
-        status = "failed"
+        status = "weak"
         retake_required = True
     elif usable_modalities == 1 or warnings:
         status = "weak"
 
-    if status == "failed":
+    if status == "failed" or retake_required:
         suggested_action = "rescan_recommended"
     elif usable_modalities == 1:
         suggested_action = "review_required"
@@ -97,7 +100,7 @@ def assess_quality(signals: dict, task: Any = None) -> dict:
 
     return {
         "status": status,
-        "passed": status != "failed",
+        "passed": True,
         "weak": status == "weak",
         "failure_reason": failure_reason,
         "reasons": [failure_reason] if failure_reason else [],
@@ -105,6 +108,8 @@ def assess_quality(signals: dict, task: Any = None) -> dict:
         "retake_required": retake_required,
         "suggested_action": suggested_action,
         "usable_modalities": usable_modalities,
+        "weak_modalities": weak_modalities,
+        "missing_modalities": missing_modalities,
         "present_modalities": present_modalities,
         "confidence_multiplier": safe_number(confidence_multiplier),
         "task_quality": task_quality,
@@ -112,17 +117,23 @@ def assess_quality(signals: dict, task: Any = None) -> dict:
         "media_quality": {
             "aggregate_quality": safe_number(aggregate_quality),
             "video": {
+                "present": video["present"],
                 "usable": video["usable"],
+                "weak": video["weak"],
                 "score": safe_number(video["score"]),
                 "warnings": video["warnings"],
             },
             "audio": {
+                "present": audio["present"],
                 "usable": audio["usable"],
+                "weak": audio["weak"],
                 "score": safe_number(audio["score"]),
                 "warnings": audio["warnings"],
             },
             "image": {
+                "present": image["present"],
                 "usable": image["usable"],
+                "weak": image["weak"],
                 "score": safe_number(image["score"]),
                 "warnings": image["warnings"],
             },

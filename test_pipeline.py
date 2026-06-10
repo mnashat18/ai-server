@@ -20,17 +20,20 @@ class PipelineTests(unittest.TestCase):
 
     def test_missing_media_handling(self):
         result = assess_quality({"camera": {}, "video": {}, "voice": {}})
-        self.assertFalse(result["passed"])
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["weak"])
         self.assertEqual(result["failure_reason"], "missing_media")
+        self.assertEqual(result["suggested_action"], "rescan_recommended")
 
-    def test_low_quality_media_failure(self):
+    def test_low_quality_media_warning(self):
         signals = {
             "camera": _signal(0.2, {"status": "ok", "image_warnings": ["image_blurry"]}),
             "video": _signal(0.25, {"status": "ok", "visual_warnings": ["video_blurry"]}),
             "voice": _signal(0.22, {"status": "ok", "audio_warnings": ["audio_too_noisy"]}),
         }
         result = assess_quality(signals)
-        self.assertFalse(result["passed"])
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["weak"])
         self.assertEqual(result["failure_reason"], "low_quality_media")
 
     def test_no_undefined_values_in_payload(self):
@@ -75,6 +78,142 @@ class PipelineTests(unittest.TestCase):
         result = compute_result(signals=signals, quality=quality)
         self.assertGreater(result["confidence"], 0.5)
         self.assertNotEqual(result["risk_level"], "unknown")
+
+    def test_low_media_quality_reduces_confidence_and_score(self):
+        good_signals = {
+            "camera": _signal(0.76, {"status": "ok", "image_confidence": 0.76, "image_quality_score": 0.73, "image_warnings": []}),
+            "video": _signal(0.82, {"status": "ok", "visual_confidence": 0.82, "visual_quality_score": 0.8, "visual_warnings": []}),
+            "voice": _signal(0.78, {"status": "ok", "audio_confidence": 0.78, "audio_quality_score": 0.76, "audio_warnings": []}),
+        }
+        weak_signals = {
+            "camera": _signal(0.22, {"status": "ok", "image_confidence": 0.22, "image_quality_score": 0.2, "image_warnings": ["image_blurry"]}),
+            "video": _signal(0.25, {"status": "ok", "visual_confidence": 0.25, "visual_quality_score": 0.2, "visual_warnings": ["video_blurry"]}),
+            "voice": _signal(0.24, {"status": "ok", "audio_confidence": 0.24, "audio_quality_score": 0.2, "audio_warnings": ["audio_too_noisy"]}),
+        }
+        good = compute_result(signals=good_signals, quality=assess_quality(good_signals))
+        weak = compute_result(signals=weak_signals, quality=assess_quality(weak_signals))
+
+        self.assertLess(weak["confidence"], good["confidence"])
+        self.assertLess(weak["readiness_score"], good["readiness_score"])
+        self.assertIn("reduced", weak["explanation"].lower())
+
+    def test_blurry_video_reduces_confidence(self):
+        clean_signals = {
+            "camera": _signal(0.76, {"status": "ok", "image_confidence": 0.76, "image_quality_score": 0.73, "image_warnings": []}),
+            "video": _signal(0.82, {"status": "ok", "visual_confidence": 0.82, "visual_quality_score": 0.8, "visual_warnings": []}),
+            "voice": _signal(0.78, {"status": "ok", "audio_confidence": 0.78, "audio_quality_score": 0.76, "audio_warnings": []}),
+        }
+        blurry_signals = {
+            "camera": clean_signals["camera"],
+            "video": _signal(0.82, {"status": "ok", "visual_confidence": 0.82, "visual_quality_score": 0.8, "visual_warnings": ["video_blurry"]}),
+            "voice": clean_signals["voice"],
+        }
+
+        clean = compute_result(signals=clean_signals, quality=assess_quality(clean_signals))
+        blurry = compute_result(signals=blurry_signals, quality=assess_quality(blurry_signals))
+
+        self.assertLess(blurry["confidence"], clean["confidence"])
+        self.assertLess(blurry["modality_scores"]["video"], clean["modality_scores"]["video"])
+        self.assertIn("blur", blurry["explanation"].lower())
+
+    def test_noisy_audio_reduces_confidence(self):
+        clean_signals = {
+            "camera": _signal(0.76, {"status": "ok", "image_confidence": 0.76, "image_quality_score": 0.73, "image_warnings": []}),
+            "video": _signal(0.82, {"status": "ok", "visual_confidence": 0.82, "visual_quality_score": 0.8, "visual_warnings": []}),
+            "voice": _signal(0.78, {"status": "ok", "audio_confidence": 0.78, "audio_quality_score": 0.76, "audio_warnings": []}),
+        }
+        noisy_signals = {
+            "camera": clean_signals["camera"],
+            "video": clean_signals["video"],
+            "voice": _signal(0.78, {"status": "ok", "audio_confidence": 0.78, "audio_quality_score": 0.76, "audio_warnings": ["audio_too_noisy"]}),
+        }
+
+        clean = compute_result(signals=clean_signals, quality=assess_quality(clean_signals))
+        noisy = compute_result(signals=noisy_signals, quality=assess_quality(noisy_signals))
+
+        self.assertLess(noisy["confidence"], clean["confidence"])
+        self.assertLess(noisy["modality_scores"]["audio"], clean["modality_scores"]["audio"])
+        self.assertIn("noise", noisy["explanation"].lower())
+
+    def test_weak_face_visibility_reduces_confidence(self):
+        clean_signals = {
+            "camera": _signal(0.76, {"status": "ok", "image_confidence": 0.76, "image_quality_score": 0.73, "image_warnings": []}),
+            "video": _signal(0.82, {"status": "ok", "visual_confidence": 0.82, "visual_quality_score": 0.8, "visual_warnings": []}),
+            "voice": _signal(0.78, {"status": "ok", "audio_confidence": 0.78, "audio_quality_score": 0.76, "audio_warnings": []}),
+        }
+        weak_face_quality = assess_quality(clean_signals)
+        weak_face_quality["warnings"] = ["face_not_visible"]
+        weak_face_quality["weak"] = True
+        weak_face_quality["status"] = "weak"
+
+        clean = compute_result(signals=clean_signals, quality=assess_quality(clean_signals))
+        weak_face = compute_result(signals=clean_signals, quality=weak_face_quality)
+
+        self.assertLess(weak_face["confidence"], clean["confidence"])
+        self.assertLess(weak_face["modality_scores"]["video"], clean["modality_scores"]["video"])
+        self.assertIn("face visibility", weak_face["explanation"].lower())
+
+    def test_low_confidence_does_not_return_stable(self):
+        signals = {
+            "camera": _signal(None, {"status": "missing", "image_warnings": ["image_missing"]}),
+            "video": _signal(None, {"status": "missing", "visual_warnings": ["video_missing"]}),
+            "voice": _signal(None, {"status": "missing", "audio_warnings": ["audio_missing"]}),
+        }
+        result = compute_result(signals=signals, quality=assess_quality(signals))
+
+        self.assertLess(result["confidence"], 0.45)
+        self.assertEqual(result["risk_level"], "unknown")
+        self.assertEqual(result["suggested_action"], "rescan_recommended")
+
+    def test_missing_video_with_good_audio_image_is_unknown_rescan(self):
+        signals = {
+            "camera": _signal(0.76, {"status": "ok", "image_confidence": 0.76, "image_quality_score": 0.73, "image_warnings": []}),
+            "video": _signal(None, {"status": "missing", "visual_warnings": ["video_missing"]}),
+            "voice": _signal(0.78, {"status": "ok", "audio_confidence": 0.78, "audio_quality_score": 0.76, "audio_warnings": []}),
+        }
+        result = compute_result(signals=signals, quality=assess_quality(signals))
+
+        self.assertEqual(result["risk_level"], "unknown")
+        self.assertEqual(result["suggested_action"], "rescan_recommended")
+        self.assertIn("video", result["explanation"].lower())
+
+    def test_missing_audio_with_good_video_image_is_unknown_rescan(self):
+        signals = {
+            "camera": _signal(0.76, {"status": "ok", "image_confidence": 0.76, "image_quality_score": 0.73, "image_warnings": []}),
+            "video": _signal(0.82, {"status": "ok", "visual_confidence": 0.82, "visual_quality_score": 0.8, "visual_warnings": []}),
+            "voice": _signal(None, {"status": "missing", "audio_warnings": ["audio_missing"]}),
+        }
+        result = compute_result(signals=signals, quality=assess_quality(signals))
+
+        self.assertEqual(result["risk_level"], "unknown")
+        self.assertEqual(result["suggested_action"], "rescan_recommended")
+        self.assertIn("audio", result["explanation"].lower())
+
+    def test_missing_major_media_is_unknown_without_quality_metadata(self):
+        signals = {
+            "camera": _signal(0.76, {"status": "ok", "image_confidence": 0.76, "image_quality_score": 0.73, "image_warnings": []}),
+            "video": _signal(None, {"status": "open_failed", "visual_warnings": []}),
+            "voice": _signal(0.78, {"status": "ok", "audio_confidence": 0.78, "audio_quality_score": 0.76, "audio_warnings": []}),
+        }
+        result = compute_result(signals=signals, quality={})
+
+        self.assertEqual(result["risk_level"], "unknown")
+        self.assertEqual(result["suggested_action"], "rescan_recommended")
+        self.assertIn("video", result["explanation"].lower())
+
+    def test_low_media_quality_creates_explanation_warnings(self):
+        signals = {
+            "camera": _signal(0.3, {"status": "ok", "image_confidence": 0.3, "image_quality_score": 0.3, "image_warnings": ["image_blurry"]}),
+            "video": _signal(0.3, {"status": "ok", "visual_confidence": 0.3, "visual_quality_score": 0.3, "visual_warnings": ["video_too_dark"]}),
+            "voice": _signal(0.3, {"status": "ok", "audio_confidence": 0.3, "audio_quality_score": 0.3, "audio_warnings": ["audio_too_quiet"]}),
+        }
+        result = compute_result(signals=signals, quality=assess_quality(signals))
+
+        explanation = result["explanation"].lower()
+        self.assertEqual(result["risk_level"], "unknown")
+        self.assertEqual(result["suggested_action"], "rescan_recommended")
+        self.assertIn("reduced", explanation)
+        self.assertTrue("lighting" in explanation or "volume" in explanation or "blur" in explanation)
 
     def test_duplicate_scan_result_prevention(self):
         client = DirectusClient(base_url="http://example.com", token="x")
