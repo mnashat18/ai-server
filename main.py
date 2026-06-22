@@ -9,10 +9,11 @@ import tempfile
 import traceback
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import requests
+from requests import HTTPError
 
 from baseline import baseline_ready_for_scoring, baseline_signal_payload, baseline_status_payload
 from config import MAX_DOWNLOAD_BYTES, MODEL_VERSION
@@ -33,6 +34,11 @@ ml_runtime.load()
 directus = DirectusClient()
 
 VALIDATION_POLICY = ValidationPolicy.from_env()
+AI_SERVER_ENV = os.getenv("AI_SERVER_ENV", "production").strip().lower()
+DEBUG_SCAN_ENDPOINT_ENABLED = AI_SERVER_ENV in {"dev", "development", "local", "test"} and os.getenv(
+    "DEBUG_SCAN_ENDPOINT_ENABLED",
+    "",
+).strip().lower() in {"1", "true", "yes", "on"}
 
 SCAN_STATUS_PENDING = "pending"
 SCAN_STATUS_MEDIA_READY = "media_ready"
@@ -509,6 +515,181 @@ def _build_scan_result_response(
     if current_status is not None:
         payload["current_status"] = current_status
     return JSONResponse(status_code=status_code, content=payload)
+
+
+def _bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    parts = authorization.strip().split()
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        return None
+    return parts[1].strip()
+
+
+def _ids_equal(left: Any, right: Any) -> bool:
+    left_id = _relation_id(left)
+    right_id = _relation_id(right)
+    if left_id is None or right_id is None:
+        return False
+    return str(left_id) == str(right_id)
+
+
+def _truthy_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "active", "enabled", "approved", "published"}
+    return bool(value)
+
+
+def _membership_row_is_active(row: dict[str, Any]) -> bool:
+    status = row.get("status")
+    if status not in (None, ""):
+        status_value = str(_relation_id(status)).strip().lower()
+        if status_value not in {"active", "enabled", "approved", "published"}:
+            return False
+    for field_name in ["is_active", "active"]:
+        if field_name in row and row.get(field_name) is not None and not _truthy_flag(row.get(field_name)):
+            return False
+    return True
+
+
+def _membership_row_matches_scan_scope(row: dict[str, Any], scan_context: dict[str, Any]) -> bool:
+    scan_member_id = _relation_id(scan_context.get("member"))
+    scan_department_id = _relation_id(scan_context.get("department"))
+
+    if scan_member_id:
+        member_candidates = [_relation_id(row.get("id")), _relation_id(row.get("member"))]
+        if not any(_ids_equal(candidate, scan_member_id) for candidate in member_candidates if candidate is not None):
+            return False
+
+    row_department_id = _relation_id(row.get("department"))
+    if scan_department_id and row_department_id and not _ids_equal(row_department_id, scan_department_id):
+        return False
+
+    return True
+
+
+def _authenticate_process_user(authorization: str | None, scan_id: str) -> Any:
+    token = _bearer_token(authorization)
+    if not token:
+        logger.info("process_auth_failed scan_id=%s reason=missing_or_malformed_authorization", scan_id)
+        raise HTTPException(status_code=401, detail="invalid_authorization")
+
+    try:
+        user = directus.get_current_user(token)
+    except HTTPError as exc:
+        status_code = getattr(exc.response, "status_code", None)
+        if status_code in {401, 403}:
+            logger.info("process_auth_failed scan_id=%s reason=invalid_or_expired_token status_code=%s", scan_id, status_code)
+            raise HTTPException(status_code=401, detail="invalid_authorization") from exc
+        logger.warning("process_identity_request_failed scan_id=%s status_code=%s", scan_id, status_code)
+        raise HTTPException(status_code=502, detail="directus_identity_request_failed") from exc
+    except Exception as exc:
+        logger.warning("process_identity_request_failed scan_id=%s error_type=%s", scan_id, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="directus_identity_request_failed") from exc
+
+    user_id = _relation_id((user or {}).get("id"))
+    if not user_id:
+        logger.info("process_auth_failed scan_id=%s reason=missing_user_id", scan_id)
+        raise HTTPException(status_code=401, detail="invalid_authorization")
+    user_status = str(_relation_id((user or {}).get("status")) or "").strip().lower()
+    if not user_status or user_status != "active":
+        logger.info("process_auth_failed scan_id=%s reason=inactive_user", scan_id)
+        raise HTTPException(status_code=401, detail="invalid_authorization")
+    return user_id
+
+
+def _resolve_scan_auth_context(scan_id: str) -> dict[str, Any]:
+    if not directus.is_configured():
+        raise HTTPException(status_code=500, detail="Directus credentials are not configured")
+    try:
+        scan_context = directus.get_scan_auth_context(scan_id)
+    except HTTPError as exc:
+        status_code = getattr(exc.response, "status_code", None)
+        if status_code == 404:
+            raise HTTPException(status_code=404, detail="wellness_scans record not found") from exc
+        logger.warning("scan_auth_context_failed scan_id=%s status_code=%s", scan_id, status_code)
+        raise HTTPException(status_code=502, detail="scan_auth_context_failed") from exc
+    except Exception as exc:
+        logger.exception("scan_auth_context_failed scan_id=%s error=%s", scan_id, exc)
+        raise HTTPException(status_code=502, detail="scan_auth_context_failed") from exc
+
+    if not scan_context or not _relation_id(scan_context.get("id")):
+        raise HTTPException(status_code=404, detail="wellness_scans record not found")
+    return scan_context
+
+
+def _authorize_scan_access(scan_context: dict[str, Any], authenticated_user_id: Any) -> None:
+    scan_id = _relation_id(scan_context.get("id"))
+    scan_user_id = _relation_id(scan_context.get("user"))
+    if not scan_user_id or not _ids_equal(scan_user_id, authenticated_user_id):
+        logger.info("process_scan_not_found_or_not_owned scan_id=%s authenticated_user_id=%s", scan_id, authenticated_user_id)
+        raise HTTPException(status_code=404, detail="wellness_scans record not found")
+
+    business_profile_id = _relation_id(scan_context.get("business_profile"))
+    if not business_profile_id:
+        logger.info("process_membership_denied scan_id=%s user_id=%s reason=missing_business_profile", scan_id, authenticated_user_id)
+        raise HTTPException(status_code=403, detail="active_membership_required")
+
+    try:
+        membership_rows = directus.list_business_profile_members(authenticated_user_id, business_profile_id)
+    except Exception as exc:
+        logger.warning(
+            "process_membership_lookup_failed scan_id=%s user_id=%s business_profile_id=%s error=%s",
+            scan_id,
+            authenticated_user_id,
+            business_profile_id,
+            exc,
+        )
+        raise HTTPException(status_code=403, detail="active_membership_required") from exc
+
+    for row in membership_rows:
+        if not _ids_equal(row.get("user"), authenticated_user_id):
+            continue
+        if not _ids_equal(row.get("business_profile"), business_profile_id):
+            continue
+        if not _membership_row_is_active(row):
+            continue
+        if _membership_row_matches_scan_scope(row, scan_context):
+            return
+
+    logger.info(
+        "process_membership_denied scan_id=%s user_id=%s business_profile_id=%s member_id=%s department_id=%s",
+        scan_id,
+        authenticated_user_id,
+        business_profile_id,
+        _relation_id(scan_context.get("member")),
+        _relation_id(scan_context.get("department")),
+    )
+    raise HTTPException(status_code=403, detail="active_membership_required")
+
+
+def _ensure_scan_media_ready(scan_id: str) -> None:
+    try:
+        media_row = directus.get_scan_media(scan_id)
+    except Exception as exc:
+        logger.warning("process_scan_media_lookup_failed scan_id=%s error_type=%s", scan_id, type(exc).__name__)
+        raise HTTPException(status_code=409, detail="scan_media_not_ready") from exc
+
+    if not media_row:
+        logger.info("process_scan_media_not_ready scan_id=%s reason=missing_scan_media", scan_id)
+        raise HTTPException(status_code=409, detail="scan_media_not_ready")
+
+    required_fields = []
+    if VALIDATION_POLICY.require_video:
+        required_fields.append("video_file")
+    if VALIDATION_POLICY.require_audio:
+        required_fields.append("audio_file")
+    if getattr(VALIDATION_POLICY, "require_image", False):
+        required_fields.append("thumbnail")
+
+    missing_fields = [field for field in required_fields if not _relation_id(media_row.get(field))]
+    if missing_fields:
+        logger.info("process_scan_media_not_ready scan_id=%s missing_fields=%s", scan_id, missing_fields)
+        raise HTTPException(status_code=409, detail="scan_media_not_ready")
 
 
 def _model_health() -> dict[str, Any]:
@@ -1204,7 +1385,6 @@ def health():
     return _model_health()
 
 
-@app.get("/debug/scan/{scan_id}")
 def debug_scan(scan_id: str):
     scan_context = _resolve_scan_context(scan_id)
     media_row = scan_context.get("scan_media")
@@ -1225,6 +1405,10 @@ def debug_scan(scan_id: str):
         "request_source": scan_context.get("request_source"),
         "status": scan_context.get("status"),
     }
+
+
+if DEBUG_SCAN_ENDPOINT_ENABLED:
+    app.get("/debug/scan/{scan_id}")(debug_scan)
 
 
 @app.get("/baseline/status", response_model=BaselineStatusResponse)
@@ -1278,16 +1462,26 @@ def set_baseline(req: BaselineRequest):
 
 
 @app.post("/process")
-def process_scan(req: ScanRequest, background_tasks: BackgroundTasks):
+def process_scan(
+    req: ScanRequest,
+    background_tasks: BackgroundTasks,
+    authorization: str | None = Header(default=None),
+):
     scan_id = (req.scan_id or "").strip()
     logger.info("RECEIVED /process scan_id=%s", scan_id)
-    if not scan_id:
-        return _build_scan_result_response(ok=False, scan_id=scan_id, error="invalid_scan_id", status_code=422)
 
     try:
-        scan_context = _resolve_scan_context(scan_id)
+        authenticated_user_id = _authenticate_process_user(authorization, scan_id)
+        if not scan_id:
+            return _build_scan_result_response(ok=False, scan_id=scan_id, error="invalid_scan_id", status_code=422)
+        scan_context = _resolve_scan_auth_context(scan_id)
+        _authorize_scan_access(scan_context, authenticated_user_id)
     except HTTPException as exc:
         error = "scan_not_found" if exc.status_code == 404 else "scan_context_failed"
+        if exc.status_code == 401:
+            error = "invalid_authorization"
+        elif exc.status_code == 403:
+            error = "active_membership_required"
         return _build_scan_result_response(ok=False, scan_id=scan_id, error=error, status_code=exc.status_code)
 
     current_status = (scan_context.get("status") or "").strip()
@@ -1313,6 +1507,12 @@ def process_scan(req: ScanRequest, background_tasks: BackgroundTasks):
             current_status=current_status,
             status_code=409,
         )
+
+    try:
+        _ensure_scan_media_ready(scan_id)
+    except HTTPException as exc:
+        error = exc.detail if exc.detail == "scan_media_not_ready" else "invalid_scan_status"
+        return _build_scan_result_response(ok=False, scan_id=scan_id, error=error, status_code=exc.status_code)
 
     update_payload = _wellness_scan_update_payload(
         {
