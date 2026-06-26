@@ -5,6 +5,7 @@ import types
 import unittest
 from unittest.mock import ANY, MagicMock, patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from validation import ValidationPolicy, validate_scan_inputs
@@ -987,15 +988,151 @@ class MainPayloadTests(unittest.TestCase):
 
     def test_idempotency_already_processing(self):
         client = TestClient(main.app)
-        with patch.object(main, "_resolve_scan_context", return_value={"status": "processing"}):
-            response = client.post("/process", json={"scan_id": "scan-123"})
+        with patch.object(main, "_authenticate_process_user", return_value="user-1"), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+            return_value={"id": "scan-123", "status": "processing", "user": "user-1", "business_profile": "bp-1"},
+        ), patch.object(main, "_authorize_scan_access", return_value=None):
+            response = client.post("/process", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["status"], "already_processing")
 
+    def test_process_requires_bearer_token_before_scan_lookup(self):
+        client = TestClient(main.app)
+        with patch.object(main, "_resolve_scan_auth_context") as scan_lookup_mock:
+            response = client.post("/process", json={"scan_id": "scan-123"})
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "invalid_authorization")
+        scan_lookup_mock.assert_not_called()
+
+    def test_process_hides_scan_owned_by_another_user(self):
+        client = TestClient(main.app)
+        with patch.object(main, "_authenticate_process_user", return_value="user-1"), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+            return_value={"id": "scan-123", "status": "media_ready", "user": "user-2", "business_profile": "bp-1"},
+        ), patch.object(
+            main,
+            "_authorize_scan_access",
+            side_effect=HTTPException(status_code=404, detail="wellness_scans record not found"),
+        ):
+            response = client.post("/process", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"], "scan_not_found")
+
+    def test_process_rejects_missing_active_membership(self):
+        client = TestClient(main.app)
+        with patch.object(main, "_authenticate_process_user", return_value="user-1"), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+            return_value={"id": "scan-123", "status": "media_ready", "user": "user-1", "business_profile": "bp-1"},
+        ), patch.object(
+            main,
+            "_authorize_scan_access",
+            side_effect=HTTPException(status_code=403, detail="active_membership_required"),
+        ):
+            response = client.post("/process", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"], "active_membership_required")
+
+    def test_process_rejects_non_active_directus_user_status(self):
+        client = TestClient(main.app)
+        with patch.object(main.directus, "get_current_user", return_value={"id": "user-1", "status": "suspended"}), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+        ) as scan_lookup_mock:
+            response = client.post("/process", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "invalid_authorization")
+        scan_lookup_mock.assert_not_called()
+
+    def test_process_rejects_media_ready_scan_with_missing_required_scan_media(self):
+        client = TestClient(main.app)
+        scan_context = {
+            "id": "scan-123",
+            "status": "media_ready",
+            "user": "user-1",
+            "business_profile": "bp-1",
+        }
+        policy = ValidationPolicy(require_video=True, require_audio=True, require_image=True)
+        with patch.object(main, "VALIDATION_POLICY", policy), patch.object(
+            main,
+            "_authenticate_process_user",
+            return_value="user-1",
+        ), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+            return_value=scan_context,
+        ), patch.object(main, "_authorize_scan_access", return_value=None), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value={"id": "media-1", "scan_id": "scan-123", "video_file": "video-1", "audio_file": None, "thumbnail": "thumb-1"},
+        ):
+            response = client.post("/process", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "scan_media_not_ready")
+
+    def test_process_scan_media_not_ready_does_not_update_or_schedule_background(self):
+        client = TestClient(main.app)
+        scan_context = {
+            "id": "scan-123",
+            "status": "media_ready",
+            "processing_attempts": 1,
+            "user": "user-1",
+            "business_profile": "bp-1",
+        }
+        policy = ValidationPolicy(require_video=True, require_audio=False, require_image=False)
+        with patch.object(main, "VALIDATION_POLICY", policy), patch.object(
+            main,
+            "_authenticate_process_user",
+            return_value="user-1",
+        ), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+            return_value=scan_context,
+        ), patch.object(main, "_authorize_scan_access", return_value=None), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value=None,
+        ), patch.object(
+            main.directus,
+            "update_wellness_scan",
+            return_value={},
+        ) as update_mock, patch.object(
+            main,
+            "process_scan_background",
+            return_value=None,
+        ) as background_mock:
+            response = client.post("/process", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "scan_media_not_ready")
+        update_mock.assert_not_called()
+        background_mock.assert_not_called()
+
     def test_process_accepts_media_ready_scan_and_ignores_extra_request_fields(self):
         client = TestClient(main.app)
-        scan_context = {"status": "media_ready", "processing_attempts": 1}
-        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+        scan_context = {
+            "id": "scan-123",
+            "status": "media_ready",
+            "processing_attempts": 1,
+            "user": "user-1",
+            "business_profile": "bp-1",
+        }
+        with patch.object(main, "_authenticate_process_user", return_value="user-1"), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+            return_value=scan_context,
+        ), patch.object(main, "_authorize_scan_access", return_value=None), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value={"id": "media-1", "scan_id": "scan-123", "video_file": "video-1", "audio_file": "audio-1", "thumbnail": "thumb-1"},
+        ), patch.object(
             main.directus,
             "update_wellness_scan",
             return_value={},
@@ -1012,6 +1149,7 @@ class MainPayloadTests(unittest.TestCase):
                     "previous_confidence": 0.99,
                     "task": {"reaction_time": 0.1},
                 },
+                headers={"Authorization": "Bearer test-token"},
             )
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["status"], "accepted")

@@ -119,6 +119,12 @@ class DirectusClient:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
 
+    def _user_token_headers(self, access_token: str) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        }
+
     def _url(self, path: str) -> str:
         if not self.base_url:
             raise RuntimeError("DIRECTUS_URL is not configured")
@@ -154,6 +160,20 @@ class DirectusClient:
             raise
         data = response.json()
         return data.get("data", data)
+
+    def get_current_user(self, access_token: str) -> dict | None:
+        if not self.base_url:
+            raise RuntimeError("DIRECTUS_URL is not configured")
+        response = requests.get(
+            self._url("/users/me"),
+            headers=self._user_token_headers(access_token),
+            params={"fields": "id,status"},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        user = data.get("data", data)
+        return user if isinstance(user, dict) else None
 
     async def _arequest(
         self,
@@ -449,6 +469,59 @@ class DirectusClient:
             "video": _relation_id(media_row.get("video_file")) if media_row else None,
         }
         return scan
+
+    def get_scan_auth_context(self, scan_id: Any) -> dict | None:
+        self.clear_schema_cache("wellness_scans")
+        optional_scan_fields = sorted(
+            self.supports_fields(
+                "wellness_scans",
+                ["processing_attempts"],
+            )
+        )
+        return self.get_item(
+            "wellness_scans",
+            scan_id,
+            fields=[
+                "id",
+                "status",
+                "user",
+                "business_profile",
+                "member",
+                "department",
+            ]
+            + optional_scan_fields,
+        )
+
+    def list_business_profile_members(self, user_id: Any, business_profile_id: Any) -> list[dict]:
+        available = self.get_collection_fields("business_profile_members")
+        if not available or not {"id", "user", "business_profile"}.issubset(available):
+            return []
+
+        fields = [
+            field
+            for field in [
+                "id",
+                "user",
+                "business_profile",
+                "member",
+                "department",
+                "status",
+                "is_active",
+                "active",
+            ]
+            if field in available
+        ]
+        filters: dict[str, Any] = {
+            "filter[user][_eq]": user_id,
+            "filter[business_profile][_eq]": business_profile_id,
+        }
+
+        return self.list_items(
+            "business_profile_members",
+            filters=filters,
+            fields=fields,
+            limit=25,
+        )
 
     def get_scan_media(self, scan_id: Any) -> dict | None:
         media_rows = self.list_items(
