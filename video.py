@@ -17,8 +17,19 @@ LOW_LIGHT_THRESHOLD = 75.0
 BLUR_THRESHOLD = 65.0
 MIN_DURATION_SEC = 1.5
 MIN_RESOLUTION = (480, 360)
-MAX_SAMPLED_FRAMES = 180
-FRAME_STRIDE = 3
+MAX_SAMPLED_FRAMES = 8
+MAX_EYE_CLOSURE_WINDOWS = 2
+EYE_CLOSURE_SAMPLES_PER_WINDOW = 4
+MIN_EYE_CLOSURE_DURATION_SECONDS = 0.45
+MAX_EYE_CLOSURE_WINDOW_SECONDS = 1.2
+DEFAULT_EYE_CLOSURE_WINDOW_SPAN_SECONDS = 0.6
+MIN_EYE_EVIDENCE_FRAMES = 4
+SUSTAINED_EYE_CLOSURE_EAR = 0.16
+SUSTAINED_EYE_CLOSURE_STRONG_EAR = 0.14
+MAX_EYE_ASYMMETRY = 0.08
+
+LEFT_EYE = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
 mp_face = mp.solutions.face_mesh.FaceMesh(static_image_mode=False) if mp else None
 
@@ -41,6 +52,122 @@ def _landmark_visibility(frame) -> tuple[bool, float | None]:
     if res.multi_face_landmarks:
         return True, 0.9
     return False, 0.0
+
+
+def _dist(a, b) -> float:
+    return float(np.hypot(a.x - b.x, a.y - b.y))
+
+
+def _eye_aspect_ratio(landmarks, idxs) -> float:
+    p0, p1, p2, p3, p4, p5 = [landmarks[i] for i in idxs]
+    horizontal = _dist(p0, p3)
+    if horizontal == 0:
+        return 0.0
+    vertical = _dist(p1, p5) + _dist(p2, p4)
+    return vertical / (2.0 * horizontal)
+
+
+def _longest_true_streak(values: list[bool]) -> int:
+    longest = 0
+    current = 0
+    for value in values:
+        if value:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def _eye_closure_sample_windows(frame_count: int, fps: float, duration_seconds: float) -> list[list[dict[str, float | int]]]:
+    if frame_count < EYE_CLOSURE_SAMPLES_PER_WINDOW or fps <= 0 or duration_seconds < MIN_EYE_CLOSURE_DURATION_SECONDS:
+        return []
+
+    min_window_span_frames = max(int(np.ceil(MIN_EYE_CLOSURE_DURATION_SECONDS * fps)), EYE_CLOSURE_SAMPLES_PER_WINDOW - 1)
+    max_window_span_frames = min(
+        int(np.floor(MAX_EYE_CLOSURE_WINDOW_SECONDS * fps)),
+        frame_count - 1,
+    )
+    if max_window_span_frames < min_window_span_frames:
+        return []
+
+    target_span_frames = int(round(DEFAULT_EYE_CLOSURE_WINDOW_SPAN_SECONDS * fps))
+    target_span_frames = max(target_span_frames, min_window_span_frames)
+    target_span_frames = min(target_span_frames, max_window_span_frames)
+    if target_span_frames < min_window_span_frames:
+        return []
+
+    window_count = 1
+    if duration_seconds >= 1.0 and frame_count >= 8:
+        window_count = 2
+
+    windows: list[list[dict[str, float | int]]] = []
+    for window_index, center_ratio in enumerate([0.25, 0.75][:window_count]):
+        center_frame = int(round((frame_count - 1) * center_ratio))
+        start_frame = center_frame - (target_span_frames // 2)
+        max_start_frame = max(frame_count - 1 - target_span_frames, 0)
+        start_frame = max(0, min(start_frame, max_start_frame))
+        end_frame = start_frame + target_span_frames
+        sample_frame_indices = [
+            start_frame,
+            start_frame + int(round(target_span_frames / 3.0)),
+            start_frame + int(round((2.0 * target_span_frames) / 3.0)),
+            end_frame,
+        ]
+        sample_frame_indices = [max(0, min(frame_count - 1, frame_index)) for frame_index in sample_frame_indices]
+        if len(set(sample_frame_indices)) < EYE_CLOSURE_SAMPLES_PER_WINDOW:
+            continue
+        window_samples: list[dict[str, float | int]] = []
+        for frame_index in sample_frame_indices:
+            timestamp = frame_index / fps
+            window_samples.append(
+                {
+                    "window_id": window_index,
+                    "frame_index": frame_index,
+                    "timestamp": timestamp,
+                }
+            )
+        windows.append(window_samples)
+    return windows
+
+
+def _longest_temporal_eye_closure_streak(
+    observations: list[dict[str, float | bool | int | None]],
+) -> tuple[int, int, float]:
+    grouped: dict[int, list[dict[str, float | bool | int | None]]] = {}
+    for observation in observations:
+        window_id = int(observation.get("window_id") or 0)
+        grouped.setdefault(window_id, []).append(observation)
+
+    longest = 0
+    best_window_seconds = 0.0
+    best_window_ms = 0
+    for window_samples in grouped.values():
+        ordered = sorted(window_samples, key=lambda item: float(item.get("timestamp") or 0.0))
+        if len(ordered) < EYE_CLOSURE_SAMPLES_PER_WINDOW:
+            continue
+        if len({int(sample.get("frame_index") or -1) for sample in ordered}) < EYE_CLOSURE_SAMPLES_PER_WINDOW:
+            continue
+        all_closed = all(
+            bool(sample.get("usable"))
+            and bool(sample.get("bright_enough"))
+            and bool(sample.get("sharp_enough"))
+            and bool(sample.get("face_visible"))
+            and bool(sample.get("landmark_valid"))
+            and bool(sample.get("eye_closed"))
+            for sample in ordered
+        )
+        if not all_closed:
+            continue
+        window_seconds = max(0.0, float(ordered[-1].get("timestamp") or 0.0) - float(ordered[0].get("timestamp") or 0.0))
+        if window_seconds < MIN_EYE_CLOSURE_DURATION_SECONDS or window_seconds > MAX_EYE_CLOSURE_WINDOW_SECONDS:
+            continue
+        if len(ordered) > longest:
+            longest = len(ordered)
+            best_window_seconds = window_seconds
+            best_window_ms = int(round(window_seconds * 1000))
+
+    return longest, best_window_ms, best_window_seconds
 
 
 def analyze_video(video_path: str) -> dict:
@@ -87,47 +214,100 @@ def analyze_video(video_path: str) -> dict:
     brightness_values: list[float] = []
     blur_values: list[float] = []
     camera_motion: list[float] = []
+    eye_apertures: list[float] = []
+    eye_asymmetries: list[float] = []
+    eye_closure_samples: list[bool] = []
+    frame_observations: list[dict[str, float | bool | int | None]] = []
     prev_gray = None
     warnings: list[str] = []
+    eye_closure_windows = _eye_closure_sample_windows(frame_count, fps, duration_seconds)
 
     try:
-        while cap.isOpened() and sampled_frames < MAX_SAMPLED_FRAMES:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        for window in eye_closure_windows:
+            for sample in window:
+                if not cap.isOpened():
+                    break
+                frame_index = int(sample["frame_index"])
+                timestamp = float(sample["timestamp"])
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                ok, frame = cap.read()
+                if not ok:
+                    frame_observations.append(
+                        {
+                            "window_id": sample["window_id"],
+                            "frame_index": frame_index,
+                            "timestamp": frame_index / fps if fps else timestamp,
+                            "usable": False,
+                            "bright_enough": False,
+                            "sharp_enough": False,
+                            "face_visible": False,
+                            "landmark_valid": False,
+                            "eye_closed": False,
+                        }
+                    )
+                    continue
 
-            current_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            if current_index % FRAME_STRIDE != 0:
-                continue
+                sampled_frames += 1
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                brightness = float(np.mean(gray))
+                blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                brightness_values.append(brightness)
+                blur_values.append(blur_var)
 
-            sampled_frames += 1
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            brightness = float(np.mean(gray))
-            blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-            brightness_values.append(brightness)
-            blur_values.append(blur_var)
+                bright_enough = brightness >= LOW_LIGHT_THRESHOLD
+                sharp_enough = blur_var >= BLUR_THRESHOLD
+                if not bright_enough:
+                    low_light_frames += 1
+                if not sharp_enough:
+                    blurry_frames += 1
 
-            is_bright_enough = brightness >= LOW_LIGHT_THRESHOLD
-            is_sharp_enough = blur_var >= BLUR_THRESHOLD
-            if not is_bright_enough:
-                low_light_frames += 1
-            if not is_sharp_enough:
-                blurry_frames += 1
+                if prev_gray is not None:
+                    diff = cv2.absdiff(prev_gray, gray)
+                    camera_motion.append(float(np.mean(diff)))
+                prev_gray = gray
 
-            if prev_gray is not None:
-                diff = cv2.absdiff(prev_gray, gray)
-                camera_motion.append(float(np.mean(diff)))
-            prev_gray = gray
+                face_visible, landmark_confidence = _landmark_visibility(frame)
+                landmark_valid = False
+                eye_closed = False
+                if landmark_confidence is not None:
+                    landmark_confidences.append(float(landmark_confidence))
+                if face_visible:
+                    face_frames += 1
+                    if mp_face is not None:
+                        try:
+                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            res = mp_face.process(rgb)
+                            if res.multi_face_landmarks:
+                                landmarks = res.multi_face_landmarks[0].landmark
+                                left_eye_aperture = _eye_aspect_ratio(landmarks, LEFT_EYE)
+                                right_eye_aperture = _eye_aspect_ratio(landmarks, RIGHT_EYE)
+                                avg_ear = (left_eye_aperture + right_eye_aperture) / 2.0
+                                asymmetry = abs(left_eye_aperture - right_eye_aperture)
+                                landmark_valid = True
+                                if bright_enough and sharp_enough and asymmetry <= MAX_EYE_ASYMMETRY:
+                                    eye_apertures.append(avg_ear)
+                                    eye_asymmetries.append(asymmetry)
+                                    eye_closed = avg_ear <= SUSTAINED_EYE_CLOSURE_EAR
+                        except Exception:
+                            landmark_valid = False
 
-            face_visible, landmark_confidence = _landmark_visibility(frame)
-            if landmark_confidence is not None:
-                landmark_confidences.append(float(landmark_confidence))
-            if face_visible:
-                face_frames += 1
-
-            usable = is_bright_enough and is_sharp_enough and face_visible
-            if usable:
-                usable_frames += 1
+                usable = bright_enough and sharp_enough and face_visible and landmark_valid
+                if usable:
+                    usable_frames += 1
+                eye_closure_samples.append(bool(usable and eye_closed))
+                frame_observations.append(
+                    {
+                        "window_id": sample["window_id"],
+                        "frame_index": frame_index,
+                        "timestamp": frame_index / fps if fps else timestamp,
+                        "usable": usable,
+                        "bright_enough": bright_enough,
+                        "sharp_enough": sharp_enough,
+                        "face_visible": face_visible,
+                        "landmark_valid": landmark_valid,
+                        "eye_closed": eye_closed,
+                    }
+                )
     finally:
         cap.release()
 
@@ -151,6 +331,28 @@ def analyze_video(video_path: str) -> dict:
     landmark_detection_confidence = (
         float(np.mean(landmark_confidences)) if landmark_confidences else (0.0 if mp_face else None)
     )
+    avg_eye_aperture = float(np.mean(eye_apertures)) if eye_apertures else 0.0
+    eye_aperture_std = float(np.std(eye_apertures)) if eye_apertures else 0.0
+    longest_eye_closure_streak, closure_window_ms, closure_window_seconds = _longest_temporal_eye_closure_streak(frame_observations)
+    closed_eye_ratio = (sum(1 for value in eye_closure_samples if value) / len(eye_closure_samples)) if eye_closure_samples else 0.0
+    reliable_eye_landmarks = bool(
+        mp_face is not None
+        and len(eye_apertures) >= MIN_EYE_EVIDENCE_FRAMES
+        and face_visibility >= 0.65
+        and motion_stability_score >= 0.45
+        and sharpness_score >= 0.4
+        and brightness_score >= 0.4
+    )
+    sustained_eye_closure = bool(
+        reliable_eye_landmarks
+        and longest_eye_closure_streak >= EYE_CLOSURE_SAMPLES_PER_WINDOW
+        and len(eye_closure_samples) >= EYE_CLOSURE_SAMPLES_PER_WINDOW
+        and closed_eye_ratio >= 0.75
+        and avg_eye_aperture <= SUSTAINED_EYE_CLOSURE_STRONG_EAR
+        and eye_aperture_std <= 0.025
+        and closure_window_seconds >= MIN_EYE_CLOSURE_DURATION_SECONDS
+        and closure_window_seconds <= MAX_EYE_CLOSURE_WINDOW_SECONDS
+    )
 
     if avg_brightness < LOW_LIGHT_THRESHOLD:
         warnings.append("video_too_dark")
@@ -164,6 +366,8 @@ def analyze_video(video_path: str) -> dict:
         warnings.append("subject_not_visible")
     if mp_face is not None and face_frames == 0:
         warnings.append("landmark_detection_failed")
+    if sustained_eye_closure:
+        warnings.append("sustained_eye_closure")
 
     visual_quality_score = float(
         np.clip(
@@ -199,6 +403,15 @@ def analyze_video(video_path: str) -> dict:
         "usable_frame_ratio": safe_number(usable_frame_ratio),
         "face_or_subject_visibility": safe_number(face_visibility),
         "landmark_detection_confidence": safe_number(landmark_detection_confidence),
+        "reliable_eye_landmarks": reliable_eye_landmarks,
+        "sustained_eye_closure": sustained_eye_closure,
+        "eye_closure_sample_count": len(eye_closure_samples),
+        "closed_eye_ratio": safe_number(closed_eye_ratio),
+        "longest_eye_closure_streak": longest_eye_closure_streak,
+        "eye_closure_window_ms": closure_window_ms,
+        "avg_eye_aperture": safe_number(avg_eye_aperture),
+        "eye_aperture_std": safe_number(eye_aperture_std),
+        "avg_eye_asymmetry": safe_number(float(np.mean(eye_asymmetries)) if eye_asymmetries else None),
         "visual_confidence": safe_number(visual_confidence),
         "visual_quality_score": safe_number(visual_quality_score),
         "visual_warnings": clean_warning_codes(warnings),

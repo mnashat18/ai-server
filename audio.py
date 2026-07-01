@@ -107,6 +107,20 @@ def analyze_audio(audio_path: str) -> dict:
             1.0,
         )
     )
+    minimum_usable_energy = MIN_RMS_ENERGY * 0.75
+    quiet_but_usable = bool(
+        rms_energy < MIN_RMS_ENERGY
+        and rms_energy >= minimum_usable_energy
+        and duration_seconds >= MIN_AUDIO_DURATION_SEC
+        and speech_presence_score >= 0.58
+        and noise_estimate <= 0.68
+        and silence_ratio <= 0.45
+    )
+    no_usable_speech = bool(
+        speech_presence_score < 0.3
+        or silence_ratio > 0.8
+        or (rms_energy < minimum_usable_energy and silence_ratio > 0.6)
+    )
 
     pitch_stability_score = None
     try:
@@ -132,14 +146,22 @@ def analyze_audio(audio_path: str) -> dict:
     warnings: list[str] = []
     if duration_seconds < MIN_AUDIO_DURATION_SEC:
         warnings.append("audio_too_short")
-    if rms_energy < MIN_RMS_ENERGY:
+    if rms_energy < minimum_usable_energy and not quiet_but_usable:
         warnings.append("audio_too_quiet")
     if noise_estimate > 0.72:
         warnings.append("audio_too_noisy")
     if silence_ratio > 0.55:
         warnings.append("too_much_silence")
-    if speech_presence_score < 0.35:
+    if no_usable_speech:
         warnings.append("speech_not_detected")
+
+    speech_state = "usable_speech"
+    if no_usable_speech:
+        speech_state = "no_speech"
+    elif "audio_too_noisy" in warnings or ("audio_too_quiet" in warnings and not quiet_but_usable):
+        speech_state = "unusable_quality"
+    elif quiet_but_usable:
+        speech_state = "quiet_usable_speech"
 
     duration_factor = clamp01(duration_seconds / 4.0, 0.0) or 0.0
     level_factor = clamp01(rms_energy / (MIN_RMS_ENERGY * 2.5), 0.0) or 0.0
@@ -176,6 +198,9 @@ def analyze_audio(audio_path: str) -> dict:
         "speech_presence_score": safe_number(speech_presence_score, 4),
         "voice_clarity_score": safe_number(voice_clarity_score, 4),
         "pitch_stability_score": safe_number(pitch_stability_score, 4),
+        "speech_state": speech_state,
+        "usable_speech_detected": speech_state in {"usable_speech", "quiet_usable_speech"},
+        "quiet_but_usable": quiet_but_usable,
         "spectral_centroid": safe_number(_safe_mean(centroid), 2),
         "centroid": safe_number(_safe_mean(centroid), 2),
         "zero_crossing_rate": safe_number(_safe_mean(zcr), 6),

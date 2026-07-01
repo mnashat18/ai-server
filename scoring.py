@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from baseline import baseline_feature_reference
 from config import MODEL_VERSION
 from utils import clamp01, clean_warning_codes, safe_number, sanitize_text
 
-VALID_RISK_LEVELS = {"stable", "low_focus", "elevated_fatigue", "high_risk", "unknown"}
+VALID_RISK_LEVELS = {"stable", "low_focus", "elevated_fatigue", "high_risk"}
 VALID_ACTIONS = {
     "continue_normal_activity",
     "review_required",
@@ -26,6 +27,7 @@ WARNING_SCORE_PENALTIES = {
     "unstable_video": 0.16,
     "unstable_camera": 0.16,
     "face_not_visible": 0.22,
+    "sustained_eye_closure": 0.16,
     "subject_not_visible": 0.18,
     "audio_too_noisy": 0.18,
     "audio_too_quiet": 0.18,
@@ -70,25 +72,32 @@ def compute_task_score(task: Any) -> float | None:
     return round(sum(scores) / len(scores), 4)
 
 
-def _baseline_stat(baseline: dict | None, key: str) -> dict | None:
-    value = (baseline or {}).get(key)
-    return value if isinstance(value, dict) else None
-
-
 def _baseline_drift(current: float | None, stat: dict | None) -> dict | None:
-    if current is None or not stat or stat.get("avg") is None:
+    if current is None or not stat or stat.get("median") is None:
         return None
-    avg = float(stat["avg"])
-    std = float(stat.get("std") or 0.0)
-    threshold = max(0.1, std * 1.5)
-    drift = round(float(current) - avg, 4)
+    median_value = float(stat["median"])
+    mad = float(stat.get("mad") or 0.0)
+    threshold = max(0.1, mad * 2.5)
+    drift = round(float(current) - median_value, 4)
     return {
         "current": safe_number(current),
-        "baseline_avg": safe_number(avg),
-        "baseline_std": safe_number(std),
+        "baseline_median": safe_number(median_value),
+        "baseline_mad": safe_number(mad),
         "drift": safe_number(drift),
         "threshold": safe_number(threshold),
         "below_threshold": drift <= (-threshold),
+    }
+
+
+def _raw_baseline_observations(signals: dict | None) -> dict[str, float | None]:
+    signals = signals or {}
+    camera_details = ((signals.get("camera") or {}).get("details") or {}) if isinstance(signals.get("camera"), dict) else {}
+    voice_details = ((signals.get("voice") or {}).get("details") or {}) if isinstance(signals.get("voice"), dict) else {}
+    return {
+        "open_eye_aperture": safe_number(camera_details.get("avg_ear")),
+        "left_right_eye_asymmetry": safe_number(camera_details.get("left_right_eye_asymmetry")),
+        "normalized_voice_energy": safe_number(voice_details.get("rms_energy"), 6),
+        "speech_rate": safe_number(voice_details.get("speech_rate")),
     }
 
 
@@ -147,6 +156,7 @@ def _quality_warnings_for_modality(quality: dict | None, modality: str, current:
             "unstable_video",
             "unstable_camera",
             "face_not_visible",
+            "sustained_eye_closure",
             "subject_not_visible",
             "low_quality_media",
         },
@@ -297,17 +307,30 @@ def _confidence_from_profiles(
     }
 
 
+def _invalid_scan_outcome(readiness_score: int, confidence: float, quality: dict) -> tuple[int, float]:
+    adjusted_score = min(readiness_score, 51)
+    adjusted_confidence = min(confidence, 0.44)
+    if quality.get("failure_reason") == "missing_media":
+        adjusted_score = min(adjusted_score, 35)
+    elif quality.get("failure_reason") == "low_quality_media":
+        adjusted_score = min(adjusted_score, 45)
+    return adjusted_score, adjusted_confidence
+
+
 def _risk_level(readiness_score: int, confidence: float, baseline_flags: list[str], quality: dict) -> str:
     quality_failed = quality.get("status") == "failed"
     media_quality_too_weak = quality.get("failure_reason") in {"low_quality_media", "missing_media"}
     missing_major_media = bool({"video", "audio"} & set(quality.get("missing_modalities") or []))
+    sustained_eye_closure = "sustained_eye_closure" in set(quality.get("warnings") or [])
     if quality_failed or media_quality_too_weak or missing_major_media or confidence < 0.45:
-        return "unknown"
+        return "low_focus"
+    if sustained_eye_closure:
+        return "elevated_fatigue" if confidence >= 0.5 else "low_focus"
     if quality.get("weak") and readiness_score < 52 and not baseline_flags:
-        return "unknown"
-    if readiness_score < 35 and (confidence >= 0.62 or len(baseline_flags) >= 2):
+        return "low_focus"
+    if readiness_score < 35 and confidence >= 0.62:
         return "high_risk"
-    if readiness_score < 52 and (confidence >= 0.5 or baseline_flags):
+    if readiness_score < 52 and confidence >= 0.5:
         return "elevated_fatigue"
     if readiness_score < 68:
         return "low_focus"
@@ -316,8 +339,6 @@ def _risk_level(readiness_score: int, confidence: float, baseline_flags: list[st
 
 def _suggested_action(risk_level: str, confidence: float, quality: dict) -> str:
     if quality.get("status") == "failed":
-        return "rescan_recommended"
-    if risk_level == "unknown":
         return "rescan_recommended"
     if risk_level == "high_risk":
         return "manager_review"
@@ -330,16 +351,25 @@ def _suggested_action(risk_level: str, confidence: float, quality: dict) -> str:
     return "continue_normal_activity"
 
 
-def _explanation(profiles: dict[str, dict], quality: dict, risk_level: str, confidence: float) -> str:
+def _explanation(
+    profiles: dict[str, dict],
+    quality: dict,
+    risk_level: str,
+    confidence: float,
+    baseline_notes: list[str] | None = None,
+) -> str:
     positives: list[str] = []
     negatives: list[str] = []
     warning_reasons: list[str] = []
+    baseline_notes = baseline_notes or []
     if profiles["video"]["score"] is not None and (profiles["video"]["quality"] or 0.0) >= 0.55:
         positives.append("Video quality was acceptable")
     if profiles["audio"]["score"] is not None and (profiles["audio"]["quality"] or 0.0) >= 0.55:
         positives.append("voice signal was clear")
     if profiles["image"]["score"] is not None and (profiles["image"]["quality"] or 0.0) >= 0.55:
         positives.append("thumbnail quality was usable")
+    if baseline_notes:
+        positives.extend(baseline_notes)
     if "audio_too_noisy" in quality.get("warnings", []):
         negatives.append("Audio was noisy")
         warning_reasons.append("background noise reduced voice confidence")
@@ -347,8 +377,8 @@ def _explanation(profiles: dict[str, dict], quality: dict, risk_level: str, conf
         negatives.append("audio volume was low")
         warning_reasons.append("low voice volume reduced confidence")
     if "speech_not_detected" in quality.get("warnings", []):
-        negatives.append("speech was not clearly detected")
-        warning_reasons.append("weak speech detection reduced confidence")
+        negatives.append("no usable speech was detected")
+        warning_reasons.append("missing or unusable speech reduced confidence")
     if "video_blurry" in quality.get("warnings", []) or "image_blurry" in quality.get("warnings", []):
         negatives.append("visual media was partially blurred")
         warning_reasons.append("blur reduced visual confidence")
@@ -361,6 +391,9 @@ def _explanation(profiles: dict[str, dict], quality: dict, risk_level: str, conf
     if "face_not_visible" in quality.get("warnings", []) or "unstable_video" in quality.get("warnings", []):
         negatives.append("face visibility was weak")
         warning_reasons.append("weak face visibility reduced confidence")
+    if "sustained_eye_closure" in quality.get("warnings", []):
+        negatives.append("reliable sustained eye closure was observed")
+        warning_reasons.append("repeated eye-closure evidence lowered the readiness result")
     if "low_quality_media" in quality.get("warnings", []) or quality.get("failure_reason") == "low_quality_media":
         warning_reasons.append("overall media quality was low")
     if "missing_media" in quality.get("warnings", []) or quality.get("failure_reason") == "missing_media":
@@ -380,7 +413,15 @@ def _explanation(profiles: dict[str, dict], quality: dict, risk_level: str, conf
     if warning_reasons:
         unique_reasons = clean_warning_codes(warning_reasons)
         lead = f"{lead}. Score and confidence were reduced because {', '.join(unique_reasons[:4])}"
-    if risk_level == "stable":
+    scan_unreliable = (
+        quality.get("status") == "failed"
+        or quality.get("failure_reason") in {"low_quality_media", "missing_media"}
+        or bool({"video", "audio"} & set(quality.get("missing_modalities") or []))
+        or confidence < 0.45
+    )
+    if scan_unreliable:
+        tail = "The scan could not be assessed reliably. Please repeat it with clear face visibility, better lighting, steady video, and usable audio."
+    elif risk_level == "stable":
         tail = "Both signals suggest stable readiness with moderate confidence." if confidence >= 0.5 else "Confidence was reduced because the available signals were limited."
     elif risk_level == "low_focus":
         tail = "The fused result suggests a mild reduction in readiness."
@@ -405,6 +446,7 @@ def compute_result(
 ) -> dict:
     quality = quality or {}
     task_score = compute_task_score(task)
+    raw_features = _raw_baseline_observations(signals)
     profiles = _build_signal_profiles(signals, task_score, quality=quality)
     if not quality.get("missing_modalities"):
         inferred_missing = _missing_modalities_from_profiles(profiles)
@@ -440,21 +482,61 @@ def compute_result(
     else:
         face_score = image_score if image_score is not None else video_score
 
-    face_drift = _baseline_drift(face_score, _baseline_stat(baseline, "face_avg")) if baseline_used else None
-    voice_drift = _baseline_drift(profiles["audio"]["score"], _baseline_stat(baseline, "voice_avg")) if baseline_used else None
-    reaction_drift = _baseline_drift(task_score, _baseline_stat(baseline, "reaction_avg")) if baseline_used else None
+    eye_aperture_drift = _baseline_drift(
+        raw_features.get("open_eye_aperture"),
+        baseline_feature_reference(baseline, "face_avg", "open_eye_aperture"),
+    ) if baseline_used else None
+    eye_asymmetry_drift = _baseline_drift(
+        raw_features.get("left_right_eye_asymmetry"),
+        baseline_feature_reference(baseline, "face_avg", "left_right_eye_asymmetry"),
+    ) if baseline_used else None
+    voice_energy_drift = _baseline_drift(
+        raw_features.get("normalized_voice_energy"),
+        baseline_feature_reference(baseline, "voice_avg", "normalized_voice_energy"),
+    ) if baseline_used else None
+    speech_rate_drift = _baseline_drift(
+        raw_features.get("speech_rate"),
+        baseline_feature_reference(baseline, "voice_avg", "speech_rate"),
+    ) if baseline_used else None
     baseline_flags = [
         name
         for name, drift in {
-            "face": face_drift,
-            "voice": voice_drift,
-            "reaction": reaction_drift,
+            "open_eye_aperture": eye_aperture_drift,
+            "left_right_eye_asymmetry": eye_asymmetry_drift,
+            "normalized_voice_energy": voice_energy_drift,
+            "speech_rate": speech_rate_drift,
         }.items()
         if drift and drift.get("below_threshold")
     ]
 
     if baseline_flags:
         fused_score = max(0.0, fused_score - (0.03 * len(baseline_flags)))
+    if "sustained_eye_closure" in set(quality.get("warnings") or []):
+        fused_score = max(0.0, fused_score - 0.14)
+
+    baseline_notes: list[str] = []
+    if baseline_used:
+        eye_aperture_reference = baseline_feature_reference(baseline, "face_avg", "open_eye_aperture")
+        voice_energy_reference = baseline_feature_reference(baseline, "voice_avg", "normalized_voice_energy")
+        speech_rate_reference = baseline_feature_reference(baseline, "voice_avg", "speech_rate")
+        if (
+            raw_features.get("open_eye_aperture") is not None
+            and eye_aperture_reference is not None
+            and not (eye_aperture_drift or {}).get("below_threshold")
+        ):
+            baseline_notes.append("Eye appearance was within this employee's established normal range")
+        if (
+            raw_features.get("normalized_voice_energy") is not None
+            and voice_energy_reference is not None
+            and not (voice_energy_drift or {}).get("below_threshold")
+        ):
+            baseline_notes.append("Quiet but usable speech was consistent with the employee's established baseline")
+        if (
+            raw_features.get("speech_rate") is not None
+            and speech_rate_reference is not None
+            and not (speech_rate_drift or {}).get("below_threshold")
+        ):
+            baseline_notes.append("Speech timing was consistent with the employee's established baseline")
 
     confidence, calibration = _confidence_from_profiles(
         fused_score=fused_score,
@@ -465,13 +547,22 @@ def compute_result(
         ml_result=ml_result,
     )
     readiness_score = int(round((clamp01(fused_score, 0.0) or 0.0) * 100))
+    scan_unreliable = (
+        quality.get("status") == "failed"
+        or quality.get("failure_reason") in {"low_quality_media", "missing_media"}
+        or bool({"video", "audio"} & set(quality.get("missing_modalities") or []))
+        or confidence < 0.45
+        or (quality.get("weak") and readiness_score < 52 and not baseline_flags)
+    )
+    if scan_unreliable:
+        readiness_score, confidence = _invalid_scan_outcome(readiness_score, confidence, quality)
     risk_level = _risk_level(readiness_score, confidence, baseline_flags, quality)
     if risk_level not in VALID_RISK_LEVELS:
-        risk_level = "unknown"
+        risk_level = "low_focus"
     suggested_action = _suggested_action(risk_level, confidence, quality)
     if suggested_action not in VALID_ACTIONS:
         suggested_action = "rescan_recommended"
-    explanation = _explanation(profiles, quality, risk_level, confidence)
+    explanation = _explanation(profiles, quality, risk_level, confidence, baseline_notes=baseline_notes)
 
     previous = clamp01(previous_confidence, confidence)
     confidence_drift = safe_number(confidence - (previous if previous is not None else confidence))
@@ -481,12 +572,14 @@ def compute_result(
         "image": safe_number(profiles["image"]["score"]),
         "task": safe_number(task_score),
     }
+    observed_fatigue_score = int(round((1.0 - (clamp01(fused_score, 0.0) or 0.0)) * 100))
 
     return {
         "status": "completed",
         "retake_required": False,
         "failure_reason": None,
         "readiness_score": readiness_score,
+        "observed_fatigue_score": observed_fatigue_score,
         "risk_level": risk_level,
         "confidence": safe_number(confidence),
         "camera_confidence": safe_number(face_score),
@@ -498,18 +591,28 @@ def compute_result(
             "image_score": safe_number(image_score),
             "video_score": safe_number(video_score),
             "face_score": safe_number(face_score),
-            "baseline_drift": face_drift,
+            "open_eye_aperture": raw_features.get("open_eye_aperture"),
+            "left_right_eye_asymmetry": raw_features.get("left_right_eye_asymmetry"),
+            "baseline_drifts": {
+                "open_eye_aperture": eye_aperture_drift,
+                "left_right_eye_asymmetry": eye_asymmetry_drift,
+            },
         },
         "voice_metrics": {
             "voice_score": safe_number(profiles["audio"]["score"]),
-            "baseline_drift": voice_drift,
+            "normalized_voice_energy": raw_features.get("normalized_voice_energy"),
+            "speech_rate": raw_features.get("speech_rate"),
+            "baseline_drifts": {
+                "normalized_voice_energy": voice_energy_drift,
+                "speech_rate": speech_rate_drift,
+            },
         },
         "reaction_metrics": {
             "reaction_score": safe_number(task_score),
             "reaction_time": _task_value(task, "reaction_time"),
             "errors": _task_value(task, "errors"),
             "attempts": _task_value(task, "attempts"),
-            "baseline_drift": reaction_drift,
+            "baseline_drifts": {},
         },
         "explanation": explanation,
         "suggested_action": suggested_action,
@@ -521,6 +624,7 @@ def compute_result(
             "baseline_flags": baseline_flags,
             "quality_penalty": safe_number(quality_penalty),
             "fused_score": safe_number(fused_score),
+            "observed_fatigue_score": observed_fatigue_score,
             "calibration": calibration,
         },
     }
