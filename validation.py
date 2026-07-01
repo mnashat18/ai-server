@@ -129,6 +129,7 @@ QUALITY_WARNING_PENALTIES = {
     "video_blurry": 0.15,
     "unstable_video": 0.12,
     "face_not_visible": 0.18,
+    "sustained_eye_closure": 0.12,
     "audio_too_short": 0.08,
     "speech_not_detected": 0.18,
     "audio_too_noisy": 0.15,
@@ -265,7 +266,8 @@ def validate_scan_inputs(
         _merge_validation_metadata(result, video_validation)
 
     if audio_path:
-        audio_validation = validate_audio_result(policy, audio_result)
+        speech_required = policy.require_phrase_match or bool(expected_phrase)
+        audio_validation = validate_audio_result(policy, audio_result, speech_required=speech_required)
         warnings.extend(audio_validation["warnings"])
         _merge_quality_scores(result["quality_scores"], audio_validation["quality_scores"])
         _merge_validation_metadata(result, audio_validation)
@@ -333,6 +335,8 @@ def validate_video_result(policy: ValidationPolicy, video_result: dict[str, Any]
     motion_stability = float(details.get("motion_stability_score") or 0.0)
     if usable_ratio < 0.3 or motion_stability < 0.35 or "unstable_camera" in warnings:
         warnings.append("unstable_video")
+    if details.get("reliable_eye_landmarks") and details.get("sustained_eye_closure"):
+        warnings.append("sustained_eye_closure")
 
     quality = float(details.get("visual_quality_score") or 0.0)
     if quality < policy.min_video_quality:
@@ -341,9 +345,16 @@ def validate_video_result(policy: ValidationPolicy, video_result: dict[str, Any]
     return _finalize_modality_result(result, modality="video", warnings=warnings)
 
 
-def validate_audio_result(policy: ValidationPolicy, audio_result: dict[str, Any] | None) -> dict[str, Any]:
+def validate_audio_result(
+    policy: ValidationPolicy,
+    audio_result: dict[str, Any] | None,
+    *,
+    speech_required: bool = False,
+) -> dict[str, Any]:
     details = ((audio_result or {}).get("details") or {}) if audio_result else {}
     warnings = clean_warning_codes(details.get("audio_warnings") or [])
+    if not speech_required:
+        warnings = [warning for warning in warnings if warning != "speech_not_detected"]
     quality_scores = {"audio": safe_number(details.get("audio_quality_score"))}
     status = details.get("status")
 
@@ -357,17 +368,18 @@ def validate_audio_result(policy: ValidationPolicy, audio_result: dict[str, Any]
             missing=True,
         )
     duration = float(details.get("duration_seconds") or details.get("duration_sec") or 0.0)
+    quiet_but_usable = bool(details.get("quiet_but_usable"))
     if duration < policy.min_audio_seconds:
         warnings.append("audio_too_short")
-    if "speech_not_detected" in warnings or float(details.get("speech_presence_score") or 0.0) < 0.35:
+    if speech_required and ("speech_not_detected" in warnings or float(details.get("speech_presence_score") or 0.0) < 0.35):
         warnings.append("speech_not_detected")
     if "audio_too_noisy" in warnings or float(details.get("noise_estimate") or 0.0) > 0.72:
         warnings.append("audio_too_noisy")
-    if "audio_too_quiet" in warnings or float(details.get("rms_energy") or details.get("energy") or 0.0) < 0.012:
+    if not quiet_but_usable and ("audio_too_quiet" in warnings or float(details.get("rms_energy") or details.get("energy") or 0.0) < 0.012):
         warnings.append("audio_too_quiet")
 
     quality = float(details.get("audio_quality_score") or 0.0)
-    if quality < policy.min_audio_quality:
+    if quality < policy.min_audio_quality and not quiet_but_usable:
         warnings.append("low_quality_media")
 
     return _finalize_modality_result(result, modality="audio", warnings=warnings)

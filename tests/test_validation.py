@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from validation import ValidationPolicy, validate_scan_inputs
+import scoring
 
 
 if "torch" not in sys.modules:
@@ -21,11 +22,6 @@ if "audio" not in sys.modules:
     fake_audio.analyze_audio = lambda path: {"score": 0.8, "details": {"status": "ok", "audio_quality_score": 0.8, "audio_warnings": []}}
     fake_audio.transcribe_audio = lambda path: "hello world"
     sys.modules["audio"] = fake_audio
-
-if "video" not in sys.modules:
-    fake_video = types.ModuleType("video")
-    fake_video.analyze_video = lambda path: {"score": 0.8, "details": {"status": "ok", "visual_quality_score": 0.8, "visual_warnings": []}}
-    sys.modules["video"] = fake_video
 
 if "vision" not in sys.modules:
     fake_vision = types.ModuleType("vision")
@@ -63,6 +59,7 @@ if "ml.features" not in sys.modules:
     sys.modules["ml.features"] = fake_features
 
 import main
+import video
 
 
 def _video_result(**overrides):
@@ -257,6 +254,77 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(result["critical_errors"], [])
         self.assertIn("video", result["weak_modalities"])
 
+    def test_quiet_but_usable_audio_is_not_marked_low_quality(self):
+        result = validate_scan_inputs(
+            policy=self.policy,
+            media=self.media,
+            video_result=_video_result(),
+            audio_result=_audio_result(rms_energy=0.0105, energy=0.0105, speech_presence_score=0.65, audio_quality_score=0.58, audio_warnings=[], quiet_but_usable=True),
+            image_result=_image_result(),
+            expected_phrase="hello world",
+            transcript="hello world",
+        )
+        self.assertTrue(result["passed"])
+        self.assertNotIn("audio_too_quiet", result["warnings"])
+        self.assertNotIn("low_quality_media", result["warnings"])
+
+    def test_no_usable_speech_in_required_scan_cannot_return_stable(self):
+        scan_context = {
+            "status": "media_ready",
+            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
+            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
+            "task_metrics": {},
+            "expected_phrase": "please say continuity ready",
+        }
+        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value=scan_context["scan_media"],
+        ), patch.object(
+            main.ml_runtime,
+            "is_loaded",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "local_model_required",
+            return_value=False,
+        ), patch.object(
+            main,
+            "_resolve_media_input",
+            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+        ), patch.object(
+            main,
+            "_safe_analyze",
+            side_effect=[
+                _video_result(),
+                _image_result(),
+                _audio_result(speech_presence_score=0.1, audio_quality_score=0.2, audio_warnings=["speech_not_detected"]),
+            ],
+        ), patch.object(
+            main,
+            "_expected_phrase",
+            return_value="please say continuity ready",
+        ), patch.object(
+            main,
+            "_transcribe_audio_file",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_baseline_rows_for_member",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_write_success",
+            return_value={"scan_result": "created:1"},
+        ) as write_mock:
+            result = main._process_scan_sync("scan-123")
+
+        self.assertEqual(result["status"], "completed")
+        written_result = write_mock.call_args.kwargs["result"]
+        self.assertEqual(written_result["risk_level"], "low_focus")
+        self.assertEqual(written_result["suggested_action"], "rescan_recommended")
+        self.assertIn("speech", written_result["explanation"].lower())
+
     def test_validation_passed(self):
         result = validate_scan_inputs(
             policy=self.policy,
@@ -320,6 +388,21 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertTrue(result["passed"])
 
+    def test_speech_absence_is_not_penalized_when_not_required(self):
+        result = validate_scan_inputs(
+            policy=ValidationPolicy(require_phrase_match=False),
+            media=self.media,
+            video_result=_video_result(),
+            audio_result=_audio_result(speech_presence_score=0.05, audio_quality_score=0.82, audio_warnings=["speech_not_detected"]),
+            image_result=_image_result(),
+            expected_phrase=None,
+            transcript=None,
+        )
+
+        self.assertTrue(result["passed"])
+        self.assertNotIn("speech_not_detected", result["warnings"])
+        self.assertNotIn("audio", result["weak_modalities"])
+
 
 class MainPayloadTests(unittest.TestCase):
     def _run_scan_with_analysis(self, *, video_result, image_result, audio_result):
@@ -355,8 +438,8 @@ class MainPayloadTests(unittest.TestCase):
             return_value=None,
         ), patch.object(
             main,
-            "_baseline_for_member",
-            return_value=None,
+            "_baseline_rows_for_member",
+            return_value=[],
         ), patch.object(
             main,
             "_write_success",
@@ -377,6 +460,7 @@ class MainPayloadTests(unittest.TestCase):
         written_result = write_mock.call_args.kwargs["result"]
         self.assertIn("video_blurry", written_result["validation_warnings"])
         self.assertIn("reduced", written_result["explanation"].lower())
+        self.assertNotEqual(written_result["risk_level"], "stable")
 
     def test_dark_video_still_creates_result(self):
         result, write_mock = self._run_scan_with_analysis(
@@ -390,6 +474,7 @@ class MainPayloadTests(unittest.TestCase):
         written_result = write_mock.call_args.kwargs["result"]
         self.assertIn("video_too_dark", written_result["validation_warnings"])
         self.assertIn("lighting", written_result["explanation"].lower())
+        self.assertNotEqual(written_result["risk_level"], "stable")
 
     def test_noisy_audio_still_creates_result(self):
         result, write_mock = self._run_scan_with_analysis(
@@ -403,6 +488,7 @@ class MainPayloadTests(unittest.TestCase):
         written_result = write_mock.call_args.kwargs["result"]
         self.assertIn("audio_too_noisy", written_result["validation_warnings"])
         self.assertIn("noise", written_result["explanation"].lower())
+        self.assertNotEqual(written_result["risk_level"], "high_risk")
 
     def test_weak_face_visibility_still_creates_result(self):
         result, write_mock = self._run_scan_with_analysis(
@@ -417,7 +503,44 @@ class MainPayloadTests(unittest.TestCase):
         self.assertTrue({"face_not_visible", "unstable_video"} & set(written_result["validation_warnings"]))
         self.assertIn("face visibility", written_result["explanation"].lower())
 
-    def test_completely_missing_media_creates_unknown_rescan_result(self):
+    def test_single_poor_frame_does_not_reduce_valid_scan(self):
+        result, write_mock = self._run_scan_with_analysis(
+            video_result=_video_result(
+                visual_quality_score=0.82,
+                visual_warnings=[],
+                sampled_frames=8,
+                blurry_frames=1,
+                low_light_frames=0,
+                reliable_eye_landmarks=True,
+                sustained_eye_closure=False,
+            ),
+            image_result=_image_result(),
+            audio_result=_audio_result(),
+        )
+
+        self.assertEqual(result["status"], "completed")
+        written_result = write_mock.call_args.kwargs["result"]
+        self.assertIn(written_result["risk_level"], {"stable", "low_focus", "elevated_fatigue", "high_risk"})
+        self.assertNotIn("sustained_eye_closure", written_result["validation_warnings"])
+
+    def test_sustained_eye_closure_with_reliable_evidence_is_not_stable(self):
+        result, write_mock = self._run_scan_with_analysis(
+            video_result=_video_result(
+                visual_quality_score=0.8,
+                visual_warnings=["sustained_eye_closure"],
+                reliable_eye_landmarks=True,
+                sustained_eye_closure=True,
+            ),
+            image_result=_image_result(),
+            audio_result=_audio_result(),
+        )
+
+        self.assertEqual(result["status"], "completed")
+        written_result = write_mock.call_args.kwargs["result"]
+        self.assertNotEqual(written_result["risk_level"], "stable")
+        self.assertIn("eye closure", written_result["explanation"].lower())
+
+    def test_completely_missing_media_creates_low_focus_rescan_result(self):
         scan_context = {
             "status": "media_ready",
             "scan_media": {"video_file": None, "audio_file": None, "thumbnail": None},
@@ -438,8 +561,8 @@ class MainPayloadTests(unittest.TestCase):
             return_value=False,
         ), patch.object(
             main,
-            "_baseline_for_member",
-            return_value=None,
+            "_baseline_rows_for_member",
+            return_value=[],
         ), patch.object(
             main,
             "_write_success",
@@ -450,9 +573,10 @@ class MainPayloadTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         write_mock.assert_called_once()
         written_result = write_mock.call_args.kwargs["result"]
-        self.assertEqual(written_result["risk_level"], "unknown")
+        self.assertEqual(written_result["risk_level"], "low_focus")
         self.assertEqual(written_result["suggested_action"], "rescan_recommended")
         self.assertLess(written_result["confidence"], 0.45)
+        self.assertLess(written_result["readiness_score"], 52)
 
     def test_degraded_scan_writes_scan_result_to_directus_and_completes_scan(self):
         scan_context = {
@@ -491,8 +615,8 @@ class MainPayloadTests(unittest.TestCase):
             return_value=None,
         ), patch.object(
             main,
-            "_baseline_for_member",
-            return_value=None,
+            "_baseline_rows_for_member",
+            return_value=[],
         ), patch.object(
             main.directus,
             "supports_fields",
@@ -542,7 +666,7 @@ class MainPayloadTests(unittest.TestCase):
         self.assertEqual(completed_payload["status"], "completed")
         self.assertEqual(completed_payload["failure_reason"], None)
 
-    def test_missing_media_writes_unknown_scan_result_to_directus_when_possible(self):
+    def test_missing_media_writes_low_focus_scan_result_to_directus_when_possible(self):
         scan_context = {
             "status": "media_ready",
             "scan_media": {"video_file": None, "audio_file": None, "thumbnail": None},
@@ -563,8 +687,8 @@ class MainPayloadTests(unittest.TestCase):
             return_value=False,
         ), patch.object(
             main,
-            "_baseline_for_member",
-            return_value=None,
+            "_baseline_rows_for_member",
+            return_value=[],
         ), patch.object(
             main.directus,
             "supports_fields",
@@ -607,7 +731,7 @@ class MainPayloadTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         upsert_mock.assert_called_once()
         scan_result_payload = upsert_mock.call_args[0][1]
-        self.assertEqual(scan_result_payload["risk_level"], "unknown")
+        self.assertEqual(scan_result_payload["risk_level"], "low_focus")
         self.assertEqual(scan_result_payload["suggested_action"], "rescan_recommended")
         self.assertLess(scan_result_payload["confidence"], 0.45)
         self.assertIn("missing_media", scan_result_payload["validation_warnings"])
@@ -684,8 +808,8 @@ class MainPayloadTests(unittest.TestCase):
             return_value=None,
         ), patch.object(
             main,
-            "_baseline_for_member",
-            return_value=None,
+            "_baseline_rows_for_member",
+            return_value=[],
         ), patch.object(
             main,
             "_write_success",
@@ -738,6 +862,7 @@ class MainPayloadTests(unittest.TestCase):
         supported_fields = {
             "scan_id",
             "readiness_score",
+            "observed_fatigue_score",
             "risk_level",
             "confidence",
             "explanation",
@@ -761,6 +886,7 @@ class MainPayloadTests(unittest.TestCase):
                 "scan-1",
                 {
                     "readiness_score": 75,
+                    "observed_fatigue_score": 25,
                     "risk_level": "stable",
                     "confidence": 0.8,
                     "camera_confidence": 0.7,
@@ -798,6 +924,7 @@ class MainPayloadTests(unittest.TestCase):
                 "scan-1",
                 {
                     "readiness_score": 75,
+                    "observed_fatigue_score": 25,
                     "risk_level": "stable",
                     "confidence": 0.8,
                     "explanation": "ok",
@@ -808,6 +935,118 @@ class MainPayloadTests(unittest.TestCase):
             )
 
         self.assertEqual(payload["ai_model_version"], "cie_v1_2")
+
+    def test_scan_results_payload_includes_new_fields_only_when_schema_supports_them(self):
+        supported_fields = {
+            "scan_id",
+            "readiness_score",
+            "observed_fatigue_score",
+            "risk_level",
+            "confidence",
+            "explanation",
+            "suggested_action",
+            "ai_model_version",
+            "result_status",
+            "capture_quality_score",
+            "measurement_reliability_score",
+            "personal_deviation_score",
+            "task_completion_status",
+            "baseline_status_at_inference",
+            "baseline_confidence",
+            "baseline_eligible",
+            "hard_gates_triggered",
+            "explainable_reasons",
+        }
+        with patch.object(main.directus, "supports_fields", return_value=supported_fields), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=lambda collection, payload: {key: value for key, value in payload.items() if key in supported_fields},
+        ), patch.object(main.directus, "first_supported_field", return_value=None), patch.object(
+            main.directus,
+            "get_field_choices",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=False,
+        ):
+            payload = main._build_scan_result_payload(
+                "scan-1",
+                {
+                    "readiness_score": 75,
+                    "observed_fatigue_score": 25,
+                    "risk_level": "stable",
+                    "confidence": 0.8,
+                    "explanation": "ok",
+                    "suggested_action": "continue_normal_activity",
+                    "result_status": "scored",
+                    "capture_quality_score": 0.83,
+                    "measurement_reliability_score": 0.77,
+                    "personal_deviation_score": 0.04,
+                    "task_completion_status": "completed",
+                    "baseline_status_at_inference": "provisional",
+                    "baseline_confidence": 0.6,
+                    "baseline_eligible": True,
+                    "hard_gates_triggered": [],
+                    "explainable_reasons": [],
+                },
+                {"quality": {}},
+            )
+
+        self.assertIn("result_status", payload)
+        self.assertIn("baseline_eligible", payload)
+        self.assertIn("hard_gates_triggered", payload)
+        self.assertIn("explainable_reasons", payload)
+
+    def test_scan_results_payload_omits_new_fields_when_schema_does_not_support_them(self):
+        supported_fields = {
+            "scan_id",
+            "readiness_score",
+            "risk_level",
+            "confidence",
+            "explanation",
+            "suggested_action",
+            "ai_model_version",
+        }
+        with patch.object(main.directus, "supports_fields", return_value=supported_fields), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=lambda collection, payload: {key: value for key, value in payload.items() if key in supported_fields},
+        ), patch.object(main.directus, "first_supported_field", return_value=None), patch.object(
+            main.directus,
+            "get_field_choices",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=False,
+        ):
+            payload = main._build_scan_result_payload(
+                "scan-1",
+                {
+                    "readiness_score": 75,
+                    "observed_fatigue_score": 25,
+                    "risk_level": "stable",
+                    "confidence": 0.8,
+                    "explanation": "ok",
+                    "suggested_action": "continue_normal_activity",
+                    "result_status": "scored",
+                    "capture_quality_score": 0.83,
+                    "measurement_reliability_score": 0.77,
+                    "personal_deviation_score": 0.04,
+                    "task_completion_status": "completed",
+                    "baseline_status_at_inference": "provisional",
+                    "baseline_confidence": 0.6,
+                    "baseline_eligible": True,
+                    "hard_gates_triggered": [],
+                    "explainable_reasons": [],
+                },
+                {"quality": {}},
+            )
+
+        self.assertNotIn("result_status", payload)
+        self.assertNotIn("baseline_eligible", payload)
+        self.assertNotIn("hard_gates_triggered", payload)
 
     def test_optional_overlong_string_field_is_skipped_with_warning(self):
         with patch.object(main.directus, "supports_fields", return_value=set()), patch.object(
@@ -981,10 +1220,51 @@ class MainPayloadTests(unittest.TestCase):
             )
 
         self.assertIn("internal_analysis", payload)
+        self.assertIsInstance(payload["internal_analysis"], str)
+        self.assertLessEqual(len(payload["internal_analysis"]), 255)
         self.assertNotIn("audio_quality_score", payload)
         self.assertNotIn("video_quality_score", payload)
         self.assertNotIn("image_quality_score", payload)
         self.assertNotIn("validation_warnings", payload)
+
+    def test_internal_analysis_never_receives_structured_dictionary(self):
+        supported_optional = {"internal_analysis"}
+        with patch.object(main.directus, "supports_fields", return_value=supported_optional), patch.object(
+            main.directus,
+            "filter_payload_fields",
+            side_effect=lambda collection, payload: payload,
+        ), patch.object(main.directus, "first_supported_field", return_value="internal_analysis"), patch.object(
+            main.directus,
+            "get_field_choices",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "is_field_required",
+            return_value=False,
+        ):
+            payload = main._build_scan_result_payload(
+                "scan-1",
+                {
+                    "readiness_score": 45,
+                    "risk_level": "low_focus",
+                    "confidence": 0.3,
+                    "explanation": "retake needed",
+                    "suggested_action": "rescan_recommended",
+                    "ai_model_version": "cie_v1_2",
+                    "validation_warnings": ["missing_media"],
+                },
+                {"quality": {"failure_reason": "missing_media", "warnings": ["missing_media"]}, "signals": {"video": {"details": {"status": "missing"}}}},
+            )
+
+        self.assertIn("internal_analysis", payload)
+        self.assertIsInstance(payload["internal_analysis"], str)
+        self.assertNotIn("{", payload["internal_analysis"])
+        self.assertLessEqual(len(payload["internal_analysis"]), 255)
+
+    def test_no_unsupported_directus_risk_values_are_introduced(self):
+        supported = {"stable", "low_focus", "elevated_fatigue", "high_risk"}
+        self.assertEqual(set(main.SCAN_RESULT_CHOICE_ALIASES["risk_level"].keys()), supported)
+        self.assertEqual(scoring.VALID_RISK_LEVELS, supported)
 
     def test_idempotency_already_processing(self):
         client = TestClient(main.app)
@@ -1357,8 +1637,8 @@ class MainPayloadTests(unittest.TestCase):
             return_value=None,
         ), patch.object(
             main,
-            "_baseline_for_member",
-            return_value={"id": "baseline-1"},
+            "_baseline_rows_for_member",
+            return_value=[{"id": "baseline-1"}],
         ), patch.object(
             main.directus,
             "upsert_employee_baseline",
@@ -1371,6 +1651,580 @@ class MainPayloadTests(unittest.TestCase):
             result = main._process_scan_sync("scan-123")
 
         self.assertEqual(result["status"], "completed")
+
+    def test_manual_baseline_route_cannot_fetch_arbitrary_remote_url(self):
+        client = TestClient(main.app)
+        scan_context = {
+            "id": "scan-123",
+            "status": "media_ready",
+            "member": "member-1",
+            "business_profile": "bp-1",
+            "resolved_media": {"image": "img-1", "audio": "aud-1", "video": "vid-1"},
+        }
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main,
+            "_authenticate_process_user",
+            return_value="user-1",
+        ), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+            return_value={"id": "scan-123", "status": "media_ready", "user": "user-1", "business_profile": "bp-1", "member": "member-1"},
+        ), patch.object(
+            main,
+            "_authorize_scan_access",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_resolve_scan_context",
+            return_value=scan_context,
+        ):
+            response = client.post(
+                "/baseline",
+                json={
+                    "scan_id": "scan-123",
+                    "media": {"video": "https://evil.example/video.mp4"},
+                },
+                headers={"Authorization": "Bearer test-token"},
+            )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_baseline_requires_authentication(self):
+        client = TestClient(main.app)
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main,
+            "_authenticate_process_user",
+            side_effect=HTTPException(status_code=401, detail="invalid_authorization"),
+        ):
+            response = client.post("/baseline", json={"scan_id": "scan-123"})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_baseline_requires_ownership_and_active_membership(self):
+        client = TestClient(main.app)
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main,
+            "_authenticate_process_user",
+            return_value="user-1",
+        ), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+            return_value={"id": "scan-123", "status": "media_ready", "user": "user-2", "business_profile": "bp-1"},
+        ), patch.object(
+            main,
+            "_authorize_scan_access",
+            side_effect=HTTPException(status_code=403, detail="active_membership_required"),
+        ):
+            response = client.post("/baseline", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_baseline_rejects_duplicate_rows_before_analysis(self):
+        client = TestClient(main.app)
+        scan_context = {
+            "id": "scan-123",
+            "status": "media_ready",
+            "member": "member-1",
+            "business_profile": "bp-1",
+            "resolved_media": {"image": "img-1", "audio": "aud-1", "video": "vid-1"},
+        }
+        duplicate_rows = [{"id": "baseline-1"}, {"id": "baseline-2"}]
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main,
+            "_authenticate_process_user",
+            return_value="user-1",
+        ), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+            return_value=scan_context,
+        ), patch.object(
+            main,
+            "_authorize_scan_access",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_resolve_scan_context",
+            return_value=scan_context,
+        ), patch.object(
+            main,
+            "_baseline_rows_for_member",
+            return_value=duplicate_rows,
+        ) as baseline_rows_mock:
+            response = client.post("/baseline", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
+
+        self.assertEqual(response.status_code, 409)
+        baseline_rows_mock.assert_called_once()
+
+    def test_baseline_route_does_not_use_current_scan_as_personalization(self):
+        client = TestClient(main.app)
+        scan_context = {
+            "id": "scan-123",
+            "status": "media_ready",
+            "member": "member-1",
+            "business_profile": "bp-1",
+            "resolved_media": {"image": "img-1", "audio": "aud-1", "video": "vid-1"},
+            "task_metrics": {},
+        }
+        signals = {
+            "camera": _image_result(),
+            "video": _video_result(),
+            "voice": _audio_result(),
+        }
+        captured_baseline_used = []
+
+        def fake_compute_result(**kwargs):
+            captured_baseline_used.append(kwargs["baseline_used"])
+            return {
+                "status": "completed",
+                "retake_required": False,
+                "failure_reason": None,
+                "readiness_score": 80,
+                "observed_fatigue_score": 20,
+                "risk_level": "stable",
+                "confidence": 0.8,
+                "camera_confidence": 0.8,
+                "voice_confidence": 0.8,
+                "task_performance_score": 80,
+                "baseline_used": kwargs["baseline_used"],
+                "confidence_drift": 0.0,
+                "face_metrics": {"face_score": 0.8, "baseline_drifts": {}},
+                "voice_metrics": {"voice_score": 0.8, "baseline_drifts": {}},
+                "reaction_metrics": {"reaction_score": 0.8, "baseline_drifts": {}},
+                "explanation": "ok",
+                "suggested_action": "continue_normal_activity",
+                "ai_model_version": "cie_v1_2",
+                "modality_scores": {},
+                "fusion_details": {},
+            }
+
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main,
+            "_authenticate_process_user",
+            return_value="user-1",
+        ), patch.object(
+            main,
+            "_resolve_scan_auth_context",
+            return_value={"id": "scan-123", "status": "media_ready", "user": "user-1", "business_profile": "bp-1", "member": "member-1"},
+        ), patch.object(
+            main,
+            "_authorize_scan_access",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_resolve_scan_context",
+            return_value=scan_context,
+        ), patch.object(
+            main,
+            "_analyze_media",
+            return_value=(signals, []),
+        ), patch.object(
+            main,
+            "_transcribe_audio_file",
+            return_value="hello world",
+        ), patch.object(
+            main,
+            "_expected_phrase",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_baseline_rows_for_member",
+            return_value=[{"id": "baseline-1", "scan_count": 4, "is_active": True}],
+        ), patch.object(
+            main,
+            "compute_result",
+            side_effect=fake_compute_result,
+        ), patch.object(
+            main.directus,
+            "upsert_employee_baseline",
+            return_value={"id": "baseline-1"},
+        ):
+            response = client.post("/baseline", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured_baseline_used, [False])
+
+    def test_baseline_write_failure_does_not_corrupt_completed_scan_result(self):
+        scan_context = {
+            "status": "media_ready",
+            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
+            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
+            "task_metrics": {},
+            "member": "member-1",
+            "business_profile": "bp-1",
+        }
+        response = MagicMock()
+        response.status_code = 403
+        response._content = b'{"errors":[{"message":"forbidden"}]}'
+        baseline_error = main.requests.HTTPError(response=response)
+
+        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value=scan_context["scan_media"],
+        ), patch.object(
+            main.ml_runtime,
+            "is_loaded",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "local_model_required",
+            return_value=False,
+        ), patch.object(
+            main,
+            "_resolve_media_input",
+            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+        ), patch.object(
+            main,
+            "_safe_analyze",
+            side_effect=[_video_result(), _image_result(), _audio_result()],
+        ), patch.object(
+            main,
+            "_expected_phrase",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_baseline_rows_for_member",
+            return_value=[{"id": "baseline-1", "scan_count": 4, "is_active": False}],
+        ), patch.object(
+            main.directus,
+            "upsert_employee_baseline",
+            side_effect=baseline_error,
+        ), patch.object(
+            main,
+            "_write_success",
+            return_value={"scan_result": "created:1", "wellness_scan": "updated"},
+        ) as write_mock:
+            result = main._process_scan_sync("scan-123")
+
+        self.assertEqual(result["status"], "completed")
+        write_mock.assert_called_once()
+
+    def test_duplicate_baseline_rows_skip_baseline_update_and_continue_scan(self):
+        scan_context = {
+            "status": "media_ready",
+            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
+            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
+            "task_metrics": {},
+            "member": "member-1",
+            "business_profile": "bp-1",
+        }
+        duplicate_rows = [{"id": "baseline-1"}, {"id": "baseline-2"}]
+        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value=scan_context["scan_media"],
+        ), patch.object(
+            main.ml_runtime,
+            "is_loaded",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "local_model_required",
+            return_value=False,
+        ), patch.object(
+            main,
+            "_resolve_media_input",
+            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+        ), patch.object(
+            main,
+            "_safe_analyze",
+            side_effect=[_video_result(), _image_result(), _audio_result()],
+        ), patch.object(
+            main,
+            "_expected_phrase",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_baseline_rows_for_member",
+            return_value=duplicate_rows,
+        ), patch.object(
+            main.directus,
+            "upsert_employee_baseline",
+        ) as baseline_upsert_mock, patch.object(
+            main,
+            "_write_success",
+            return_value={"scan_result": "created:1", "wellness_scan": "updated"},
+        ):
+            result = main._process_scan_sync("scan-123")
+
+        self.assertEqual(result["status"], "completed")
+        baseline_upsert_mock.assert_not_called()
+
+    def test_low_quality_scan_does_not_call_baseline_upsert(self):
+        scan_context = {
+            "status": "media_ready",
+            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
+            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
+            "task_metrics": {},
+            "member": "member-1",
+            "business_profile": "bp-1",
+        }
+        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value=scan_context["scan_media"],
+        ), patch.object(
+            main.ml_runtime,
+            "is_loaded",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "local_model_required",
+            return_value=False,
+        ), patch.object(
+            main,
+            "_resolve_media_input",
+            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+        ), patch.object(
+            main,
+            "_safe_analyze",
+            side_effect=[
+                _video_result(visual_quality_score=0.2, visual_warnings=["video_blurry"]),
+                _image_result(image_quality_score=0.2, image_warnings=["image_blurry"]),
+                _audio_result(audio_quality_score=0.2, audio_warnings=["audio_too_noisy"]),
+            ],
+        ), patch.object(
+            main,
+            "_expected_phrase",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_baseline_rows_for_member",
+            return_value=[{"id": "baseline-1"}],
+        ), patch.object(
+            main.directus,
+            "upsert_employee_baseline",
+        ) as baseline_upsert_mock, patch.object(
+            main,
+            "_write_success",
+            return_value={"scan_result": "created:1", "wellness_scan": "updated"},
+        ):
+            result = main._process_scan_sync("scan-123")
+
+        self.assertEqual(result["status"], "completed")
+        baseline_upsert_mock.assert_not_called()
+
+    def test_malformed_baseline_json_does_not_crash_scan_processing(self):
+        scan_context = {
+            "status": "media_ready",
+            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
+            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
+            "task_metrics": {},
+            "member": "member-1",
+            "business_profile": "bp-1",
+        }
+        malformed_rows = [{"id": "baseline-1", "scan_count": "bad", "face_avg": "broken", "voice_avg": 123, "reaction_avg": []}]
+        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value=scan_context["scan_media"],
+        ), patch.object(
+            main.ml_runtime,
+            "is_loaded",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "local_model_required",
+            return_value=False,
+        ), patch.object(
+            main,
+            "_resolve_media_input",
+            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+        ), patch.object(
+            main,
+            "_safe_analyze",
+            side_effect=[_video_result(), _image_result(), _audio_result()],
+        ), patch.object(
+            main,
+            "_expected_phrase",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_baseline_rows_for_member",
+            return_value=malformed_rows,
+        ), patch.object(
+            main.directus,
+            "upsert_employee_baseline",
+            return_value={"id": "baseline-1"},
+        ), patch.object(
+            main,
+            "_write_success",
+            return_value={"scan_result": "created:1", "wellness_scan": "updated"},
+        ):
+            result = main._process_scan_sync("scan-123")
+
+        self.assertEqual(result["status"], "completed")
+
+    def test_missing_required_speech_does_not_call_baseline_upsert(self):
+        scan_context = {
+            "status": "media_ready",
+            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
+            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
+            "task_metrics": {},
+            "member": "member-1",
+            "business_profile": "bp-1",
+            "expected_phrase": "please say continuity ready",
+        }
+        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value=scan_context["scan_media"],
+        ), patch.object(
+            main.ml_runtime,
+            "is_loaded",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "local_model_required",
+            return_value=False,
+        ), patch.object(
+            main,
+            "_resolve_media_input",
+            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+        ), patch.object(
+            main,
+            "_safe_analyze",
+            side_effect=[_video_result(), _image_result(), _audio_result()],
+        ), patch.object(
+            main,
+            "_transcribe_audio_file",
+            return_value="something else entirely",
+        ), patch.object(
+            main,
+            "_baseline_rows_for_member",
+            return_value=[{"id": "baseline-1"}],
+        ), patch.object(
+            main.directus,
+            "upsert_employee_baseline",
+        ) as baseline_upsert_mock, patch.object(
+            main,
+            "_write_success",
+            return_value={"scan_result": "created:1", "wellness_scan": "updated"},
+        ):
+            result = main._process_scan_sync("scan-123")
+
+        self.assertEqual(result["status"], "completed")
+        baseline_upsert_mock.assert_not_called()
+
+    def test_elevated_fatigue_and_high_risk_do_not_call_baseline_upsert(self):
+        scan_context = {
+            "status": "media_ready",
+            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
+            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
+            "task_metrics": {},
+            "member": "member-1",
+            "business_profile": "bp-1",
+        }
+        for risk_level in ["elevated_fatigue", "high_risk"]:
+            with self.subTest(risk_level=risk_level):
+                with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+                    main.directus,
+                    "get_scan_media",
+                    return_value=scan_context["scan_media"],
+                ), patch.object(
+                    main.ml_runtime,
+                    "is_loaded",
+                    return_value=False,
+                ), patch.object(
+                    main.ml_runtime,
+                    "local_model_required",
+                    return_value=False,
+                ), patch.object(
+                    main,
+                    "_resolve_media_input",
+                    side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+                ), patch.object(
+                    main,
+                    "_safe_analyze",
+                    side_effect=[_video_result(), _image_result(), _audio_result()],
+                ), patch.object(
+                    main,
+                    "_expected_phrase",
+                    return_value=None,
+                ), patch.object(
+                    main,
+                    "_baseline_rows_for_member",
+                    return_value=[{"id": "baseline-1"}],
+                ), patch.object(
+                    main,
+                    "compute_result",
+                    return_value={
+                        "status": "completed",
+                        "retake_required": False,
+                        "failure_reason": None,
+                        "readiness_score": 40,
+                        "observed_fatigue_score": 60,
+                        "risk_level": risk_level,
+                        "confidence": 0.8,
+                        "camera_confidence": 0.8,
+                        "voice_confidence": 0.8,
+                        "task_performance_score": None,
+                        "baseline_used": False,
+                        "confidence_drift": 0.0,
+                        "face_metrics": {"face_score": 0.8, "baseline_drifts": {}},
+                        "voice_metrics": {"voice_score": 0.8, "baseline_drifts": {}},
+                        "reaction_metrics": {"reaction_score": None, "baseline_drifts": {}},
+                        "explanation": "ok",
+                        "suggested_action": "continue_normal_activity",
+                        "ai_model_version": "cie_v1_2",
+                        "modality_scores": {},
+                        "fusion_details": {},
+                    },
+                ), patch.object(
+                    main.directus,
+                    "upsert_employee_baseline",
+                ) as baseline_upsert_mock, patch.object(
+                    main,
+                    "_write_success",
+                    return_value={"scan_result": "created:1", "wellness_scan": "updated"},
+                ):
+                    result = main._process_scan_sync("scan-123")
+
+                self.assertEqual(result["status"], "completed")
+                baseline_upsert_mock.assert_not_called()
+
+    def test_result_status_uses_only_approved_values(self):
+        self.assertEqual(
+            main._result_status_from_outcome(
+                quality_result={"retake_required": False, "failure_reason": None},
+                validation_result={},
+                result={"confidence": 0.8, "retake_required": False},
+                baseline_eligibility={"task_completion_status": "completed"},
+            ),
+            "scored",
+        )
+        self.assertEqual(
+            main._result_status_from_outcome(
+                quality_result={"retake_required": True, "failure_reason": "low_quality_media"},
+                validation_result={},
+                result={"confidence": 0.8, "retake_required": True},
+                baseline_eligibility={"task_completion_status": "completed"},
+            ),
+            "retake_required",
+        )
+        self.assertEqual(
+            main._result_status_from_outcome(
+                quality_result={"retake_required": False, "failure_reason": None},
+                validation_result={},
+                result={"confidence": 0.8, "retake_required": False},
+                baseline_eligibility={"task_completion_status": "incomplete_required_speech"},
+            ),
+            "incomplete",
+        )
+        self.assertEqual(
+            main._result_status_from_outcome(
+                quality_result={"retake_required": False, "failure_reason": None},
+                validation_result={},
+                result={"confidence": 0.3, "retake_required": False},
+                baseline_eligibility={"task_completion_status": "completed"},
+            ),
+            "low_confidence",
+        )
+
+    def test_migration_contains_no_member_null_mutation(self):
+        with open("sql\\2026_07_01_phase2_baseline_foundation.sql", "r", encoding="utf-8") as handle:
+            migration = handle.read()
+        self.assertNotIn("SET member = NULL", migration)
 
     def test_missing_wellness_scan_ai_model_version_does_not_fail_completion(self):
         def filter_missing_wellness_ai_model_version(collection, payload):

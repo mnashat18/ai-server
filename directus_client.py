@@ -547,6 +547,12 @@ class DirectusClient:
         return media_rows[0] if media_rows else None
 
     def get_employee_baseline(self, member_id: Any, business_profile_id: Any) -> dict | None:
+        rows = self.get_employee_baselines(member_id, business_profile_id)
+        if len(rows) != 1:
+            return None
+        return rows[0]
+
+    def get_employee_baselines(self, member_id: Any, business_profile_id: Any) -> list[dict]:
         rows = self.list_items(
             "employee_baselines",
             filters={
@@ -554,9 +560,9 @@ class DirectusClient:
                 "filter[member][_eq]": member_id,
             },
             fields=["*"],
-            limit=1,
+            sort="-scan_count,-date_updated",
         )
-        return rows[0] if rows else None
+        return rows or []
 
     def upsert_employee_baseline(self, baseline_id: Any | None, payload: dict) -> dict:
         if baseline_id:

@@ -15,7 +15,12 @@ from pydantic import BaseModel, Field
 import requests
 from requests import HTTPError
 
-from baseline import baseline_ready_for_scoring, baseline_signal_payload, baseline_status_payload
+from baseline import (
+    baseline_ready_for_personalized_scoring,
+    baseline_signal_payload,
+    baseline_status_payload,
+    evaluate_baseline_eligibility,
+)
 from config import MAX_DOWNLOAD_BYTES, MODEL_VERSION
 from directus_client import DirectusClient
 from logger import get_logger
@@ -77,10 +82,22 @@ OPTIONAL_SCAN_RESULT_FIELDS = [
     "modality_scores",
     "fusion_details",
     "internal_analysis",
+    "result_status",
+    "capture_quality_score",
+    "measurement_reliability_score",
+    "observed_fatigue_score",
+    "personal_deviation_score",
+    "task_completion_status",
+    "baseline_status_at_inference",
+    "baseline_confidence",
+    "baseline_eligible",
+    "hard_gates_triggered",
+    "explainable_reasons",
 ]
 
 SCAN_RESULT_NUMERIC_FIELDS: dict[str, bool] = {
     "readiness_score": True,
+    "observed_fatigue_score": True,
     "confidence": False,
     "camera_confidence": False,
     "voice_confidence": False,
@@ -90,6 +107,10 @@ SCAN_RESULT_NUMERIC_FIELDS: dict[str, bool] = {
     "audio_quality_score": False,
     "video_quality_score": False,
     "image_quality_score": False,
+    "capture_quality_score": False,
+    "measurement_reliability_score": False,
+    "personal_deviation_score": False,
+    "baseline_confidence": False,
 }
 
 SCAN_RESULT_CHOICE_ALIASES: dict[str, dict[str, list[str]]] = {
@@ -98,7 +119,20 @@ SCAN_RESULT_CHOICE_ALIASES: dict[str, dict[str, list[str]]] = {
         "low_focus": ["Low Focus"],
         "elevated_fatigue": ["Elevated Fatigue"],
         "high_risk": ["High Risk"],
-        "unknown": ["Unknown"],
+    },
+    "baseline_status": {
+        "collecting": ["Collecting"],
+        "provisional": ["Provisional"],
+        "active": ["Active"],
+        "needs_review": ["Needs Review"],
+        "disabled": ["Disabled"],
+    },
+    "result_status": {
+        "scored": ["Scored"],
+        "retake_required": ["Retake Required"],
+        "incomplete": ["Incomplete"],
+        "low_confidence": ["Low Confidence"],
+        "failed": ["Failed"],
     },
     "suggested_action": {
         "continue_normal_activity": ["Continue Normal Activity"],
@@ -106,6 +140,12 @@ SCAN_RESULT_CHOICE_ALIASES: dict[str, dict[str, list[str]]] = {
         "rescan_recommended": ["Rescan Recommended"],
         "rest_advised": ["Rest Advised"],
         "manager_review": ["Manager Review"],
+    },
+    "task_completion_status": {
+        "completed": ["Completed"],
+        "incomplete_required_speech": ["Incomplete Required Speech"],
+        "incomplete_required_task": ["Incomplete Required Task"],
+        "not_required": ["Not Required"],
     },
 }
 
@@ -130,10 +170,9 @@ class ScanRequest(BaseModel):
 
 
 class BaselineRequest(BaseModel):
-    member_id: str
-    business_profile_id: str
-    media: Media
-    task: Task | None = None
+    scan_id: str | None = None
+    media: Media | None = None
+    manually_unreliable: bool = False
 
 
 class ProcessResponse(BaseModel):
@@ -423,9 +462,16 @@ def _schema_aware_scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]
         if field_name in candidate:
             candidate[field_name] = _safe_numeric(candidate.get(field_name), integer=integer)
 
-    for field_name in ["risk_level", "suggested_action"]:
+    for field_name in [
+        "risk_level",
+        "suggested_action",
+        "result_status",
+        "task_completion_status",
+        "baseline_status_at_inference",
+    ]:
         if field_name in candidate:
-            candidate[field_name] = _coerce_scan_result_choice(field_name, candidate.get(field_name))
+            choice_field = "baseline_status" if field_name == "baseline_status_at_inference" else field_name
+            candidate[field_name] = _coerce_scan_result_choice(choice_field, candidate.get(field_name))
 
     candidate["explanation"] = _truncate_string_to_schema(
         "scan_results",
@@ -469,8 +515,9 @@ def _schema_aware_scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]
         "warnings",
         "modality_scores",
         "fusion_details",
-        "internal_analysis",
         "validation_warnings",
+        "hard_gates_triggered",
+        "explainable_reasons",
     ]:
         if field_name in candidate:
             candidate[field_name] = _coerce_json_field("scan_results", field_name, candidate.get(field_name))
@@ -810,13 +857,27 @@ def _merge_task(scan_context: dict) -> Task | None:
 
 
 def _baseline_for_member(member_id: str | None, business_profile_id: str | None) -> dict | None:
-    if not directus.is_configured() or not member_id or not business_profile_id:
+    rows = _baseline_rows_for_member(member_id, business_profile_id)
+    if len(rows) != 1:
+        if len(rows) > 1:
+            logger.warning(
+                "baseline_duplicate_rows member_id=%s business_profile_id=%s count=%s",
+                member_id,
+                business_profile_id,
+                len(rows),
+            )
         return None
+    return rows[0]
+
+
+def _baseline_rows_for_member(member_id: str | None, business_profile_id: str | None) -> list[dict]:
+    if not directus.is_configured() or not member_id or not business_profile_id:
+        return []
     try:
-        return directus.get_employee_baseline(member_id, business_profile_id)
+        return directus.get_employee_baselines(member_id, business_profile_id)
     except Exception as exc:
         logger.warning("baseline_fetch_failed member_id=%s error=%s", member_id, exc)
-        return None
+        return []
 
 
 def _identifier_payload(scan_context: dict) -> dict:
@@ -877,7 +938,7 @@ def _wellness_scan_update_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
     filtered = directus.filter_payload_fields("scan_results", payload)
-    metadata_field = directus.first_supported_field("scan_results", ["internal_analysis", "analysis_metadata"])
+    metadata_field = directus.first_supported_field("scan_results", ["analysis_metadata"])
     if metadata_field and metadata_field not in filtered:
         extras = {}
         for key in [
@@ -990,9 +1051,9 @@ def _quality_failure_response(scan_id: str, quality_result: dict, diagnostics: d
         "status": "failed",
         "retake_required": True,
         "failure_reason": quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA,
-        "readiness_score": None,
-        "risk_level": "unknown",
-        "confidence": None,
+        "readiness_score": 35 if (quality_result.get("failure_reason") == FAILURE_REASON_MISSING_MEDIA) else 45,
+        "risk_level": "low_focus",
+        "confidence": 0.2,
         "camera_confidence": None,
         "voice_confidence": None,
         "task_performance_score": None,
@@ -1009,10 +1070,24 @@ def _quality_failure_response(scan_id: str, quality_result: dict, diagnostics: d
     }
 
 
+def _safe_internal_analysis_text(result: dict, internal_analysis: dict) -> str:
+    quality = internal_analysis.get("quality") or {}
+    warnings = [str(w).replace("_", " ") for w in (quality.get("warnings") or result.get("validation_warnings") or [])[:3]]
+    if quality.get("failure_reason") in {"missing_media", "low_quality_media"}:
+        summary = "reliable assessment unavailable"
+        if warnings:
+            summary = f"{summary}: {', '.join(warnings)}"
+        return sanitize_text(summary, fallback="reliable assessment unavailable", max_len=255) or "reliable assessment unavailable"
+    if warnings:
+        return sanitize_text(f"analysis warnings: {', '.join(warnings)}", fallback="analysis available", max_len=255) or "analysis available"
+    return "analysis available"
+
+
 def _build_scan_result_payload(scan_id: str, result: dict, internal_analysis: dict) -> dict:
     payload = {
         "scan_id": scan_id,
         "readiness_score": result.get("readiness_score"),
+        "observed_fatigue_score": result.get("observed_fatigue_score"),
         "risk_level": result.get("risk_level"),
         "confidence": result.get("confidence"),
         "camera_confidence": result.get("camera_confidence"),
@@ -1033,6 +1108,16 @@ def _build_scan_result_payload(scan_id: str, result: dict, internal_analysis: di
         "video_quality_score": result.get("video_quality_score"),
         "image_quality_score": result.get("image_quality_score"),
         "validation_warnings": result.get("validation_warnings"),
+        "result_status": result.get("result_status"),
+        "capture_quality_score": result.get("capture_quality_score"),
+        "measurement_reliability_score": result.get("measurement_reliability_score"),
+        "personal_deviation_score": result.get("personal_deviation_score"),
+        "task_completion_status": result.get("task_completion_status"),
+        "baseline_status_at_inference": result.get("baseline_status_at_inference"),
+        "baseline_confidence": result.get("baseline_confidence"),
+        "baseline_eligible": result.get("baseline_eligible"),
+        "hard_gates_triggered": result.get("hard_gates_triggered"),
+        "explainable_reasons": result.get("explainable_reasons"),
     }
     supported_optional = directus.supports_fields(
         "scan_results",
@@ -1058,7 +1143,7 @@ def _build_scan_result_payload(scan_id: str, result: dict, internal_analysis: di
     if "fusion_details" in supported_optional:
         payload["fusion_details"] = result.get("fusion_details")
     if "internal_analysis" in supported_optional:
-        payload["internal_analysis"] = internal_analysis
+        payload["internal_analysis"] = _safe_internal_analysis_text(result, internal_analysis)
     return _schema_aware_scan_result_payload(payload)
 
 
@@ -1067,6 +1152,41 @@ def _write_quality_failure(scan_id: str, quality_result: dict) -> dict:
         scan_id,
         quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA,
     )
+
+
+def _baseline_personal_deviation_score(result: dict) -> float | None:
+    drifts = []
+    for field_name in ["face_metrics", "voice_metrics", "reaction_metrics"]:
+        metric_drifts = (result.get(field_name) or {}).get("baseline_drifts") or {}
+        for drift_payload in metric_drifts.values():
+            drift = (drift_payload or {}).get("drift")
+            if drift is None:
+                continue
+            try:
+                drifts.append(abs(float(drift)))
+            except (TypeError, ValueError):
+                continue
+    if not drifts:
+        return None
+    return round(sum(drifts) / len(drifts), 4)
+
+
+def _result_status_from_outcome(
+    *,
+    quality_result: dict,
+    validation_result: dict,
+    result: dict,
+    baseline_eligibility: dict,
+) -> str:
+    if quality_result.get("retake_required") or result.get("retake_required") or quality_result.get("failure_reason") in {"low_quality_media", "missing_media"}:
+        return "retake_required"
+    task_completion_status = baseline_eligibility.get("task_completion_status")
+    if task_completion_status in {"incomplete_required_speech", "incomplete_required_task"}:
+        return "incomplete"
+    confidence = result.get("confidence")
+    if confidence is None or float(confidence) < 0.45:
+        return "low_confidence"
+    return "scored"
 
 
 def _write_success(
@@ -1186,8 +1306,15 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     media = _merge_media(scan_context)
     task = _merge_task(scan_context)
     identifiers = _identifier_payload(scan_context)
-    baseline = _baseline_for_member(identifiers.get("member_id"), identifiers.get("business_profile_id"))
-    baseline_used = baseline_ready_for_scoring(baseline)
+    baseline_rows = _baseline_rows_for_member(identifiers.get("member_id"), identifiers.get("business_profile_id"))
+    if len(baseline_rows) > 1:
+        logger.warning(
+            "baseline_duplicate_rows member_id=%s business_profile_id=%s count=%s",
+            identifiers.get("member_id"),
+            identifiers.get("business_profile_id"),
+            len(baseline_rows),
+        )
+    baseline = baseline_rows[0] if len(baseline_rows) == 1 else None
     baseline_status = baseline_status_payload(baseline)
     expected_phrase = _expected_phrase(scan_context)
 
@@ -1267,7 +1394,11 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             "video": video_result,
             "voice": audio_result,
         }
-        quality_result = assess_quality(raw_signals, task)
+        quality_result = assess_quality(
+            raw_signals,
+            task,
+            speech_required=VALIDATION_POLICY.require_phrase_match or bool(expected_phrase),
+        )
         combined_warnings = []
         combined_warnings.extend(quality_result.get("warnings") or [])
         combined_warnings.extend(phrase_validation.get("warnings") or [])
@@ -1296,6 +1427,24 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         feature_map, _ = features_from_signals(raw_signals, task=task)
         feature_vector = vector_from_features(feature_map)
         ml_result = ml_runtime.predict(feature_vector)
+        preview_result = compute_result(
+            signals=raw_signals,
+            task=task,
+            previous_confidence=None,
+            baseline=baseline,
+            baseline_used=False,
+            quality=quality_result,
+            ml_result=ml_result,
+        )
+        baseline_used = baseline_ready_for_personalized_scoring(
+            baseline,
+            quality_result=quality_result,
+            validation_result=phrase_validation,
+            result=preview_result,
+            task=task,
+            expected_phrase=expected_phrase,
+            unique_row=len(baseline_rows) == 1,
+        )
         result = compute_result(
             signals=raw_signals,
             task=task,
@@ -1316,22 +1465,56 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
                 "validation_warnings": quality_result.get("warnings"),
             }
         )
+        baseline_eligibility = evaluate_baseline_eligibility(
+            quality_result=quality_result,
+            validation_result=phrase_validation,
+            result=result,
+            signals=raw_signals,
+            expected_phrase=expected_phrase,
+            task=task,
+            manually_unreliable=False,
+        )
+        result.update(
+            {
+                "capture_quality_score": baseline_eligibility.get("capture_quality_score"),
+                "measurement_reliability_score": baseline_eligibility.get("measurement_reliability_score"),
+                "personal_deviation_score": _baseline_personal_deviation_score(result),
+                "task_completion_status": baseline_eligibility.get("task_completion_status"),
+                "baseline_status_at_inference": baseline_status.get("baseline_status"),
+                "baseline_confidence": baseline_status.get("baseline_confidence"),
+                "baseline_eligible": baseline_eligibility.get("eligible"),
+                "hard_gates_triggered": baseline_eligibility.get("hard_gates_triggered"),
+                "explainable_reasons": baseline_eligibility.get("reasons"),
+            }
+        )
+        result["result_status"] = _result_status_from_outcome(
+            quality_result=quality_result,
+            validation_result=phrase_validation,
+            result=result,
+            baseline_eligibility=baseline_eligibility,
+        )
         _log_step(scan_id, "analysis_done", risk_level=result.get("risk_level"), confidence=result.get("confidence"))
 
-        if identifiers.get("member_id") and identifiers.get("business_profile_id"):
-            try:
-                baseline_payload = baseline_signal_payload(
-                    baseline,
-                    face_score=result["face_metrics"]["face_score"],
-                    voice_score=result["voice_metrics"]["voice_score"],
-                    reaction_score=result["reaction_metrics"]["reaction_score"],
-                    scanned_at=_scan_timestamp(scan_context),
+        if identifiers.get("member_id") and identifiers.get("business_profile_id") and baseline_eligibility.get("eligible"):
+            if len(baseline_rows) > 1:
+                logger.warning(
+                    "baseline_write_skipped_duplicate member_id=%s business_profile_id=%s scan_id=%s",
+                    identifiers.get("member_id"),
+                    identifiers.get("business_profile_id"),
+                    scan_id,
                 )
-                baseline_payload["member"] = identifiers["member_id"]
-                baseline_payload["business_profile"] = identifiers["business_profile_id"]
-                directus.upsert_employee_baseline(_relation_id((baseline or {}).get("id")), baseline_payload)
-            except Exception as exc:
-                logger.warning("baseline_write_failed scan_id=%s optional=true error=%s", scan_id, exc)
+            else:
+                try:
+                    baseline_payload = baseline_signal_payload(
+                        baseline,
+                        signals=raw_signals,
+                        scanned_at=_scan_timestamp(scan_context),
+                    )
+                    baseline_payload["member"] = identifiers["member_id"]
+                    baseline_payload["business_profile"] = identifiers["business_profile_id"]
+                    directus.upsert_employee_baseline(_relation_id((baseline or {}).get("id")), baseline_payload)
+                except Exception as exc:
+                    logger.warning("baseline_write_failed scan_id=%s optional=true error=%s", scan_id, exc)
 
         internal_analysis = sanitize_payload(
             {
@@ -1423,37 +1606,107 @@ def baseline_status(
 
 
 @app.post("/baseline")
-def set_baseline(req: BaselineRequest):
-    signals, temp_files = _analyze_media("baseline", req.media)
+def set_baseline(
+    req: BaselineRequest,
+    authorization: str | None = Header(default=None),
+):
+    if not directus.is_configured():
+        raise HTTPException(status_code=500, detail="Directus credentials are not configured")
+    if not req.scan_id:
+        raise HTTPException(status_code=422, detail="scan_id_required")
+    authenticated_user_id = _authenticate_process_user(authorization, req.scan_id.strip())
+    scan_context = _resolve_scan_auth_context(req.scan_id.strip())
+    _authorize_scan_access(scan_context, authenticated_user_id)
+    scan_context = _resolve_scan_context(req.scan_id.strip())
+    identifiers = _identifier_payload(scan_context)
+    if not identifiers.get("member_id") or not identifiers.get("business_profile_id"):
+        raise HTTPException(status_code=422, detail="scan_identifiers_missing")
+    media = _merge_media(scan_context)
+    baseline_rows = _baseline_rows_for_member(identifiers["member_id"], identifiers["business_profile_id"])
+    if len(baseline_rows) > 1:
+        logger.warning(
+            "baseline_duplicate_rows member_id=%s business_profile_id=%s count=%s",
+            identifiers["member_id"],
+            identifiers["business_profile_id"],
+            len(baseline_rows),
+        )
+        raise HTTPException(status_code=409, detail="duplicate_baseline_rows")
+    baseline = baseline_rows[0] if baseline_rows else None
+    if req.media:
+        requested = _model_to_dict(req.media)
+        trusted = _model_to_dict(media)
+        for field_name in ["image", "audio", "video"]:
+            candidate = requested.get(field_name)
+            if candidate and str(candidate) != str(trusted.get(field_name)):
+                raise HTTPException(status_code=422, detail="manual_baseline_requires_directus_media")
+    expected_phrase = _expected_phrase(scan_context)
+    signals, temp_files = _analyze_media("baseline", media)
     try:
-        quality_result = assess_quality(signals, req.task)
+        task = _merge_task(scan_context)
+        quality_result = assess_quality(
+            signals,
+            task,
+            speech_required=VALIDATION_POLICY.require_phrase_match or bool(expected_phrase),
+        )
         if not quality_result["passed"]:
             raise HTTPException(status_code=422, detail=quality_result["failure_reason"] or FAILURE_REASON_LOW_QUALITY_MEDIA)
+        transcript = None
+        if expected_phrase:
+            try:
+                audio_path, audio_temp = _resolve_media_input(media.audio, ".bin", "audio", allow_url=False, allow_local_path=False)
+                if audio_path and audio_temp:
+                    temp_files.append(audio_path)
+                if audio_path and _should_convert_audio(audio_path):
+                    converted = _convert_audio_to_wav(audio_path)
+                    temp_files.append(converted)
+                    audio_path = converted
+                transcript = _transcribe_audio_file(audio_path) if audio_path else None
+            except Exception:
+                transcript = None
+        phrase_validation = validate_scan_inputs(
+            policy=VALIDATION_POLICY,
+            media=media,
+            video_result=signals.get("video"),
+            audio_result=signals.get("voice"),
+            image_result=signals.get("camera"),
+            expected_phrase=expected_phrase,
+            transcript=transcript,
+        )
         result = compute_result(
             signals=signals,
-            task=req.task,
+            task=task,
             previous_confidence=None,
-            baseline=None,
+            baseline=baseline,
             baseline_used=False,
             quality=quality_result,
             ml_result=None,
         )
-        baseline = _baseline_for_member(req.member_id, req.business_profile_id)
+        eligibility = evaluate_baseline_eligibility(
+            quality_result=quality_result,
+            validation_result=phrase_validation,
+            result=result,
+            signals=signals,
+            expected_phrase=expected_phrase,
+            task=task,
+            manually_unreliable=req.manually_unreliable,
+        )
+        if not eligibility["eligible"]:
+            raise HTTPException(status_code=422, detail={"reason": "baseline_ineligible", "reasons": eligibility["reasons"]})
         payload = baseline_signal_payload(
             baseline,
-            face_score=result["face_metrics"]["face_score"],
-            voice_score=result["voice_metrics"]["voice_score"],
-            reaction_score=result["reaction_metrics"]["reaction_score"],
+            signals=signals,
             scanned_at=_utc_now(),
         )
-        payload["member"] = req.member_id
-        payload["business_profile"] = req.business_profile_id
+        payload["member"] = identifiers["member_id"]
+        payload["business_profile"] = identifiers["business_profile_id"]
         updated = directus.upsert_employee_baseline(_relation_id((baseline or {}).get("id")), payload)
         return {
-            "member_id": req.member_id,
-            "business_profile_id": req.business_profile_id,
+            "scan_id": req.scan_id,
+            "member_id": identifiers["member_id"],
+            "business_profile_id": identifiers["business_profile_id"],
             "baseline": updated,
             "baseline_status": baseline_status_payload(updated),
+            "baseline_eligible": True,
             "model_version": MODEL_VERSION,
         }
     finally:

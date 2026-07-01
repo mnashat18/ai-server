@@ -17,14 +17,35 @@ def _task_value(task: Any, key: str) -> Any:
     return getattr(task, key, None)
 
 
-def _signal_summary(name: str, result: dict | None, usable_threshold: float, warning_key: str) -> dict:
+def _signal_summary(
+    name: str,
+    result: dict | None,
+    usable_threshold: float,
+    warning_key: str,
+    *,
+    suppressed_warnings: set[str] | None = None,
+) -> dict:
     result = result or {}
     details = result.get("details", {}) if isinstance(result, dict) else {}
     score = clamp01(result.get("score"))
     warnings = clean_warning_codes(details.get(warning_key) or [])
+    if suppressed_warnings:
+        warnings = [warning for warning in warnings if warning not in suppressed_warnings]
     missing_statuses = {"missing", "open_failed", "load_failed", "empty_audio", "invalid", "invalid_image", "error", None}
     present = details.get("status") not in missing_statuses or score is not None
-    usable = bool(score is not None and score >= usable_threshold and len(warnings) < 3)
+    disqualifying_warnings = {
+        "video": {"video_too_dark", "video_blurry", "unstable_video", "subject_not_visible", "face_not_visible"},
+        "audio": {"speech_not_detected", "audio_too_noisy"},
+        "image": {"image_too_dark", "image_blurry", "face_not_visible", "subject_not_visible"},
+    }
+    if name == "audio" and details.get("quiet_but_usable"):
+        warnings = [warning for warning in warnings if warning != "audio_too_quiet"]
+    usable = bool(
+        score is not None
+        and score >= usable_threshold
+        and not (set(warnings) & disqualifying_warnings.get(name, set()))
+        and len(warnings) < 3
+    )
     weak = bool(score is not None and not usable)
     return {
         "name": name,
@@ -37,9 +58,15 @@ def _signal_summary(name: str, result: dict | None, usable_threshold: float, war
     }
 
 
-def assess_quality(signals: dict, task: Any = None) -> dict:
+def assess_quality(signals: dict, task: Any = None, *, speech_required: bool = False) -> dict:
     video = _signal_summary("video", signals.get("video"), 0.42, "visual_warnings")
-    audio = _signal_summary("audio", signals.get("voice"), 0.4, "audio_warnings")
+    audio = _signal_summary(
+        "audio",
+        signals.get("voice"),
+        0.4,
+        "audio_warnings",
+        suppressed_warnings=None if speech_required else {"speech_not_detected"},
+    )
     image = _signal_summary("image", signals.get("camera"), 0.38, "image_warnings")
 
     warnings = clean_warning_codes(video["warnings"] + audio["warnings"] + image["warnings"])
@@ -90,6 +117,11 @@ def assess_quality(signals: dict, task: Any = None) -> dict:
         retake_required = True
     elif usable_modalities == 1 or warnings:
         status = "weak"
+
+    if speech_required and "speech_not_detected" in warnings and audio["present"]:
+        failure_reason = failure_reason or FAILURE_REASON_LOW_QUALITY_MEDIA
+        status = "weak"
+        retake_required = True
 
     if status == "failed" or retake_required:
         suggested_action = "rescan_recommended"

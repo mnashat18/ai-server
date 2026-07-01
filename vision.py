@@ -88,6 +88,9 @@ def analyze_face(image_path: str) -> dict:
     face_detected = False
     landmark_confidence = None
     avg_ear = None
+    left_eye_aperture = None
+    right_eye_aperture = None
+    left_right_eye_asymmetry = None
     eyes_closed = None
 
     if width * height < MIN_RESOLUTION:
@@ -108,7 +111,10 @@ def analyze_face(image_path: str) -> dict:
                 subject_visibility = 1.0
                 landmark_confidence = 0.9
                 landmarks = res.multi_face_landmarks[0].landmark
-                avg_ear = (_eye_aspect_ratio(landmarks, LEFT_EYE) + _eye_aspect_ratio(landmarks, RIGHT_EYE)) / 2.0
+                left_eye_aperture = _eye_aspect_ratio(landmarks, LEFT_EYE)
+                right_eye_aperture = _eye_aspect_ratio(landmarks, RIGHT_EYE)
+                avg_ear = (left_eye_aperture + right_eye_aperture) / 2.0
+                left_right_eye_asymmetry = abs(left_eye_aperture - right_eye_aperture)
                 eyes_closed = avg_ear < 0.18
                 if eyes_closed:
                     subject_visibility = 0.85
@@ -144,6 +150,9 @@ def analyze_face(image_path: str) -> dict:
         "avg_brightness": safe_number(brightness_raw, 2),
         "blur_var": safe_number(blur_var, 2),
         "avg_ear": safe_number(avg_ear),
+        "left_eye_aperture": safe_number(left_eye_aperture),
+        "right_eye_aperture": safe_number(right_eye_aperture),
+        "left_right_eye_asymmetry": safe_number(left_right_eye_asymmetry),
         "eyes_closed": eyes_closed,
         "low_light": brightness_raw < LOW_LIGHT_THRESHOLD,
         "blurry": blur_var < BLUR_THRESHOLD,
