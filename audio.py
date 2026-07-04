@@ -41,6 +41,32 @@ def _elapsed_ms(started_at: float) -> int:
     return int(round((time.perf_counter() - started_at) * 1000))
 
 
+def _rms_numpy(y: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
+    if frame_length <= 0 or hop_length <= 0:
+        raise ValueError("frame_length_and_hop_length_must_be_positive")
+    if y is None:
+        return np.zeros(1, dtype=np.float32)
+
+    samples = np.asarray(y, dtype=np.float32)
+    if samples.ndim != 1:
+        samples = np.ravel(samples)
+
+    pad = frame_length // 2
+    padded = np.pad(samples, (pad, pad), mode="constant")
+    if padded.size < frame_length:
+        padded = np.pad(padded, (0, frame_length - padded.size), mode="constant")
+
+    frame_count = 1 + ((padded.size - frame_length) // hop_length)
+    stride = padded.strides[0]
+    frames = np.lib.stride_tricks.as_strided(
+        padded,
+        shape=(frame_length, frame_count),
+        strides=(stride, hop_length * stride),
+        writeable=False,
+    )
+    return np.sqrt(np.mean(frames * frames, axis=0, dtype=np.float64)).astype(np.float32, copy=False)
+
+
 def _pcm_bytes_to_float32(raw: bytes, sample_width: int) -> np.ndarray:
     if sample_width == 1:
         data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
@@ -180,8 +206,9 @@ def analyze_audio(audio_path: str) -> dict:
     duration_seconds = source_duration_seconds
     frame_length = min(2048, max(512, int(sr * 0.032)))
     hop_length = max(256, int(frame_length / 4))
+    rms_impl = "numpy_stride_centered"
     step_started = time.perf_counter()
-    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    rms = _rms_numpy(y=y, frame_length=frame_length, hop_length=hop_length)
     quality_steps_ms["rms_ms"] = _elapsed_ms(step_started)
     step_started = time.perf_counter()
     zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame_length, hop_length=hop_length)[0]
@@ -204,7 +231,8 @@ def analyze_audio(audio_path: str) -> dict:
     quality_steps_ms["derived_metrics_ms"] = _elapsed_ms(step_started)
     timings_ms["audio_quality_ms"] = int(round((time.perf_counter() - quality_started) * 1000))
     logger.info(
-        "[AUDIO_QUALITY_DETAIL] rms_ms=%s zcr_ms=%s spectral_centroid_ms=%s spectral_flatness_ms=%s mfcc_ms=%s derived_metrics_ms=%s",
+        "[AUDIO_QUALITY_DETAIL] rms_impl=%s rms_ms=%s zcr_ms=%s spectral_centroid_ms=%s spectral_flatness_ms=%s mfcc_ms=%s derived_metrics_ms=%s",
+        rms_impl,
         quality_steps_ms["rms_ms"],
         quality_steps_ms["zcr_ms"],
         quality_steps_ms["spectral_centroid_ms"],
