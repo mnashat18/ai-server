@@ -1,4 +1,8 @@
 import math
+import os
+
+os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import numpy as np
 
@@ -21,7 +25,16 @@ MIN_RESOLUTION = 256 * 256
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
-mp_face = mp.solutions.face_mesh.FaceMesh(static_image_mode=True) if mp else None
+mp_face = (
+    mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=False,
+        min_detection_confidence=0.5,
+    )
+    if mp
+    else None
+)
 
 
 def _dist(a, b) -> float:
