@@ -1,3 +1,8 @@
+import os
+
+os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
 import numpy as np
 
 from utils import clamp01, clean_warning_codes, safe_number
@@ -31,7 +36,17 @@ MAX_EYE_ASYMMETRY = 0.08
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
-mp_face = mp.solutions.face_mesh.FaceMesh(static_image_mode=False) if mp else None
+mp_face = (
+    mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=False,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    if mp
+    else None
+)
 
 
 def _resolution_score(width: int, height: int) -> float:
@@ -266,30 +281,35 @@ def analyze_video(video_path: str) -> dict:
                     camera_motion.append(float(np.mean(diff)))
                 prev_gray = gray
 
-                face_visible, landmark_confidence = _landmark_visibility(frame)
+                face_visible = False
+                landmark_confidence = 0.0 if mp_face is not None else None
                 landmark_valid = False
                 eye_closed = False
+                if mp_face is not None:
+                    try:
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        res = mp_face.process(rgb)
+                        if res.multi_face_landmarks:
+                            face_visible = True
+                            landmark_confidence = 0.9
+                            landmarks = res.multi_face_landmarks[0].landmark
+                            left_eye_aperture = _eye_aspect_ratio(landmarks, LEFT_EYE)
+                            right_eye_aperture = _eye_aspect_ratio(landmarks, RIGHT_EYE)
+                            avg_ear = (left_eye_aperture + right_eye_aperture) / 2.0
+                            asymmetry = abs(left_eye_aperture - right_eye_aperture)
+                            landmark_valid = True
+                            if bright_enough and sharp_enough and asymmetry <= MAX_EYE_ASYMMETRY:
+                                eye_apertures.append(avg_ear)
+                                eye_asymmetries.append(asymmetry)
+                                eye_closed = avg_ear <= SUSTAINED_EYE_CLOSURE_EAR
+                    except Exception:
+                        face_visible = False
+                        landmark_valid = False
+                        landmark_confidence = 0.0
                 if landmark_confidence is not None:
                     landmark_confidences.append(float(landmark_confidence))
                 if face_visible:
                     face_frames += 1
-                    if mp_face is not None:
-                        try:
-                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            res = mp_face.process(rgb)
-                            if res.multi_face_landmarks:
-                                landmarks = res.multi_face_landmarks[0].landmark
-                                left_eye_aperture = _eye_aspect_ratio(landmarks, LEFT_EYE)
-                                right_eye_aperture = _eye_aspect_ratio(landmarks, RIGHT_EYE)
-                                avg_ear = (left_eye_aperture + right_eye_aperture) / 2.0
-                                asymmetry = abs(left_eye_aperture - right_eye_aperture)
-                                landmark_valid = True
-                                if bright_enough and sharp_enough and asymmetry <= MAX_EYE_ASYMMETRY:
-                                    eye_apertures.append(avg_ear)
-                                    eye_asymmetries.append(asymmetry)
-                                    eye_closed = avg_ear <= SUSTAINED_EYE_CLOSURE_EAR
-                        except Exception:
-                            landmark_valid = False
 
                 usable = bright_enough and sharp_enough and face_visible and landmark_valid
                 if usable:

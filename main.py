@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import concurrent.futures
 from datetime import datetime, timezone
 import math
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import traceback
 from typing import Any
 
@@ -44,6 +46,7 @@ DEBUG_SCAN_ENDPOINT_ENABLED = AI_SERVER_ENV in {"dev", "development", "local", "
     "DEBUG_SCAN_ENDPOINT_ENABLED",
     "",
 ).strip().lower() in {"1", "true", "yes", "on"}
+OPTIONAL_PHRASE_TIMEOUT_SECONDS = 1.5
 
 SCAN_STATUS_PENDING = "pending"
 SCAN_STATUS_MEDIA_READY = "media_ready"
@@ -545,6 +548,15 @@ def _log_step(scan_id: str, step: str, **details: Any) -> None:
     logger.info("scan_id=%s step=%s", scan_id, step)
 
 
+def _elapsed_ms(started_at: float) -> int:
+    return int(round((time.perf_counter() - started_at) * 1000))
+
+
+def _log_perf(scan_id: str, metric: str, elapsed_ms: int | float | None) -> None:
+    value = int(round(float(elapsed_ms or 0)))
+    logger.info("[PERF] %s scan_id=%s value=%s", metric, scan_id, value)
+
+
 def _build_scan_result_response(
     *,
     ok: bool,
@@ -980,6 +992,24 @@ def _transcribe_audio_file(path: str) -> str:
     return transcribe_audio(path)
 
 
+def _transcribe_audio_file_optional(path: str | None, timeout_seconds: float = OPTIONAL_PHRASE_TIMEOUT_SECONDS) -> tuple[str | None, str]:
+    if not path:
+        return None, "audio_missing"
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="phrase-transcription")
+    future = executor.submit(_transcribe_audio_file, path)
+    try:
+        return future.result(timeout=timeout_seconds), "completed"
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        logger.warning("phrase_transcription_timeout timeout_seconds=%s", timeout_seconds)
+        return None, "timeout"
+    except Exception as exc:
+        logger.warning("phrase_transcription_error error=%s", exc)
+        return None, "error"
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def _analyze_video_file(path: str | None) -> dict:
     from video import analyze_video
 
@@ -1277,6 +1307,7 @@ def _critical_validation_errors_allow_result(critical_errors: list[str] | None) 
 
 
 def _process_scan_sync(scan_id: str) -> dict[str, Any]:
+    total_started = time.perf_counter()
     _log_step(scan_id, "validation_start")
     scan_context = _resolve_scan_context(scan_id)
     _log_step(scan_id, "scan_context_loaded", status=scan_context.get("status"))
@@ -1300,7 +1331,10 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         validation_result = fail_validation(FAILURE_REASON_MODEL_NOT_LOADED)
         _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"])
         _log_step(scan_id, "directus_writeback_start")
+        writeback_started = time.perf_counter()
         _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+        _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
+        _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
         return {"status": SCAN_STATUS_FAILED, **validation_result}
 
     media = _merge_media(scan_context)
@@ -1321,8 +1355,10 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     temp_files: list[str] = []
     transcript: str | None = None
     phrase_score: float | None = None
+    phrase_status = "not_required"
     try:
         _log_step(scan_id, "media_download_start")
+        stage_started = time.perf_counter()
         image_path, image_temp = _resolve_media_input(media.image, ".jpg", "image", allow_url=False, allow_local_path=False)
         audio_path, audio_temp = _resolve_media_input(media.audio, ".bin", "audio", allow_url=False, allow_local_path=False)
         video_path, video_temp = _resolve_media_input(media.video, ".mp4", "video", allow_url=False, allow_local_path=False)
@@ -1334,6 +1370,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             temp_files.append(converted)
             audio_path = converted
         resolved_media = Media(image=image_path, audio=audio_path, video=video_path)
+        _log_perf(scan_id, "media_download_ms", _elapsed_ms(stage_started))
         _log_step(
             scan_id,
             "media_download_done",
@@ -1343,14 +1380,18 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         )
 
         _log_step(scan_id, "video_validation_start")
+        stage_started = time.perf_counter()
         video_result = _safe_analyze(_analyze_video_file, resolved_media.video, "video_missing")
+        _log_perf(scan_id, "video_validation_ms", _elapsed_ms(stage_started))
         _log_step(scan_id, "video_validation_done", quality_score=((video_result.get("details") or {}).get("visual_quality_score")))
 
         _log_step(scan_id, "face_validation_start")
+        stage_started = time.perf_counter()
         video_details = (video_result.get("details") or {})
         image_result = None
         if resolved_media.image:
             image_result = _safe_analyze(_analyze_face_image, resolved_media.image, "image_missing")
+        _log_perf(scan_id, "face_validation_ms", _elapsed_ms(stage_started))
         _log_step(
             scan_id,
             "face_validation_done",
@@ -1359,28 +1400,39 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         )
 
         _log_step(scan_id, "audio_validation_start")
+        stage_started = time.perf_counter()
         audio_result = _safe_analyze(_analyze_audio_file, resolved_media.audio, "audio_missing")
+        audio_timings = ((audio_result.get("details") or {}).get("timings_ms") or {}) if isinstance(audio_result, dict) else {}
+        _log_perf(scan_id, "audio_decode_ms", audio_timings.get("audio_decode_ms"))
+        _log_perf(scan_id, "audio_quality_ms", audio_timings.get("audio_quality_ms"))
+        _log_perf(scan_id, "voice_activity_ms", audio_timings.get("voice_activity_ms"))
+        audio_remaining_ms = max(0, _elapsed_ms(stage_started) - int(audio_timings.get("audio_decode_ms") or 0) - int(audio_timings.get("audio_quality_ms") or 0) - int(audio_timings.get("voice_activity_ms") or 0))
+        if audio_remaining_ms:
+            logger.info("[PERF] audio_validation_overhead_ms scan_id=%s value=%s", scan_id, audio_remaining_ms)
         _log_step(scan_id, "audio_validation_done", quality_score=((audio_result.get("details") or {}).get("audio_quality_score")))
 
         _log_step(scan_id, "phrase_validation_start")
-        if VALIDATION_POLICY.require_phrase_match or expected_phrase:
-            if expected_phrase:
-                try:
-                    transcript = _transcribe_audio_file(resolved_media.audio) if resolved_media.audio else None
-                except Exception as exc:
-                    logger.warning("scan_id=%s step=phrase_transcription_error error=%s", scan_id, exc)
-                    transcript = None
+        stage_started = time.perf_counter()
+        if expected_phrase and resolved_media.audio:
+            if VALIDATION_POLICY.require_phrase_match:
+                transcript, phrase_status = _transcribe_audio_file_optional(resolved_media.audio)
+            else:
+                phrase_status = "skipped_optional"
+        elif expected_phrase:
+            phrase_status = "audio_missing"
+        phrase_expected_for_validation = expected_phrase if (VALIDATION_POLICY.require_phrase_match or transcript) else None
         phrase_validation = validate_scan_inputs(
             policy=VALIDATION_POLICY,
             media=resolved_media,
             video_result=video_result,
             audio_result=audio_result,
             image_result=image_result,
-            expected_phrase=expected_phrase,
+            expected_phrase=phrase_expected_for_validation,
             transcript=transcript,
         )
         phrase_score = phrase_validation["quality_scores"].get("phrase_match")
-        _log_step(scan_id, "phrase_validation_done", transcript_present=bool(transcript), phrase_match_score=phrase_score)
+        _log_perf(scan_id, "phrase_optional_ms", _elapsed_ms(stage_started))
+        _log_step(scan_id, "phrase_validation_done", transcript_present=bool(transcript), phrase_match_score=phrase_score, phrase_status=phrase_status)
 
         _log_step(scan_id, "image_validation_start")
         _log_step(
@@ -1419,11 +1471,15 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             validation_result = fail_validation(critical_errors[0], warnings=quality_result.get("warnings"))
             _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=phrase_validation["quality_scores"])
             _log_step(scan_id, "directus_writeback_start")
+            writeback_started = time.perf_counter()
             _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
+            _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
             return {"status": SCAN_STATUS_FAILED, **validation_result}
 
         _log_step(scan_id, "validation_passed", scores=phrase_validation["quality_scores"], warnings=quality_result.get("warnings"))
         _log_step(scan_id, "analysis_start")
+        stage_started = time.perf_counter()
         feature_map, _ = features_from_signals(raw_signals, task=task)
         feature_vector = vector_from_features(feature_map)
         ml_result = ml_runtime.predict(feature_vector)
@@ -1493,6 +1549,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             result=result,
             baseline_eligibility=baseline_eligibility,
         )
+        _log_perf(scan_id, "analysis_ms", _elapsed_ms(stage_started))
         _log_step(scan_id, "analysis_done", risk_level=result.get("risk_level"), confidence=result.get("confidence"))
 
         if identifiers.get("member_id") and identifiers.get("business_profile_id") and baseline_eligibility.get("eligible"):
@@ -1523,10 +1580,17 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
                 "ml": ml_result,
                 "baseline_status_before": baseline_status,
                 "validation": phrase_validation,
+                "phrase_optional": {
+                    "status": phrase_status,
+                    "timeout_seconds": OPTIONAL_PHRASE_TIMEOUT_SECONDS,
+                    "transcript_present": bool(transcript),
+                    "blocking_required": VALIDATION_POLICY.require_phrase_match,
+                },
             }
         )
 
         _log_step(scan_id, "directus_writeback_start")
+        writeback_started = time.perf_counter()
         writeback_status = _write_success(
             scan_id=scan_id,
             scan_context=scan_context,
@@ -1534,13 +1598,18 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             result=result,
             internal_analysis=internal_analysis,
         )
+        _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
         _log_step(scan_id, "directus_writeback_done", writeback_status=writeback_status)
+        _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
         return {"status": SCAN_STATUS_COMPLETED, "failure_reason": None, "writeback_status": writeback_status}
     except ProcessingError as exc:
         validation_result = fail_validation(exc.reason)
         _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"])
         _log_step(scan_id, "directus_writeback_start")
+        writeback_started = time.perf_counter()
         _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+        _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
+        _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
         return {"status": SCAN_STATUS_FAILED, **validation_result}
     finally:
         for path in temp_files:

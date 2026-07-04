@@ -377,6 +377,10 @@ def validate_audio_result(
         warnings.append("audio_too_noisy")
     if not quiet_but_usable and ("audio_too_quiet" in warnings or float(details.get("rms_energy") or details.get("energy") or 0.0) < 0.012):
         warnings.append("audio_too_quiet")
+    if "audio_clipping" in warnings or float(details.get("clipping_ratio") or 0.0) > 0.015:
+        warnings.append("audio_clipping")
+    if "too_much_silence" in warnings or float(details.get("silence_ratio") or 0.0) > 0.55:
+        warnings.append("too_much_silence")
 
     quality = float(details.get("audio_quality_score") or 0.0)
     if quality < policy.min_audio_quality and not quiet_but_usable:

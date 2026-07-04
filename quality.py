@@ -34,8 +34,24 @@ def _signal_summary(
     missing_statuses = {"missing", "open_failed", "load_failed", "empty_audio", "invalid", "invalid_image", "error", None}
     present = details.get("status") not in missing_statuses or score is not None
     disqualifying_warnings = {
-        "video": {"video_too_dark", "video_blurry", "unstable_video", "subject_not_visible", "face_not_visible"},
-        "audio": {"speech_not_detected", "audio_too_noisy"},
+        "video": {
+            "video_too_dark",
+            "video_blurry",
+            "unstable_video",
+            "unstable_camera",
+            "insufficient_usable_frames",
+            "subject_not_visible",
+            "face_not_visible",
+            "landmark_detection_failed",
+        },
+        "audio": {
+            "speech_not_detected",
+            "audio_too_noisy",
+            "audio_too_quiet",
+            "too_much_silence",
+            "audio_clipping",
+            "low_quality_media",
+        },
         "image": {"image_too_dark", "image_blurry", "face_not_visible", "subject_not_visible"},
     }
     if name == "audio" and details.get("quiet_but_usable"):
@@ -119,6 +135,14 @@ def assess_quality(signals: dict, task: Any = None, *, speech_required: bool = F
         status = "weak"
 
     if speech_required and "speech_not_detected" in warnings and audio["present"]:
+        failure_reason = failure_reason or FAILURE_REASON_LOW_QUALITY_MEDIA
+        status = "weak"
+        retake_required = True
+    if set(audio["warnings"]) & {"audio_too_quiet", "too_much_silence", "audio_clipping", "speech_not_detected", "audio_too_noisy"}:
+        failure_reason = failure_reason or FAILURE_REASON_LOW_QUALITY_MEDIA
+        status = "weak"
+        retake_required = True
+    if set(video["warnings"]) & {"video_blurry", "unstable_video", "insufficient_usable_frames", "subject_not_visible", "face_not_visible", "landmark_detection_failed"}:
         failure_reason = failure_reason or FAILURE_REASON_LOW_QUALITY_MEDIA
         status = "weak"
         retake_required = True

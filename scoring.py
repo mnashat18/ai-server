@@ -33,6 +33,10 @@ WARNING_SCORE_PENALTIES = {
     "audio_too_quiet": 0.18,
     "speech_not_detected": 0.22,
     "audio_too_short": 0.1,
+    "too_much_silence": 0.18,
+    "audio_clipping": 0.18,
+    "insufficient_usable_frames": 0.18,
+    "landmark_detection_failed": 0.18,
     "image_blurry": 0.14,
     "image_too_dark": 0.14,
     "low_quality_media": 0.12,
@@ -338,7 +342,7 @@ def _risk_level(readiness_score: int, confidence: float, baseline_flags: list[st
 
 
 def _suggested_action(risk_level: str, confidence: float, quality: dict) -> str:
-    if quality.get("status") == "failed":
+    if quality.get("status") == "failed" or quality.get("retake_required") or quality.get("failure_reason") in {"low_quality_media", "missing_media"}:
         return "rescan_recommended"
     if risk_level == "high_risk":
         return "manager_review"
@@ -379,6 +383,12 @@ def _explanation(
     if "speech_not_detected" in quality.get("warnings", []):
         negatives.append("no usable speech was detected")
         warning_reasons.append("missing or unusable speech reduced confidence")
+    if "too_much_silence" in quality.get("warnings", []):
+        negatives.append("audio was mostly silence")
+        warning_reasons.append("insufficient voice activity reduced confidence")
+    if "audio_clipping" in quality.get("warnings", []):
+        negatives.append("audio was clipped")
+        warning_reasons.append("clipping reduced voice confidence")
     if "video_blurry" in quality.get("warnings", []) or "image_blurry" in quality.get("warnings", []):
         negatives.append("visual media was partially blurred")
         warning_reasons.append("blur reduced visual confidence")
@@ -388,6 +398,12 @@ def _explanation(
     if "subject_not_visible" in quality.get("warnings", []):
         negatives.append("subject visibility was limited")
         warning_reasons.append("limited subject visibility reduced confidence")
+    if "insufficient_usable_frames" in quality.get("warnings", []):
+        negatives.append("too few usable video frames were available")
+        warning_reasons.append("insufficient usable frames reduced confidence")
+    if "landmark_detection_failed" in quality.get("warnings", []):
+        negatives.append("face landmarks were not reliably detected")
+        warning_reasons.append("unreliable face detection reduced confidence")
     if "face_not_visible" in quality.get("warnings", []) or "unstable_video" in quality.get("warnings", []):
         negatives.append("face visibility was weak")
         warning_reasons.append("weak face visibility reduced confidence")
@@ -415,6 +431,7 @@ def _explanation(
         lead = f"{lead}. Score and confidence were reduced because {', '.join(unique_reasons[:4])}"
     scan_unreliable = (
         quality.get("status") == "failed"
+        or quality.get("retake_required")
         or quality.get("failure_reason") in {"low_quality_media", "missing_media"}
         or bool({"video", "audio"} & set(quality.get("missing_modalities") or []))
         or confidence < 0.45
@@ -549,6 +566,7 @@ def compute_result(
     readiness_score = int(round((clamp01(fused_score, 0.0) or 0.0) * 100))
     scan_unreliable = (
         quality.get("status") == "failed"
+        or quality.get("retake_required")
         or quality.get("failure_reason") in {"low_quality_media", "missing_media"}
         or bool({"video", "audio"} & set(quality.get("missing_modalities") or []))
         or confidence < 0.45
@@ -576,8 +594,8 @@ def compute_result(
 
     return {
         "status": "completed",
-        "retake_required": False,
-        "failure_reason": None,
+        "retake_required": bool(scan_unreliable or quality.get("retake_required")),
+        "failure_reason": quality.get("failure_reason") if bool(scan_unreliable or quality.get("retake_required")) else None,
         "readiness_score": readiness_score,
         "observed_fatigue_score": observed_fatigue_score,
         "risk_level": risk_level,
