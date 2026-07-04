@@ -1,7 +1,9 @@
 import time
+import wave
 
 import numpy as np
 
+from logger import get_logger
 from utils import clamp01, clean_warning_codes, safe_number
 
 try:
@@ -14,6 +16,11 @@ try:
 except Exception:  # pragma: no cover
     whisper = None
 
+try:
+    from scipy import signal
+except Exception:  # pragma: no cover
+    signal = None
+
 MIN_AUDIO_DURATION_SEC = 1.5
 MIN_RMS_ENERGY = 0.012
 MAX_REASONABLE_PEAK = 0.98
@@ -23,10 +30,73 @@ CLIPPING_SAMPLE_THRESHOLD = 0.98
 MAX_CLIPPING_RATIO = 0.015
 _WHISPER_MODEL = None
 _WHISPER_MODEL_NAME = None
+logger = get_logger()
 
 
 def _safe_mean(values) -> float:
     return float(np.mean(values)) if values is not None and len(values) else 0.0
+
+
+def _pcm_bytes_to_float32(raw: bytes, sample_width: int) -> np.ndarray:
+    if sample_width == 1:
+        data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+        return (data - 128.0) / 128.0
+    if sample_width == 2:
+        return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if sample_width == 3:
+        bytes_view = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+        values = (
+            bytes_view[:, 0].astype(np.int32)
+            | (bytes_view[:, 1].astype(np.int32) << 8)
+            | (bytes_view[:, 2].astype(np.int32) << 16)
+        )
+        values = np.where(values & 0x800000, values - 0x1000000, values)
+        return values.astype(np.float32) / 8388608.0
+    if sample_width == 4:
+        return np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+    raise ValueError("unsupported_wav_sample_width")
+
+
+def _resample_if_needed(y: np.ndarray, sr: int) -> tuple[np.ndarray, int]:
+    if sr == TARGET_SAMPLE_RATE:
+        return y.astype(np.float32, copy=False), sr
+    if signal is None:
+        return y.astype(np.float32, copy=False), sr
+    gcd = int(np.gcd(sr, TARGET_SAMPLE_RATE))
+    resampled = signal.resample_poly(y, TARGET_SAMPLE_RATE // gcd, sr // gcd)
+    return resampled.astype(np.float32, copy=False), TARGET_SAMPLE_RATE
+
+
+def _decode_wav_slice(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
+    with wave.open(audio_path, "rb") as handle:
+        source_sr = int(handle.getframerate())
+        channels = int(handle.getnchannels())
+        sample_width = int(handle.getsampwidth())
+        frame_count = int(handle.getnframes())
+        source_duration_seconds = frame_count / float(source_sr) if source_sr else 0.0
+        frames_to_read = min(frame_count, int(round(MAX_AUDIO_ANALYSIS_SEC * source_sr)))
+        raw = handle.readframes(frames_to_read)
+
+    if not raw or source_sr <= 0 or channels <= 0:
+        return np.array([], dtype=np.float32), source_sr, source_duration_seconds, 0.0, "wave", 1
+
+    y = _pcm_bytes_to_float32(raw, sample_width)
+    if channels > 1:
+        y = y.reshape(-1, channels).mean(axis=1)
+    y, sr = _resample_if_needed(y, source_sr)
+    analysis_duration_seconds = len(y) / float(sr) if sr else 0.0
+    return y, sr, source_duration_seconds, analysis_duration_seconds, "wave", 1
+
+
+def _decode_audio_once(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
+    try:
+        return _decode_wav_slice(audio_path)
+    except Exception:
+        if librosa is None:
+            raise
+        y, sr = librosa.load(audio_path, sr=TARGET_SAMPLE_RATE, mono=True, duration=MAX_AUDIO_ANALYSIS_SEC)
+        duration_seconds = len(y) / float(sr) if sr else 0.0
+        return y, sr, duration_seconds, duration_seconds, "librosa", 1
 
 
 def _load_whisper_model():
@@ -74,13 +144,15 @@ def analyze_audio(audio_path: str) -> dict:
 
     try:
         decode_started = time.perf_counter()
-        full_duration_seconds = None
-        try:
-            full_duration_seconds = float(librosa.get_duration(path=audio_path))
-        except Exception:
-            full_duration_seconds = None
-        y, sr = librosa.load(audio_path, sr=TARGET_SAMPLE_RATE, mono=True, duration=MAX_AUDIO_ANALYSIS_SEC)
+        y, sr, source_duration_seconds, analyzed_duration_seconds, decode_backend, decode_count = _decode_audio_once(audio_path)
         timings_ms["audio_decode_ms"] = int(round((time.perf_counter() - decode_started) * 1000))
+        logger.info(
+            "[AUDIO_DECODE_DETAIL] backend=%s decode_count=%s source_duration_ms=%s analysis_duration_ms=%s",
+            decode_backend,
+            decode_count,
+            int(round(source_duration_seconds * 1000)),
+            int(round(analyzed_duration_seconds * 1000)),
+        )
     except Exception:
         return {
             "score": None,
@@ -100,8 +172,7 @@ def analyze_audio(audio_path: str) -> dict:
         }
 
     quality_started = time.perf_counter()
-    duration_seconds = full_duration_seconds if full_duration_seconds is not None else (len(y) / float(sr) if sr else 0.0)
-    analyzed_duration_seconds = len(y) / float(sr) if sr else 0.0
+    duration_seconds = source_duration_seconds
     frame_length = min(2048, max(512, int(sr * 0.032)))
     hop_length = max(256, int(frame_length / 4))
     rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
