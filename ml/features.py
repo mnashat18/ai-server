@@ -30,7 +30,8 @@ def _bool(value) -> float:
 def _get_detail(details: dict, key: str, default=0.0) -> float:
     if not details:
         return float(default)
-    return float(details.get(key, default))
+    value = details.get(key, default)
+    return float(value) if value is not None else float(default)
 
 
 def _extract_task(task) -> dict:

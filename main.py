@@ -1306,6 +1306,19 @@ def _critical_validation_errors_allow_result(critical_errors: list[str] | None) 
     return errors.issubset({"missing_media", "unreadable_media"})
 
 
+def _face_eye_evidence_unreliable(warnings: list[str] | None, video_details: dict | None, image_details: dict | None) -> bool:
+    warning_set = set(warnings or [])
+    if warning_set & {"face_not_visible", "subject_not_visible", "landmark_detection_failed", "insufficient_usable_frames"}:
+        return True
+    video_details = video_details or {}
+    image_details = image_details or {}
+    if video_details.get("reliable_eye_landmarks") is False and int(video_details.get("face_frames") or 0) <= 0:
+        return True
+    if image_details and image_details.get("face_detected") is False and image_details.get("avg_ear") is None:
+        return True
+    return False
+
+
 def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     total_started = time.perf_counter()
     _log_step(scan_id, "validation_start")
@@ -1476,6 +1489,53 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
             _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
             return {"status": SCAN_STATUS_FAILED, **validation_result}
+
+        if _face_eye_evidence_unreliable(quality_result.get("warnings"), video_details, ((image_result or {}).get("details") or {})):
+            quality_result["failure_reason"] = quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA
+            quality_result["retake_required"] = True
+            quality_result["suggested_action"] = "rescan_recommended"
+            quality_result["status"] = "weak"
+            quality_result["weak"] = True
+            result = _quality_failure_response(
+                scan_id,
+                quality_result,
+                {"quality": quality_result, "validation": phrase_validation, "signals": raw_signals},
+                {},
+            )
+            result.update(
+                {
+                    "result_status": "retake_required",
+                    "explanation": "Face and eye landmarks were not reliably detected, so the scan could not be assessed. Please retake with your face clearly visible.",
+                    "expected_phrase": expected_phrase,
+                    "phrase_match_score": phrase_score,
+                    "audio_quality_score": phrase_validation["quality_scores"].get("audio"),
+                    "video_quality_score": phrase_validation["quality_scores"].get("video"),
+                    "image_quality_score": phrase_validation["quality_scores"].get("image"),
+                    "validation_warnings": quality_result.get("warnings"),
+                }
+            )
+            internal_analysis = sanitize_payload(
+                {
+                    "quality": quality_result,
+                    "signals": raw_signals,
+                    "validation": phrase_validation,
+                    "failure_reason": "unreliable_face_eye_evidence",
+                }
+            )
+            _log_step(scan_id, "validation_retake_required", reason="unreliable_face_eye_evidence", warnings=quality_result.get("warnings"))
+            _log_step(scan_id, "directus_writeback_start")
+            writeback_started = time.perf_counter()
+            writeback_status = _write_success(
+                scan_id=scan_id,
+                scan_context=scan_context,
+                identifiers=identifiers,
+                result=result,
+                internal_analysis=internal_analysis,
+            )
+            _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
+            _log_step(scan_id, "directus_writeback_done", writeback_status=writeback_status)
+            _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
+            return {"status": SCAN_STATUS_COMPLETED, "failure_reason": None, "writeback_status": writeback_status}
 
         _log_step(scan_id, "validation_passed", scores=phrase_validation["quality_scores"], warnings=quality_result.get("warnings"))
         _log_step(scan_id, "analysis_start")
