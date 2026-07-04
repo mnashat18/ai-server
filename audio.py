@@ -37,6 +37,10 @@ def _safe_mean(values) -> float:
     return float(np.mean(values)) if values is not None and len(values) else 0.0
 
 
+def _elapsed_ms(started_at: float) -> int:
+    return int(round((time.perf_counter() - started_at) * 1000))
+
+
 def _pcm_bytes_to_float32(raw: bytes, sample_width: int) -> np.ndarray:
     if sample_width == 1:
         data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
@@ -172,20 +176,42 @@ def analyze_audio(audio_path: str) -> dict:
         }
 
     quality_started = time.perf_counter()
+    quality_steps_ms: dict[str, int] = {}
     duration_seconds = source_duration_seconds
     frame_length = min(2048, max(512, int(sr * 0.032)))
     hop_length = max(256, int(frame_length / 4))
+    step_started = time.perf_counter()
     rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    quality_steps_ms["rms_ms"] = _elapsed_ms(step_started)
+    step_started = time.perf_counter()
     zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame_length, hop_length=hop_length)[0]
+    quality_steps_ms["zcr_ms"] = _elapsed_ms(step_started)
+    step_started = time.perf_counter()
     centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
+    quality_steps_ms["spectral_centroid_ms"] = _elapsed_ms(step_started)
+    step_started = time.perf_counter()
     flatness = librosa.feature.spectral_flatness(y=y, hop_length=hop_length)[0]
+    quality_steps_ms["spectral_flatness_ms"] = _elapsed_ms(step_started)
+    step_started = time.perf_counter()
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5, hop_length=hop_length)
+    quality_steps_ms["mfcc_ms"] = _elapsed_ms(step_started)
+    step_started = time.perf_counter()
     peak_volume = float(np.max(np.abs(y))) if len(y) else 0.0
     clipping_ratio = float(np.mean(np.abs(y) >= CLIPPING_SAMPLE_THRESHOLD)) if len(y) else 0.0
     rms_energy = _safe_mean(rms)
     silence_ratio = float(np.mean(rms < max(MIN_RMS_ENERGY * 0.6, rms_energy * 0.35))) if len(rms) else 1.0
     noise_estimate = float(np.clip((_safe_mean(flatness) * 0.75) + (silence_ratio * 0.25), 0.0, 1.0))
+    quality_steps_ms["derived_metrics_ms"] = _elapsed_ms(step_started)
     timings_ms["audio_quality_ms"] = int(round((time.perf_counter() - quality_started) * 1000))
+    logger.info(
+        "[AUDIO_QUALITY_DETAIL] rms_ms=%s zcr_ms=%s spectral_centroid_ms=%s spectral_flatness_ms=%s mfcc_ms=%s derived_metrics_ms=%s",
+        quality_steps_ms["rms_ms"],
+        quality_steps_ms["zcr_ms"],
+        quality_steps_ms["spectral_centroid_ms"],
+        quality_steps_ms["spectral_flatness_ms"],
+        quality_steps_ms["mfcc_ms"],
+        quality_steps_ms["derived_metrics_ms"],
+    )
 
     voice_started = time.perf_counter()
     speech_presence_score = float(
@@ -303,5 +329,6 @@ def analyze_audio(audio_path: str) -> dict:
         "audio_warnings": clean_warning_codes(warnings),
         "silent": silence_ratio > 0.8 or rms_energy < (MIN_RMS_ENERGY * 0.5),
         "timings_ms": timings_ms,
+        "audio_quality_timings_ms": quality_steps_ms,
     }
     return {"score": details["audio_confidence"], "details": details}
