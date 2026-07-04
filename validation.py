@@ -353,8 +353,6 @@ def validate_audio_result(
 ) -> dict[str, Any]:
     details = ((audio_result or {}).get("details") or {}) if audio_result else {}
     warnings = clean_warning_codes(details.get("audio_warnings") or [])
-    if not speech_required:
-        warnings = [warning for warning in warnings if warning != "speech_not_detected"]
     quality_scores = {"audio": safe_number(details.get("audio_quality_score"))}
     status = details.get("status")
 
@@ -371,7 +369,14 @@ def validate_audio_result(
     quiet_but_usable = bool(details.get("quiet_but_usable"))
     if duration < policy.min_audio_seconds:
         warnings.append("audio_too_short")
-    if speech_required and ("speech_not_detected" in warnings or float(details.get("speech_presence_score") or 0.0) < 0.35):
+    usable_speech_detected = bool(details.get("usable_speech_detected"))
+    speech_state = str(details.get("speech_state") or "").strip().lower()
+    if (
+        "speech_not_detected" in warnings
+        or speech_state == "no_speech"
+        or not usable_speech_detected
+        or float(details.get("speech_presence_score") or 0.0) < 0.35
+    ):
         warnings.append("speech_not_detected")
     if "audio_too_noisy" in warnings or float(details.get("noise_estimate") or 0.0) > 0.72:
         warnings.append("audio_too_noisy")

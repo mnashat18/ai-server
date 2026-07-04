@@ -688,7 +688,7 @@ class DirectusClient:
         if risk_level == "high_risk":
             severity = "critical" if confidence >= 0.8 else "high"
             title = "High readiness risk detected"
-            message = "A scan requires manager review before safety-critical work."
+            message = "Do not continue safety-sensitive work. Supervisor review is required."
         elif risk_level == "elevated_fatigue":
             if confidence < 0.8:
                 return None
@@ -714,6 +714,43 @@ class DirectusClient:
             },
         )
 
+    def list_readiness_alert_recipients(
+        self,
+        *,
+        business_profile_id: Any,
+        target_user_id: Any,
+    ) -> list[Any]:
+        if not business_profile_id:
+            return []
+        rows = self.list_items(
+            "business_profile_members",
+            filters={
+                "filter[business_profile][_eq]": business_profile_id,
+                "filter[status][_in]": "active,accepted",
+                "filter[member_role][_in]": "owner,hr,manager,manger",
+            },
+            fields=[
+                "id",
+                "user",
+                "user.id",
+                "member_role",
+                "status",
+                "business_profile",
+            ],
+            limit=50,
+        )
+        recipients: list[Any] = []
+        excluded = str(_relation_id(target_user_id) or "").strip()
+        seen: set[str] = set()
+        for row in rows or []:
+            user_id = _relation_id((row or {}).get("user"))
+            text = str(user_id or "").strip()
+            if not text or text == excluded or text in seen:
+                continue
+            seen.add(text)
+            recipients.append(user_id)
+        return recipients
+
     def create_notification(
         self,
         *,
@@ -731,7 +768,7 @@ class DirectusClient:
             {
                 "user": user_id,
                 "title": "Readiness alert",
-                "body": "A team member has a scan result that needs review.",
+                "body": "Do not continue safety-sensitive work. Supervisor review is required.",
                 "type": "alert",
                 "status": "unread",
                 "link_id": alert_id,

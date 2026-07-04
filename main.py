@@ -901,6 +901,53 @@ def _identifier_payload(scan_context: dict) -> dict:
     }
 
 
+def _high_risk_evidence_summary(result: dict, internal_analysis: dict) -> str:
+    quality = (internal_analysis or {}).get("quality") or {}
+    warnings = set(quality.get("warnings") or result.get("validation_warnings") or [])
+    parts: list[str] = []
+    if "sustained_eye_closure" in warnings:
+        parts.append("sustained_eye_closure")
+    if "speech_not_detected" in warnings:
+        parts.append("speech_not_detected")
+    if "too_much_silence" in warnings:
+        parts.append("too_much_silence")
+    if not parts:
+        parts.append("score_confidence_policy")
+    return ",".join(parts[:4])
+
+
+def _dispatch_high_risk_notifications(
+    *,
+    scan_id: str,
+    alert: dict | None,
+    identifiers: dict,
+    risk_level: str,
+) -> str:
+    if not alert:
+        return "not_available"
+    alert_id = _relation_id(alert.get("id"))
+    if not alert_id:
+        return "not_available"
+    recipients = directus.list_readiness_alert_recipients(
+        business_profile_id=identifiers.get("business_profile_id"),
+        target_user_id=identifiers.get("user_id"),
+    )
+    if not recipients:
+        return "not_available"
+    created = 0
+    for user_id in recipients:
+        directus.create_notification(
+            user_id=user_id,
+            business_profile_id=identifiers.get("business_profile_id"),
+            alert_id=alert_id,
+            scan_id=scan_id,
+            member_id=identifiers.get("member_id"),
+            risk_level=risk_level,
+        )
+        created += 1
+    return "attempted" if created else "not_available"
+
+
 def _expected_phrase(scan_context: dict) -> str | None:
     return _safe_string(scan_context.get("expected_phrase"), max_len=500)
 
@@ -1082,7 +1129,7 @@ def _quality_failure_response(scan_id: str, quality_result: dict, diagnostics: d
         "retake_required": True,
         "failure_reason": quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA,
         "readiness_score": 35 if (quality_result.get("failure_reason") == FAILURE_REASON_MISSING_MEDIA) else 45,
-        "risk_level": "low_focus",
+        "risk_level": None,
         "confidence": 0.2,
         "camera_confidence": None,
         "voice_confidence": None,
@@ -1208,6 +1255,8 @@ def _result_status_from_outcome(
     result: dict,
     baseline_eligibility: dict,
 ) -> str:
+    if result.get("risk_level") == "high_risk":
+        return "scored"
     if quality_result.get("retake_required") or result.get("retake_required") or quality_result.get("failure_reason") in {"low_quality_media", "missing_media"}:
         return "retake_required"
     task_completion_status = baseline_eligibility.get("task_completion_status")
@@ -1282,6 +1331,15 @@ def _write_success(
         logger.warning("scan_request_update_failed scan_id=%s error=%s", scan_id, exc)
         status["scan_request"] = f"failed:{exc}"
 
+    high_risk_detected = result.get("risk_level") == "high_risk"
+    high_risk_evidence = _high_risk_evidence_summary(result, internal_analysis)
+    logger.info("[HIGH_RISK] detected=%s", str(bool(high_risk_detected)).lower())
+    logger.info("[HIGH_RISK] evidence=%s", high_risk_evidence)
+    logger.info("[HIGH_RISK] final_state=%s", result.get("risk_level") or "retake_required")
+
+    alert_result = "skipped"
+    notification_dispatch = "not_available"
+    alert = None
     try:
         alert = directus.create_alert_if_needed(
             risk_level=result["risk_level"],
@@ -1292,10 +1350,28 @@ def _write_success(
             department_id=identifiers.get("department_id"),
             user_id=identifiers.get("user_id"),
         )
-        status["alert"] = "created" if alert else "skipped"
+        alert_result = "created" if alert else "skipped"
+        status["alert"] = alert_result
     except Exception as exc:
         logger.warning("alert_write_failed scan_id=%s error=%s", scan_id, exc)
+        alert_result = "failed"
+        notification_dispatch = "failed" if high_risk_detected else "not_available"
         status["alert"] = f"failed:{exc}"
+    if high_risk_detected and alert:
+        try:
+            notification_dispatch = _dispatch_high_risk_notifications(
+                scan_id=scan_id,
+                alert=alert,
+                identifiers=identifiers,
+                risk_level=result["risk_level"],
+            )
+            status["notification_dispatch"] = notification_dispatch
+        except Exception as exc:
+            logger.warning("notification_dispatch_failed scan_id=%s error=%s", scan_id, exc)
+            notification_dispatch = "failed"
+            status["notification_dispatch"] = f"failed:{exc}"
+    logger.info("[HIGH_RISK] alert_result=%s", alert_result)
+    logger.info("[HIGH_RISK] notification_dispatch=%s", notification_dispatch)
     return status
 
 

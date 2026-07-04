@@ -321,15 +321,19 @@ def _invalid_scan_outcome(readiness_score: int, confidence: float, quality: dict
     return adjusted_score, adjusted_confidence
 
 
+def _confirmed_sustained_eye_closure(quality: dict) -> bool:
+    return "sustained_eye_closure" in set(quality.get("warnings") or [])
+
+
 def _risk_level(readiness_score: int, confidence: float, baseline_flags: list[str], quality: dict) -> str:
     quality_failed = quality.get("status") == "failed"
     media_quality_too_weak = quality.get("failure_reason") in {"low_quality_media", "missing_media"}
     missing_major_media = bool({"video", "audio"} & set(quality.get("missing_modalities") or []))
-    sustained_eye_closure = "sustained_eye_closure" in set(quality.get("warnings") or [])
+    sustained_eye_closure = _confirmed_sustained_eye_closure(quality)
+    if sustained_eye_closure:
+        return "high_risk"
     if quality_failed or media_quality_too_weak or missing_major_media or confidence < 0.45:
         return "low_focus"
-    if sustained_eye_closure:
-        return "elevated_fatigue" if confidence >= 0.5 else "low_focus"
     if quality.get("weak") and readiness_score < 52 and not baseline_flags:
         return "low_focus"
     if readiness_score < 35 and confidence >= 0.62:
@@ -341,11 +345,11 @@ def _risk_level(readiness_score: int, confidence: float, baseline_flags: list[st
     return "stable"
 
 
-def _suggested_action(risk_level: str, confidence: float, quality: dict) -> str:
-    if quality.get("status") == "failed" or quality.get("retake_required") or quality.get("failure_reason") in {"low_quality_media", "missing_media"}:
-        return "rescan_recommended"
+def _suggested_action(risk_level: str | None, confidence: float, quality: dict) -> str:
     if risk_level == "high_risk":
         return "manager_review"
+    if quality.get("status") == "failed" or quality.get("retake_required") or quality.get("failure_reason") in {"low_quality_media", "missing_media"}:
+        return "rescan_recommended"
     if risk_level == "elevated_fatigue":
         return "rest_advised"
     if risk_level == "low_focus":
@@ -358,7 +362,7 @@ def _suggested_action(risk_level: str, confidence: float, quality: dict) -> str:
 def _explanation(
     profiles: dict[str, dict],
     quality: dict,
-    risk_level: str,
+    risk_level: str | None,
     confidence: float,
     baseline_notes: list[str] | None = None,
 ) -> str:
@@ -429,6 +433,7 @@ def _explanation(
     if warning_reasons:
         unique_reasons = clean_warning_codes(warning_reasons)
         lead = f"{lead}. Score and confidence were reduced because {', '.join(unique_reasons[:4])}"
+    confirmed_sustained_eye_closure = _confirmed_sustained_eye_closure(quality)
     scan_unreliable = (
         quality.get("status") == "failed"
         or quality.get("retake_required")
@@ -436,6 +441,8 @@ def _explanation(
         or bool({"video", "audio"} & set(quality.get("missing_modalities") or []))
         or confidence < 0.45
     )
+    if confirmed_sustained_eye_closure:
+        scan_unreliable = False
     if scan_unreliable:
         tail = "The scan could not be assessed reliably. Please repeat it with clear face visibility, better lighting, steady video, and usable audio."
     elif risk_level == "stable":
@@ -564,6 +571,7 @@ def compute_result(
         ml_result=ml_result,
     )
     readiness_score = int(round((clamp01(fused_score, 0.0) or 0.0) * 100))
+    confirmed_sustained_eye_closure = _confirmed_sustained_eye_closure(quality)
     scan_unreliable = (
         quality.get("status") == "failed"
         or quality.get("retake_required")
@@ -572,10 +580,13 @@ def compute_result(
         or confidence < 0.45
         or (quality.get("weak") and readiness_score < 52 and not baseline_flags)
     )
+    if confirmed_sustained_eye_closure:
+        scan_unreliable = False
+        readiness_score = min(readiness_score, 30)
     if scan_unreliable:
         readiness_score, confidence = _invalid_scan_outcome(readiness_score, confidence, quality)
-    risk_level = _risk_level(readiness_score, confidence, baseline_flags, quality)
-    if risk_level not in VALID_RISK_LEVELS:
+    risk_level = None if scan_unreliable else _risk_level(readiness_score, confidence, baseline_flags, quality)
+    if risk_level is not None and risk_level not in VALID_RISK_LEVELS:
         risk_level = "low_focus"
     suggested_action = _suggested_action(risk_level, confidence, quality)
     if suggested_action not in VALID_ACTIONS:
@@ -591,11 +602,12 @@ def compute_result(
         "task": safe_number(task_score),
     }
     observed_fatigue_score = int(round((1.0 - (clamp01(fused_score, 0.0) or 0.0)) * 100))
+    retake_required = bool((scan_unreliable or quality.get("retake_required")) and not confirmed_sustained_eye_closure)
 
     return {
         "status": "completed",
-        "retake_required": bool(scan_unreliable or quality.get("retake_required")),
-        "failure_reason": quality.get("failure_reason") if bool(scan_unreliable or quality.get("retake_required")) else None,
+        "retake_required": retake_required,
+        "failure_reason": quality.get("failure_reason") if retake_required else None,
         "readiness_score": readiness_score,
         "observed_fatigue_score": observed_fatigue_score,
         "risk_level": risk_level,

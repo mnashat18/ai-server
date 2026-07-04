@@ -81,7 +81,6 @@ def assess_quality(signals: dict, task: Any = None, *, speech_required: bool = F
         signals.get("voice"),
         0.4,
         "audio_warnings",
-        suppressed_warnings=None if speech_required else {"speech_not_detected"},
     )
     image = _signal_summary("image", signals.get("camera"), 0.38, "image_warnings")
 
