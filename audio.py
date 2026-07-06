@@ -1,3 +1,7 @@
+import os
+import shutil
+import subprocess
+import tempfile
 import time
 import wave
 
@@ -26,6 +30,7 @@ MIN_RMS_ENERGY = 0.012
 MAX_REASONABLE_PEAK = 0.98
 TARGET_SAMPLE_RATE = 16000
 MAX_AUDIO_ANALYSIS_SEC = 3.0
+FFMPEG_CONVERSION_TIMEOUT_SECONDS = float(os.getenv("AUDIO_FFMPEG_CONVERSION_TIMEOUT_SECONDS", "3.5"))
 CLIPPING_SAMPLE_THRESHOLD = 0.98
 MAX_CLIPPING_RATIO = 0.015
 _WHISPER_MODEL = None
@@ -118,15 +123,69 @@ def _decode_wav_slice(audio_path: str) -> tuple[np.ndarray, int, float, float, s
     return y, sr, source_duration_seconds, analysis_duration_seconds, "wave", 1
 
 
-def _decode_audio_once(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
+def _decode_with_ffmpeg(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg_not_installed")
+
+    fd, converted_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        audio_path,
+        "-t",
+        str(MAX_AUDIO_ANALYSIS_SEC),
+        "-ac",
+        "1",
+        "-ar",
+        str(TARGET_SAMPLE_RATE),
+        "-f",
+        "wav",
+        converted_path,
+    ]
     try:
-        return _decode_wav_slice(audio_path)
-    except Exception:
-        if librosa is None:
-            raise
-        y, sr = librosa.load(audio_path, sr=TARGET_SAMPLE_RATE, mono=True, duration=MAX_AUDIO_ANALYSIS_SEC)
-        duration_seconds = len(y) / float(sr) if sr else 0.0
-        return y, sr, duration_seconds, duration_seconds, "librosa", 1
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=FFMPEG_CONVERSION_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.remove(converted_path)
+        except Exception:
+            pass
+        raise TimeoutError("audio_decode_timeout") from exc
+    except Exception as exc:
+        try:
+            os.remove(converted_path)
+        except Exception:
+            pass
+        raise RuntimeError("audio_decode_failed") from exc
+
+    try:
+        return _decode_wav_slice(converted_path)
+    finally:
+        try:
+            os.remove(converted_path)
+        except Exception:
+            pass
+
+
+def _decode_audio_once(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
+    _, ext = os.path.splitext(audio_path)
+    if ext.lower() in {".wav", ".wave"}:
+        try:
+            return _decode_wav_slice(audio_path)
+        except Exception:
+            return _decode_with_ffmpeg(audio_path)
+    return _decode_with_ffmpeg(audio_path)
 
 
 def _load_whisper_model():
@@ -183,6 +242,14 @@ def analyze_audio(audio_path: str) -> dict:
             int(round(source_duration_seconds * 1000)),
             int(round(analyzed_duration_seconds * 1000)),
         )
+    except TimeoutError:
+        return {
+            "score": None,
+            "details": {
+                "status": "load_failed",
+                "audio_warnings": ["audio_decode_timeout"],
+            },
+        }
     except Exception:
         return {
             "score": None,

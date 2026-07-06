@@ -33,6 +33,7 @@ FAILURE_MESSAGES = {
     "analysis_exception": "Something went wrong while analyzing your scan. Please try again.",
     "model_not_loaded": "The AI model is not ready. Please try again later.",
     "directus_download_failed": "We could not load your scan media. Please try again.",
+    "audio_validation_timeout": "Audio validation timed out. Please record the voice again.",
     "writeback_failed": "We could not save the scan result. Please try again.",
 }
 

@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import traceback
+import sys
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
@@ -47,6 +48,7 @@ DEBUG_SCAN_ENDPOINT_ENABLED = AI_SERVER_ENV in {"dev", "development", "local", "
     "",
 ).strip().lower() in {"1", "true", "yes", "on"}
 OPTIONAL_PHRASE_TIMEOUT_SECONDS = 1.5
+TRANSCRIPTION_TIMEOUT_SECONDS = float(os.getenv("AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS", "4.0"))
 FAST_SCAN_MODE = os.getenv("FAST_SCAN_MODE", "true").strip().lower() in {"1", "true", "yes", "on"}
 FAST_SCAN_DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("FAST_SCAN_DOWNLOAD_TIMEOUT_SECONDS", "2.5"))
 MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS = float(os.getenv("MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS", "8.0"))
@@ -76,6 +78,7 @@ FAILURE_REASON_PHRASE_MISMATCH = "phrase_mismatch"
 FAILURE_REASON_TRANSCRIPTION_FAILED = "transcription_failed"
 FAILURE_REASON_EXPECTED_PHRASE_MISSING = "expected_phrase_missing"
 FAILURE_REASON_LOW_QUALITY_MEDIA = "low_quality_media"
+FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT = "audio_validation_timeout"
 FAILURE_REASON_MODEL_NOT_LOADED = "model_not_loaded"
 FAILURE_REASON_DIRECTUS_DOWNLOAD_FAILED = "directus_download_failed"
 FAILURE_REASON_ANALYSIS_EXCEPTION = "analysis_exception"
@@ -588,6 +591,15 @@ def _log_validation_decision(
     logger.info("[VALIDATION_DECISION] terminal_reason scan_id=%s value=%s", scan_id, terminal_reason)
 
 
+def _log_validation_lifecycle(scan_id: str, *, all_workers_terminal: bool, running_modalities: list[str]) -> None:
+    logger.info(
+        "[VALIDATION_LIFECYCLE] all_workers_terminal=%s running_modalities=%s scan_id=%s",
+        str(bool(all_workers_terminal)).lower(),
+        running_modalities,
+        scan_id,
+    )
+
+
 def _shutdown_executor(executor: concurrent.futures.ThreadPoolExecutor | None) -> None:
     if executor is None:
         return
@@ -843,8 +855,36 @@ def _convert_audio_to_wav(path: str) -> str:
         raise ProcessingError(FAILURE_REASON_ANALYSIS_EXCEPTION, "ffmpeg not installed")
     fd, out = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
-    cmd = ["ffmpeg", "-y", "-i", path, "-ac", "1", "-ar", "16000", out]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        path,
+        "-t",
+        "3.0",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        out,
+    ]
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=3.5,
+        )
+    except subprocess.TimeoutExpired as exc:
+        remove_temp_file(out)
+        raise ProcessingError(FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, "audio conversion timed out") from exc
+    except Exception as exc:
+        remove_temp_file(out)
+        raise ProcessingError(FAILURE_REASON_ANALYSIS_EXCEPTION, f"audio conversion failed: {exc}") from exc
     return out
 
 
@@ -1123,28 +1163,51 @@ def _analyze_audio_file(path: str | None) -> dict:
     return analyze_audio(path)
 
 
-def _transcribe_audio_file(path: str) -> str:
-    from audio import transcribe_audio
-
-    return transcribe_audio(path)
+def _transcribe_audio_file(path: str, timeout_seconds: float | None = None) -> str:
+    if not path:
+        raise RuntimeError("audio_missing")
+    effective_timeout = TRANSCRIPTION_TIMEOUT_SECONDS if timeout_seconds is None else float(timeout_seconds)
+    cmd = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; "
+            "from audio import transcribe_audio; "
+            "print(transcribe_audio(sys.argv[1]))"
+        ),
+        path,
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+            timeout=effective_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("transcription_timeout") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        raise RuntimeError(stderr or "transcription_failed") from exc
+    transcript = (completed.stdout or "").strip()
+    if not transcript:
+        raise RuntimeError("transcription_failed")
+    return transcript
 
 
 def _transcribe_audio_file_optional(path: str | None, timeout_seconds: float = OPTIONAL_PHRASE_TIMEOUT_SECONDS) -> tuple[str | None, str]:
     if not path:
         return None, "audio_missing"
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="phrase-transcription")
-    future = executor.submit(_transcribe_audio_file, path)
     try:
-        return future.result(timeout=timeout_seconds), "completed"
-    except concurrent.futures.TimeoutError:
-        future.cancel()
+        return _transcribe_audio_file(path, timeout_seconds=timeout_seconds), "completed"
+    except TimeoutError:
         logger.warning("phrase_transcription_timeout timeout_seconds=%s", timeout_seconds)
         return None, "timeout"
     except Exception as exc:
         logger.warning("phrase_transcription_error error=%s", exc)
         return None, "error"
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _analyze_video_file(path: str | None) -> dict:
@@ -1489,6 +1552,41 @@ def _face_eye_evidence_unreliable(warnings: list[str] | None, video_details: dic
     return False
 
 
+def _required_modality_gate(
+    quality_result: dict,
+    *,
+    timed_out_modalities: list[str],
+) -> tuple[str | None, list[str]]:
+    media_quality = quality_result.get("media_quality") or {}
+    required_modalities: list[str] = []
+    for modality, required in [
+        ("video", VALIDATION_POLICY.require_video),
+        ("audio", VALIDATION_POLICY.require_audio),
+        ("image", VALIDATION_POLICY.require_image),
+    ]:
+        if not required:
+            continue
+        required_modalities.append(modality)
+        if modality in timed_out_modalities:
+            if modality == "audio":
+                return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, required_modalities
+            return FAILURE_REASON_LOW_QUALITY_MEDIA, required_modalities
+        modality_quality = media_quality.get(modality) or {}
+        if modality == "audio" and "audio_decode_timeout" in set(modality_quality.get("warnings") or []):
+            return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, required_modalities
+        if not modality_quality.get("present"):
+            if modality == "audio":
+                return FAILURE_REASON_AUDIO_MISSING, required_modalities
+            if modality == "video":
+                return FAILURE_REASON_VIDEO_MISSING, required_modalities
+            if modality == "image":
+                return FAILURE_REASON_IMAGE_MISSING, required_modalities
+            return FAILURE_REASON_MISSING_MEDIA, required_modalities
+        if not modality_quality.get("usable"):
+            return FAILURE_REASON_LOW_QUALITY_MEDIA, required_modalities
+    return None, required_modalities
+
+
 def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     total_started = time.perf_counter()
     _log_step(scan_id, "validation_start")
@@ -1581,7 +1679,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         for path, is_temp in [(image_path, image_temp), (audio_path, audio_temp), (video_path, video_temp)]:
             if path and is_temp:
                 temp_files.append(path)
-        if audio_path and _should_convert_audio(audio_path) and not FAST_SCAN_MODE:
+        if audio_path and _should_convert_audio(audio_path):
             converted = _convert_audio_to_wav(audio_path)
             temp_files.append(converted)
             audio_path = converted
@@ -1709,6 +1807,9 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             transcript=transcript,
         )
         phrase_score = phrase_validation["quality_scores"].get("phrase_match")
+        phrase_failure_reason = None
+        if VALIDATION_POLICY.require_phrase_match and not transcript:
+            phrase_failure_reason = phrase_validation.get("failure_reason") or FAILURE_REASON_TRANSCRIPTION_FAILED
         _log_perf(scan_id, "phrase_optional_ms", _elapsed_ms(stage_started))
         _log_step(scan_id, "phrase_validation_done", transcript_present=bool(transcript), phrase_match_score=phrase_score, phrase_status=phrase_status)
 
@@ -1754,17 +1855,33 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             for modality, future in analysis_futures.items()
             if future is not None and future in not_done
         ]
+        running_modalities = list(timed_out_modalities)
+        all_workers_terminal = not running_modalities
+        terminal_failure_reason, _required_modalities = _required_modality_gate(
+            quality_result,
+            timed_out_modalities=running_modalities,
+        )
         terminal_reason = "validation_passed"
-        terminal_failure_reason = None
-        if quality_result.get("usable_modalities", 0) <= 0:
+        if phrase_failure_reason and terminal_failure_reason is None:
+            terminal_failure_reason = phrase_failure_reason
+            terminal_reason = "phrase_validation_failed"
+        if terminal_failure_reason == FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT:
+            terminal_reason = "audio_validation_timeout"
+        elif terminal_failure_reason:
+            terminal_reason = "validation_timeout" if timed_out_modalities else "validation_no_reliable_evidence"
+        elif quality_result.get("usable_modalities", 0) <= 0:
             terminal_failure_reason = quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA
             terminal_reason = "validation_timeout" if timed_out_modalities else "validation_no_reliable_evidence"
+        if not all_workers_terminal and terminal_failure_reason is None:
+            terminal_failure_reason = FAILURE_REASON_ANALYSIS_EXCEPTION
+            terminal_reason = "workers_not_terminal"
         _log_validation_decision(
             scan_id,
             valid_modalities=valid_modalities,
             timed_out_modalities=timed_out_modalities,
             terminal_reason=terminal_reason,
         )
+        _log_validation_lifecycle(scan_id, all_workers_terminal=all_workers_terminal, running_modalities=running_modalities)
 
         if terminal_failure_reason:
             validation_result = fail_validation(terminal_failure_reason, warnings=quality_result.get("warnings"))
@@ -1956,7 +2073,8 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
         return {"status": SCAN_STATUS_FAILED, **validation_result}
     finally:
-        _shutdown_executor(analysis_executor)
+        if analysis_executor is not None:
+            analysis_executor.shutdown(wait=True, cancel_futures=True)
         for path in temp_files:
             remove_temp_file(path)
 
