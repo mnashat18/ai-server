@@ -47,6 +47,9 @@ DEBUG_SCAN_ENDPOINT_ENABLED = AI_SERVER_ENV in {"dev", "development", "local", "
     "",
 ).strip().lower() in {"1", "true", "yes", "on"}
 OPTIONAL_PHRASE_TIMEOUT_SECONDS = 1.5
+FAST_SCAN_MODE = os.getenv("FAST_SCAN_MODE", "true").strip().lower() in {"1", "true", "yes", "on"}
+FAST_SCAN_DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("FAST_SCAN_DOWNLOAD_TIMEOUT_SECONDS", "2.5"))
+FAST_SCAN_ANALYSIS_TIMEOUT_SECONDS = float(os.getenv("FAST_SCAN_ANALYSIS_TIMEOUT_SECONDS", "2.5"))
 
 SCAN_STATUS_PENDING = "pending"
 SCAN_STATUS_MEDIA_READY = "media_ready"
@@ -808,7 +811,8 @@ def _download_directus_asset(asset_id: str, suffix: str) -> str:
     if not directus.is_configured():
         raise ProcessingError(FAILURE_REASON_DIRECTUS_DOWNLOAD_FAILED, "Directus credentials are not configured")
     url = f"{directus.base_url}/assets/{asset_id}"
-    response = requests.get(url, headers=directus_auth_headers(url), timeout=(10, 30), stream=True)
+    download_timeout = (3, 5) if FAST_SCAN_MODE else (10, 30)
+    response = requests.get(url, headers=directus_auth_headers(url), timeout=download_timeout, stream=True)
     response.raise_for_status()
     fd, path = tempfile.mkstemp(suffix=suffix)
     total = 0
@@ -838,7 +842,7 @@ def _resolve_media_input(
         return value, False
     try:
         if allow_url and is_url(value):
-            path = download_temp_file(value, suffix)
+            path = download_temp_file(value, suffix, timeout=(3, 5) if FAST_SCAN_MODE else (10, 30))
             return path, True
         if is_url(value) or os.path.isabs(value) or any(sep in value for sep in ["/", "\\"]):
             raise ProcessingError(
@@ -1054,6 +1058,22 @@ def _timed_safe_analyze(
     result = _safe_analyze(fn, path, missing_warning)
     _log_perf(scan_id, metric_name, _elapsed_ms(started))
     return result
+
+
+def _analysis_timeout_placeholder(media_kind: str) -> dict:
+    warning_key = {
+        "video": "visual_warnings",
+        "audio": "audio_warnings",
+        "image": "image_warnings",
+    }.get(media_kind, "warnings")
+    status = "load_failed" if media_kind in {"video", "audio"} else "invalid_image"
+    return {
+        "score": None,
+        "details": {
+            "status": status,
+            warning_key: [f"{media_kind}_timeout"],
+        },
+    }
 
 
 def _analyze_audio_file(path: str | None) -> dict:
@@ -1478,19 +1498,45 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     try:
         _log_step(scan_id, "media_download_start")
         stage_started = time.perf_counter()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="media-download") as executor:
-            download_futures = {
-                "image": executor.submit(_resolve_media_input, media.image, ".jpg", "image", allow_url=False, allow_local_path=False),
-                "audio": executor.submit(_resolve_media_input, media.audio, ".bin", "audio", allow_url=False, allow_local_path=False),
-                "video": executor.submit(_resolve_media_input, media.video, ".mp4", "video", allow_url=False, allow_local_path=False),
-            }
-            image_path, image_temp = download_futures["image"].result()
-            audio_path, audio_temp = download_futures["audio"].result()
-            video_path, video_temp = download_futures["video"].result()
+        download_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="media-download")
+        download_futures = {
+            "image": download_executor.submit(_resolve_media_input, media.image, ".jpg", "image", allow_url=False, allow_local_path=False),
+            "audio": download_executor.submit(_resolve_media_input, media.audio, ".bin", "audio", allow_url=False, allow_local_path=False),
+            "video": download_executor.submit(_resolve_media_input, media.video, ".mp4", "video", allow_url=False, allow_local_path=False),
+        }
+        done, not_done = concurrent.futures.wait(
+            list(download_futures.values()),
+            timeout=FAST_SCAN_DOWNLOAD_TIMEOUT_SECONDS if FAST_SCAN_MODE else None,
+            return_when=concurrent.futures.ALL_COMPLETED,
+        )
+        if not_done:
+            logger.warning(
+                "media_download_timeout scan_id=%s timeout_seconds=%s pending=%s",
+                scan_id,
+                FAST_SCAN_DOWNLOAD_TIMEOUT_SECONDS,
+                len(not_done),
+            )
+        image_path = audio_path = video_path = None
+        image_temp = audio_temp = video_temp = False
+        for name, future in download_futures.items():
+            if future not in done:
+                continue
+            try:
+                path, is_temp = future.result()
+            except Exception as exc:
+                logger.warning("media_download_failed scan_id=%s media=%s error=%s", scan_id, name, exc)
+                path, is_temp = None, False
+            if name == "image":
+                image_path, image_temp = path, is_temp
+            elif name == "audio":
+                audio_path, audio_temp = path, is_temp
+            else:
+                video_path, video_temp = path, is_temp
+        download_executor.shutdown(wait=False, cancel_futures=True)
         for path, is_temp in [(image_path, image_temp), (audio_path, audio_temp), (video_path, video_temp)]:
             if path and is_temp:
                 temp_files.append(path)
-        if audio_path and _should_convert_audio(audio_path):
+        if audio_path and _should_convert_audio(audio_path) and not FAST_SCAN_MODE:
             converted = _convert_audio_to_wav(audio_path)
             temp_files.append(converted)
             audio_path = converted
@@ -1506,42 +1552,67 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
 
         _log_step(scan_id, "video_validation_start")
         stage_started = time.perf_counter()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="media-analysis") as executor:
-            analysis_futures = {
-                "video": executor.submit(
-                    _timed_safe_analyze,
-                    scan_id,
-                    "video_validation_ms",
-                    _analyze_video_file,
-                    resolved_media.video,
-                    "video_missing",
-                ),
-                "image": executor.submit(
-                    _timed_safe_analyze,
-                    scan_id,
-                    "face_validation_ms",
-                    _analyze_face_image,
-                    resolved_media.image,
-                    "image_missing",
-                )
-                if resolved_media.image
-                else None,
-                "audio": executor.submit(
-                    _timed_safe_analyze,
-                    scan_id,
-                    "audio_validation_ms",
-                    _analyze_audio_file,
-                    resolved_media.audio,
-                    "audio_missing",
-                ),
-            }
-            video_result = analysis_futures["video"].result()
+        analysis_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="media-analysis")
+        analysis_futures = {
+            "video": analysis_executor.submit(
+                _timed_safe_analyze,
+                scan_id,
+                "video_validation_ms",
+                _analyze_video_file,
+                resolved_media.video,
+                "video_missing",
+            ),
+            "image": analysis_executor.submit(
+                _timed_safe_analyze,
+                scan_id,
+                "face_validation_ms",
+                _analyze_face_image,
+                resolved_media.image,
+                "image_missing",
+            )
+            if resolved_media.image
+            else None,
+            "audio": analysis_executor.submit(
+                _timed_safe_analyze,
+                scan_id,
+                "audio_validation_ms",
+                _analyze_audio_file,
+                resolved_media.audio,
+                "audio_missing",
+            ),
+        }
+        done, not_done = concurrent.futures.wait(
+            [future for future in analysis_futures.values() if future is not None],
+            timeout=FAST_SCAN_ANALYSIS_TIMEOUT_SECONDS if FAST_SCAN_MODE else None,
+            return_when=concurrent.futures.ALL_COMPLETED,
+        )
+        if not_done:
+            logger.warning(
+                "media_analysis_timeout scan_id=%s timeout_seconds=%s pending=%s",
+                scan_id,
+                FAST_SCAN_ANALYSIS_TIMEOUT_SECONDS,
+                len(not_done),
+            )
+        try:
+            video_result = analysis_futures["video"].result() if analysis_futures["video"] in done else _analysis_timeout_placeholder("video")
+        except Exception as exc:
+            logger.warning("video_analysis_failed scan_id=%s error=%s", scan_id, exc)
+            video_result = _analysis_timeout_placeholder("video")
         _log_step(scan_id, "video_validation_done", quality_score=((video_result.get("details") or {}).get("visual_quality_score")))
 
         _log_step(scan_id, "face_validation_start")
         stage_started = time.perf_counter()
         video_details = (video_result.get("details") or {})
-        image_result = analysis_futures["image"].result() if analysis_futures.get("image") else None
+        if analysis_futures.get("image") and analysis_futures["image"] in done:
+            try:
+                image_result = analysis_futures["image"].result()
+            except Exception as exc:
+                logger.warning("image_analysis_failed scan_id=%s error=%s", scan_id, exc)
+                image_result = _analysis_timeout_placeholder("image")
+        elif analysis_futures.get("image"):
+            image_result = _analysis_timeout_placeholder("image")
+        else:
+            image_result = None
         _log_step(
             scan_id,
             "face_validation_done",
@@ -1551,7 +1622,11 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
 
         _log_step(scan_id, "audio_validation_start")
         stage_started = time.perf_counter()
-        audio_result = analysis_futures["audio"].result()
+        try:
+            audio_result = analysis_futures["audio"].result() if analysis_futures["audio"] in done else _analysis_timeout_placeholder("audio")
+        except Exception as exc:
+            logger.warning("audio_analysis_failed scan_id=%s error=%s", scan_id, exc)
+            audio_result = _analysis_timeout_placeholder("audio")
         audio_timings = ((audio_result.get("details") or {}).get("timings_ms") or {}) if isinstance(audio_result, dict) else {}
         _log_perf(scan_id, "audio_decode_ms", audio_timings.get("audio_decode_ms"))
         _log_perf(scan_id, "audio_quality_ms", audio_timings.get("audio_quality_ms"))
@@ -1560,6 +1635,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         if audio_remaining_ms:
             logger.info("[PERF] audio_validation_overhead_ms scan_id=%s value=%s", scan_id, audio_remaining_ms)
         _log_step(scan_id, "audio_validation_done", quality_score=((audio_result.get("details") or {}).get("audio_quality_score")))
+        analysis_executor.shutdown(wait=False, cancel_futures=True)
 
         _log_step(scan_id, "phrase_validation_start")
         stage_started = time.perf_counter()
