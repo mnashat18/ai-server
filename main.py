@@ -49,7 +49,7 @@ DEBUG_SCAN_ENDPOINT_ENABLED = AI_SERVER_ENV in {"dev", "development", "local", "
 OPTIONAL_PHRASE_TIMEOUT_SECONDS = 1.5
 FAST_SCAN_MODE = os.getenv("FAST_SCAN_MODE", "true").strip().lower() in {"1", "true", "yes", "on"}
 FAST_SCAN_DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("FAST_SCAN_DOWNLOAD_TIMEOUT_SECONDS", "2.5"))
-FAST_SCAN_ANALYSIS_TIMEOUT_SECONDS = float(os.getenv("FAST_SCAN_ANALYSIS_TIMEOUT_SECONDS", "2.5"))
+MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS = float(os.getenv("MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS", "8.0"))
 
 SCAN_STATUS_PENDING = "pending"
 SCAN_STATUS_MEDIA_READY = "media_ready"
@@ -574,6 +574,47 @@ def _elapsed_ms(started_at: float) -> int:
 def _log_perf(scan_id: str, metric: str, elapsed_ms: int | float | None) -> None:
     value = int(round(float(elapsed_ms or 0)))
     logger.info("[PERF] %s scan_id=%s value=%s", metric, scan_id, value)
+
+
+def _log_validation_decision(
+    scan_id: str,
+    *,
+    valid_modalities: list[str],
+    timed_out_modalities: list[str],
+    terminal_reason: str,
+) -> None:
+    logger.info("[VALIDATION_DECISION] valid_modalities scan_id=%s value=%s", scan_id, valid_modalities)
+    logger.info("[VALIDATION_DECISION] timed_out_modalities scan_id=%s value=%s", scan_id, timed_out_modalities)
+    logger.info("[VALIDATION_DECISION] terminal_reason scan_id=%s value=%s", scan_id, terminal_reason)
+
+
+def _shutdown_executor(executor: concurrent.futures.ThreadPoolExecutor | None) -> None:
+    if executor is None:
+        return
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _has_meaningful_evidence(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return not math.isclose(float(value), 0.0, abs_tol=0.0)
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_has_meaningful_evidence(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_meaningful_evidence(item) for item in value)
+    return bool(value)
+
+
+def _result_has_valid_evidence(result: dict[str, Any]) -> bool:
+    for field_name in ["face_metrics", "voice_metrics", "reaction_metrics", "modality_scores"]:
+        if _has_meaningful_evidence(result.get(field_name)):
+            return True
+    return False
 
 
 def _build_scan_result_response(
@@ -1326,6 +1367,9 @@ def _write_success(
     result: dict,
     internal_analysis: dict,
 ) -> dict:
+    if not _result_has_valid_evidence(result):
+        raise ProcessingError(FAILURE_REASON_ANALYSIS_EXCEPTION, "invalid_result_classification")
+
     status: dict[str, Any] = {}
     try:
         scan_result_payload = _build_scan_result_payload(scan_id, result, internal_analysis)
@@ -1492,6 +1536,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     expected_phrase = _expected_phrase(scan_context)
 
     temp_files: list[str] = []
+    analysis_executor: concurrent.futures.ThreadPoolExecutor | None = None
     transcript: str | None = None
     phrase_score: float | None = None
     phrase_status = "not_required"
@@ -1551,7 +1596,8 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         )
 
         _log_step(scan_id, "video_validation_start")
-        stage_started = time.perf_counter()
+        media_validation_started = time.perf_counter()
+        stage_started = media_validation_started
         analysis_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="media-analysis")
         analysis_futures = {
             "video": analysis_executor.submit(
@@ -1565,7 +1611,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             "image": analysis_executor.submit(
                 _timed_safe_analyze,
                 scan_id,
-                "face_validation_ms",
+                "image_validation_ms",
                 _analyze_face_image,
                 resolved_media.image,
                 "image_missing",
@@ -1583,16 +1629,20 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         }
         done, not_done = concurrent.futures.wait(
             [future for future in analysis_futures.values() if future is not None],
-            timeout=FAST_SCAN_ANALYSIS_TIMEOUT_SECONDS if FAST_SCAN_MODE else None,
+            timeout=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
             return_when=concurrent.futures.ALL_COMPLETED,
         )
         if not_done:
+            wall_elapsed_ms = _elapsed_ms(media_validation_started)
             logger.warning(
                 "media_analysis_timeout scan_id=%s timeout_seconds=%s pending=%s",
                 scan_id,
-                FAST_SCAN_ANALYSIS_TIMEOUT_SECONDS,
+                MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
                 len(not_done),
             )
+            for name, future in analysis_futures.items():
+                if future is not None and future in not_done:
+                    _log_perf(scan_id, f"{name}_validation_ms", wall_elapsed_ms)
         try:
             video_result = analysis_futures["video"].result() if analysis_futures["video"] in done else _analysis_timeout_placeholder("video")
         except Exception as exc:
@@ -1635,7 +1685,9 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         if audio_remaining_ms:
             logger.info("[PERF] audio_validation_overhead_ms scan_id=%s value=%s", scan_id, audio_remaining_ms)
         _log_step(scan_id, "audio_validation_done", quality_score=((audio_result.get("details") or {}).get("audio_quality_score")))
-        analysis_executor.shutdown(wait=False, cancel_futures=True)
+        _log_perf(scan_id, "media_validation_wall_ms", _elapsed_ms(media_validation_started))
+        _shutdown_executor(analysis_executor)
+        analysis_executor = None
 
         _log_step(scan_id, "phrase_validation_start")
         stage_started = time.perf_counter()
@@ -1692,24 +1744,65 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             quality_result["retake_required"] = True
             quality_result["suggested_action"] = "rescan_recommended"
 
+        valid_modalities = [
+            modality
+            for modality in ["video", "audio", "image"]
+            if (quality_result.get("media_quality") or {}).get(modality, {}).get("usable")
+        ]
+        timed_out_modalities = [
+            modality
+            for modality, future in analysis_futures.items()
+            if future is not None and future in not_done
+        ]
+        terminal_reason = "validation_passed"
+        terminal_failure_reason = None
+        if quality_result.get("usable_modalities", 0) <= 0:
+            terminal_failure_reason = quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA
+            terminal_reason = "validation_timeout" if timed_out_modalities else "validation_no_reliable_evidence"
+        _log_validation_decision(
+            scan_id,
+            valid_modalities=valid_modalities,
+            timed_out_modalities=timed_out_modalities,
+            terminal_reason=terminal_reason,
+        )
+
+        if terminal_failure_reason:
+            validation_result = fail_validation(terminal_failure_reason, warnings=quality_result.get("warnings"))
+            _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=phrase_validation["quality_scores"])
+            _log_step(scan_id, "directus_writeback_start")
+            writeback_started = time.perf_counter()
+            _shutdown_executor(analysis_executor)
+            analysis_executor = None
+            _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
+            _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
+            return {"status": SCAN_STATUS_FAILED, **validation_result}
+
         critical_errors = phrase_validation.get("critical_errors") or []
         if critical_errors and not _critical_validation_errors_allow_result(critical_errors):
             validation_result = fail_validation(critical_errors[0], warnings=quality_result.get("warnings"))
             _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=phrase_validation["quality_scores"])
             _log_step(scan_id, "directus_writeback_start")
             writeback_started = time.perf_counter()
+            _shutdown_executor(analysis_executor)
+            analysis_executor = None
             _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
             _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
             _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
             return {"status": SCAN_STATUS_FAILED, **validation_result}
 
-        if _face_eye_evidence_unreliable(quality_result.get("warnings"), video_details, ((image_result or {}).get("details") or {})):
-            quality_result["failure_reason"] = quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA
+        if terminal_failure_reason or _face_eye_evidence_unreliable(quality_result.get("warnings"), video_details, ((image_result or {}).get("details") or {})):
+            quality_result["failure_reason"] = terminal_failure_reason or quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA
             quality_result["retake_required"] = True
             quality_result["suggested_action"] = "rescan_recommended"
             quality_result["status"] = "weak"
             quality_result["weak"] = True
-            _log_step(scan_id, "validation_retake_required", reason="unreliable_face_eye_evidence", warnings=quality_result.get("warnings"))
+            _log_step(
+                scan_id,
+                "validation_retake_required",
+                reason=terminal_reason if terminal_failure_reason else "unreliable_face_eye_evidence",
+                warnings=quality_result.get("warnings"),
+            )
 
         _log_step(scan_id, "validation_completed", scores=phrase_validation["quality_scores"], warnings=quality_result.get("warnings"))
         _log_step(scan_id, "analysis_start")
@@ -1783,6 +1876,23 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             result=result,
             baseline_eligibility=baseline_eligibility,
         )
+        if not _result_has_valid_evidence(result):
+            validation_result = fail_validation(quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA, warnings=quality_result.get("warnings"))
+            _log_validation_decision(
+                scan_id,
+                valid_modalities=valid_modalities,
+                timed_out_modalities=timed_out_modalities,
+                terminal_reason="result_without_real_evidence",
+            )
+            _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=phrase_validation["quality_scores"])
+            _log_step(scan_id, "directus_writeback_start")
+            writeback_started = time.perf_counter()
+            _shutdown_executor(analysis_executor)
+            analysis_executor = None
+            _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
+            _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
+            return {"status": SCAN_STATUS_FAILED, **validation_result}
         _log_perf(scan_id, "analysis_ms", _elapsed_ms(stage_started))
         _log_step(scan_id, "analysis_done", risk_level=result.get("risk_level"), confidence=result.get("confidence"))
 
@@ -1846,6 +1956,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
         return {"status": SCAN_STATUS_FAILED, **validation_result}
     finally:
+        _shutdown_executor(analysis_executor)
         for path in temp_files:
             remove_temp_file(path)
 

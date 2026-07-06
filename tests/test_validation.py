@@ -540,7 +540,7 @@ class MainPayloadTests(unittest.TestCase):
         self.assertNotEqual(written_result["risk_level"], "stable")
         self.assertIn("eye closure", written_result["explanation"].lower())
 
-    def test_completely_missing_media_creates_low_focus_rescan_result(self):
+    def test_completely_missing_media_fails_without_writing_scan_result(self):
         scan_context = {
             "status": "media_ready",
             "scan_media": {"video_file": None, "audio_file": None, "thumbnail": None},
@@ -564,19 +564,21 @@ class MainPayloadTests(unittest.TestCase):
             "_baseline_rows_for_member",
             return_value=[],
         ), patch.object(
+            main.directus,
+            "update_wellness_scan",
+            return_value={},
+        ) as update_scan_mock, patch.object(
             main,
             "_write_success",
             return_value={"scan_result": "created:1"},
         ) as write_mock:
             result = main._process_scan_sync("scan-123")
 
-        self.assertEqual(result["status"], "completed")
-        write_mock.assert_called_once()
-        written_result = write_mock.call_args.kwargs["result"]
-        self.assertEqual(written_result["risk_level"], "low_focus")
-        self.assertEqual(written_result["suggested_action"], "rescan_recommended")
-        self.assertLess(written_result["confidence"], 0.45)
-        self.assertLess(written_result["readiness_score"], 52)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "missing_media")
+        write_mock.assert_not_called()
+        update_scan_mock.assert_called_once()
+        self.assertEqual(update_scan_mock.call_args[0][1]["status"], "failed")
 
     def test_degraded_scan_writes_scan_result_to_directus_and_completes_scan(self):
         scan_context = {
@@ -666,7 +668,7 @@ class MainPayloadTests(unittest.TestCase):
         self.assertEqual(completed_payload["status"], "completed")
         self.assertEqual(completed_payload["failure_reason"], None)
 
-    def test_missing_media_writes_low_focus_scan_result_to_directus_when_possible(self):
+    def test_missing_media_fails_before_scan_result_write(self):
         scan_context = {
             "status": "media_ready",
             "scan_media": {"video_file": None, "audio_file": None, "thumbnail": None},
@@ -728,15 +730,12 @@ class MainPayloadTests(unittest.TestCase):
         ):
             result = main._process_scan_sync("scan-123")
 
-        self.assertEqual(result["status"], "completed")
-        upsert_mock.assert_called_once()
-        scan_result_payload = upsert_mock.call_args[0][1]
-        self.assertEqual(scan_result_payload["risk_level"], "low_focus")
-        self.assertEqual(scan_result_payload["suggested_action"], "rescan_recommended")
-        self.assertLess(scan_result_payload["confidence"], 0.45)
-        self.assertIn("missing_media", scan_result_payload["validation_warnings"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "missing_media")
+        upsert_mock.assert_not_called()
+        update_scan_mock.assert_called_once()
         completed_payload = update_scan_mock.call_args[0][1]
-        self.assertEqual(completed_payload["status"], "completed")
+        self.assertEqual(completed_payload["status"], "failed")
 
     def test_health_uses_configured_model_version_and_optional_local_model(self):
         with patch.object(main, "MODEL_VERSION", "cie_v1_2"), patch.object(
@@ -1535,6 +1534,39 @@ class MainPayloadTests(unittest.TestCase):
         self.assertEqual(update_payload["failure_reason"], None)
         self.assertEqual(update_payload["ai_model_version"], "cie_v1_2")
         self.assertIn("completed_at", update_payload)
+
+    def test_write_success_rejects_all_null_evidence_before_scan_result_write(self):
+        with patch.object(main.directus, "upsert_scan_result", return_value=("created", {"id": "result-1"})) as upsert_mock, patch.object(
+            main.directus,
+            "update_wellness_scan",
+            return_value={},
+        ):
+            with self.assertRaises(main.ProcessingError):
+                main._write_success(
+                    scan_id="scan-123",
+                    scan_context={},
+                    identifiers={"member_id": None, "business_profile_id": None, "department_id": None, "user_id": None},
+                    result={
+                        "readiness_score": None,
+                        "risk_level": None,
+                        "confidence": None,
+                        "camera_confidence": None,
+                        "voice_confidence": None,
+                        "task_performance_score": None,
+                        "explanation": "invalid",
+                        "suggested_action": "rescan_recommended",
+                        "ai_model_version": "cie_v1_2",
+                        "confidence_drift": None,
+                        "baseline_used": False,
+                        "face_metrics": None,
+                        "voice_metrics": None,
+                        "reaction_metrics": None,
+                        "modality_scores": None,
+                    },
+                    internal_analysis={"quality": {}},
+                )
+
+        upsert_mock.assert_not_called()
 
     def test_wellness_scan_completed_update_keeps_short_ai_model_version(self):
         with patch.object(main.directus, "filter_payload_fields", side_effect=lambda collection, payload: payload), patch.object(
