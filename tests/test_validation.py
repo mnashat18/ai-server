@@ -59,6 +59,7 @@ if "ml.features" not in sys.modules:
     sys.modules["ml.features"] = fake_features
 
 import main
+import audio
 import video
 
 
@@ -268,7 +269,7 @@ class ValidationTests(unittest.TestCase):
         self.assertNotIn("audio_too_quiet", result["warnings"])
         self.assertNotIn("low_quality_media", result["warnings"])
 
-    def test_no_usable_speech_in_required_scan_cannot_return_stable(self):
+    def test_no_usable_speech_in_required_scan_fails(self):
         scan_context = {
             "status": "media_ready",
             "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
@@ -319,11 +320,9 @@ class ValidationTests(unittest.TestCase):
         ) as write_mock:
             result = main._process_scan_sync("scan-123")
 
-        self.assertEqual(result["status"], "completed")
-        written_result = write_mock.call_args.kwargs["result"]
-        self.assertEqual(written_result["risk_level"], "low_focus")
-        self.assertEqual(written_result["suggested_action"], "rescan_recommended")
-        self.assertIn("speech", written_result["explanation"].lower())
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "low_quality_media")
+        write_mock.assert_not_called()
 
     def test_validation_passed(self):
         result = validate_scan_inputs(
@@ -403,6 +402,17 @@ class ValidationTests(unittest.TestCase):
         self.assertNotIn("speech_not_detected", result["warnings"])
         self.assertNotIn("audio", result["weak_modalities"])
 
+    def test_audio_analyze_times_out_via_ffmpeg_without_librosa_fallback(self):
+        with patch.object(audio, "librosa", object()), patch.object(audio.shutil, "which", return_value="ffmpeg"), patch.object(
+            audio.subprocess,
+            "run",
+            side_effect=audio.subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=3.5),
+        ):
+            result = audio.analyze_audio("clip.m4a")
+
+        self.assertEqual(result["details"]["status"], "load_failed")
+        self.assertIn("audio_decode_timeout", result["details"]["audio_warnings"])
+
 
 class MainPayloadTests(unittest.TestCase):
     def _run_scan_with_analysis(self, *, video_result, image_result, audio_result):
@@ -476,19 +486,16 @@ class MainPayloadTests(unittest.TestCase):
         self.assertIn("lighting", written_result["explanation"].lower())
         self.assertNotEqual(written_result["risk_level"], "stable")
 
-    def test_noisy_audio_still_creates_result(self):
+    def test_noisy_audio_fails_when_audio_is_required(self):
         result, write_mock = self._run_scan_with_analysis(
             video_result=_video_result(),
             image_result=_image_result(),
             audio_result=_audio_result(noise_estimate=0.9, audio_quality_score=0.25, audio_warnings=["audio_too_noisy"]),
         )
 
-        self.assertEqual(result["status"], "completed")
-        write_mock.assert_called_once()
-        written_result = write_mock.call_args.kwargs["result"]
-        self.assertIn("audio_too_noisy", written_result["validation_warnings"])
-        self.assertIn("noise", written_result["explanation"].lower())
-        self.assertNotEqual(written_result["risk_level"], "high_risk")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "low_quality_media")
+        write_mock.assert_not_called()
 
     def test_weak_face_visibility_still_creates_result(self):
         result, write_mock = self._run_scan_with_analysis(
@@ -580,7 +587,7 @@ class MainPayloadTests(unittest.TestCase):
         update_scan_mock.assert_called_once()
         self.assertEqual(update_scan_mock.call_args[0][1]["status"], "failed")
 
-    def test_degraded_scan_writes_scan_result_to_directus_and_completes_scan(self):
+    def test_degraded_audio_scan_fails_before_scan_result_write(self):
         scan_context = {
             "status": "media_ready",
             "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
@@ -658,15 +665,12 @@ class MainPayloadTests(unittest.TestCase):
         ):
             result = main._process_scan_sync("scan-123")
 
-        self.assertEqual(result["status"], "completed")
-        upsert_mock.assert_called_once()
-        scan_result_payload = upsert_mock.call_args[0][1]
-        self.assertIn("video_blurry", scan_result_payload["validation_warnings"])
-        self.assertIn("audio_too_noisy", scan_result_payload["validation_warnings"])
-        self.assertLess(scan_result_payload["confidence"], 0.8)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "low_quality_media")
+        upsert_mock.assert_not_called()
         completed_payload = update_scan_mock.call_args[0][1]
-        self.assertEqual(completed_payload["status"], "completed")
-        self.assertEqual(completed_payload["failure_reason"], None)
+        self.assertEqual(completed_payload["status"], "failed")
+        self.assertEqual(completed_payload["failure_reason"], "low_quality_media")
 
     def test_missing_media_fails_before_scan_result_write(self):
         scan_context = {
@@ -736,6 +740,62 @@ class MainPayloadTests(unittest.TestCase):
         update_scan_mock.assert_called_once()
         completed_payload = update_scan_mock.call_args[0][1]
         self.assertEqual(completed_payload["status"], "failed")
+
+    def test_required_audio_timeout_fails_before_scoring(self):
+        scan_context = {
+            "status": "media_ready",
+            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
+            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
+            "task_metrics": {},
+        }
+        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
+            main.directus,
+            "get_scan_media",
+            return_value=scan_context["scan_media"],
+        ), patch.object(
+            main.ml_runtime,
+            "is_loaded",
+            return_value=False,
+        ), patch.object(
+            main.ml_runtime,
+            "local_model_required",
+            return_value=False,
+        ), patch.object(
+            main,
+            "_resolve_media_input",
+            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+        ), patch.object(
+            main,
+            "_safe_analyze",
+            side_effect=[
+                _video_result(),
+                _image_result(),
+                {"score": None, "details": {"status": "load_failed", "audio_warnings": ["audio_decode_timeout"]}},
+            ],
+        ), patch.object(
+            main,
+            "_expected_phrase",
+            return_value=None,
+        ), patch.object(
+            main,
+            "_baseline_rows_for_member",
+            return_value=[],
+        ), patch.object(
+            main.directus,
+            "update_wellness_scan",
+            return_value={},
+        ) as update_scan_mock, patch.object(
+            main,
+            "_write_success",
+            return_value={"scan_result": "created:1"},
+        ) as write_mock:
+            result = main._process_scan_sync("scan-123")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "audio_validation_timeout")
+        write_mock.assert_not_called()
+        update_scan_mock.assert_called_once()
+        self.assertEqual(update_scan_mock.call_args[0][1]["status"], "failed")
 
     def test_health_uses_configured_model_version_and_optional_local_model(self):
         with patch.object(main, "MODEL_VERSION", "cie_v1_2"), patch.object(
@@ -1979,7 +2039,8 @@ class MainPayloadTests(unittest.TestCase):
         ):
             result = main._process_scan_sync("scan-123")
 
-        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "low_quality_media")
         baseline_upsert_mock.assert_not_called()
 
     def test_low_quality_scan_does_not_call_baseline_upsert(self):
