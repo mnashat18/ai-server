@@ -472,6 +472,16 @@ def _confirmed_sustained_eye_closure(quality: dict) -> bool:
     return "sustained_eye_closure" in set(quality.get("warnings") or [])
 
 
+def _quality_limited_scan(quality: dict, confidence: float) -> bool:
+    return bool(
+        quality.get("status") == "failed"
+        or quality.get("retake_required")
+        or quality.get("failure_reason") in {"low_quality_media", "missing_media"}
+        or bool({"video", "audio"} & set(quality.get("missing_modalities") or []))
+        or confidence < 0.45
+    )
+
+
 def _risk_level(
     readiness_score: int,
     confidence: float,
@@ -480,13 +490,10 @@ def _risk_level(
     *,
     fatigue_evidence: float = 0.0,
 ) -> str:
-    quality_failed = quality.get("status") == "failed"
-    media_quality_too_weak = quality.get("failure_reason") in {"low_quality_media", "missing_media"}
-    missing_major_media = bool({"video", "audio"} & set(quality.get("missing_modalities") or []))
     sustained_eye_closure = _confirmed_sustained_eye_closure(quality)
     if sustained_eye_closure:
         return "elevated_fatigue"
-    if quality_failed or media_quality_too_weak or missing_major_media or confidence < 0.45:
+    if _quality_limited_scan(quality, confidence):
         return "low_focus"
     if fatigue_evidence >= 0.82 and confidence >= 0.5:
         return "high_risk"
@@ -613,7 +620,18 @@ def _explanation(
     )
     if confirmed_sustained_eye_closure:
         scan_unreliable = False
-    if scan_unreliable:
+    quality_limited = _quality_limited_scan(quality, confidence) and not confirmed_sustained_eye_closure
+    fatigue_likely = (
+        confirmed_sustained_eye_closure
+        or (fatigue_context.get("combined") or 0.0) >= 0.55
+        or (fatigue_context.get("audio") or 0.0) >= 0.45
+        or (fatigue_context.get("video") or 0.0) >= 0.45
+    )
+    if quality_limited and not fatigue_likely:
+        tail = "The result is weak because the scan quality was poor. Please retake it with clearer lighting, a steadier video, and a visible face."
+    elif confirmed_sustained_eye_closure or fatigue_likely:
+        tail = "The result suggests real fatigue. You look tired and should rest before continuing."
+    elif scan_unreliable:
         tail = "The scan could not be assessed reliably. Please repeat it with clear face visibility, better lighting, steady video, and usable audio."
     elif risk_level == "stable":
         tail = "Both signals suggest stable readiness with moderate confidence." if confidence >= 0.5 else "Confidence was reduced because the available signals were limited."
@@ -778,13 +796,15 @@ def compute_result(
         readiness_score = min(readiness_score, 30)
     if scan_unreliable:
         readiness_score, confidence = _invalid_scan_outcome(readiness_score, confidence, quality)
-    risk_level = None if scan_unreliable else _risk_level(
+    risk_level = _risk_level(
         readiness_score,
         confidence,
         baseline_flags,
         quality,
         fatigue_evidence=fatigue_evidence,
     )
+    if scan_unreliable and risk_level is None:
+        risk_level = "low_focus"
     if risk_level is not None and risk_level not in VALID_RISK_LEVELS:
         risk_level = "low_focus"
     suggested_action = _suggested_action(risk_level, confidence, quality)
