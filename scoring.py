@@ -42,6 +42,13 @@ WARNING_SCORE_PENALTIES = {
     "low_quality_media": 0.12,
 }
 
+EYE_CLOSURE_SUSTAINED_THRESHOLD = 0.55
+EYE_CLOSURE_HIGH_THRESHOLD = 0.38
+EYE_APERTURE_FATIGUE_THRESHOLD = 0.24
+VOICE_FATIGUE_SPEECH_THRESHOLD = 0.58
+VOICE_FATIGUE_ENERGY_THRESHOLD = 0.018
+VOICE_FATIGUE_SILENCE_THRESHOLD = 0.45
+
 
 def clamp_confidence(value: float | None) -> float | None:
     return clamp01(value)
@@ -182,6 +189,146 @@ def _quality_warnings_for_modality(quality: dict | None, modality: str, current:
     allowed = modality_warning_map.get(modality, set())
     combined.extend(warning for warning in global_warnings if warning in allowed)
     return clean_warning_codes(combined)
+
+
+def _raw_signal_details(signals: dict | None, modality: str) -> dict[str, Any]:
+    signals = signals or {}
+    analysis = signals.get(modality) or {}
+    if not isinstance(analysis, dict):
+        return {}
+    details = analysis.get("details") or {}
+    return details if isinstance(details, dict) else {}
+
+
+def _video_fatigue_signal(
+    *,
+    signals: dict | None,
+    quality: dict | None,
+    baseline_flags: list[str] | None,
+    eye_aperture_drift: dict | None,
+) -> float:
+    details = _raw_signal_details(signals, "video")
+    if not details:
+        return 0.0
+    if details.get("sustained_eye_closure"):
+        return 1.0
+
+    reliable_eye_landmarks = bool(details.get("reliable_eye_landmarks"))
+    if not reliable_eye_landmarks:
+        return 0.0
+
+    closed_eye_ratio = clamp01(details.get("closed_eye_ratio"), 0.0) or 0.0
+    avg_eye_aperture = details.get("avg_eye_aperture")
+    eye_aperture = 0.0
+    if avg_eye_aperture is not None:
+        eye_aperture = clamp01((EYE_APERTURE_FATIGUE_THRESHOLD - float(avg_eye_aperture)) / EYE_APERTURE_FATIGUE_THRESHOLD, 0.0) or 0.0
+    closure_ratio = clamp01((closed_eye_ratio - 0.12) / max(EYE_CLOSURE_HIGH_THRESHOLD - 0.12, 1e-6), 0.0) or 0.0
+
+    closure_streak = float(details.get("longest_eye_closure_streak") or 0.0)
+    closure_window_seconds = float(details.get("eye_closure_window_seconds") or 0.0)
+    closure_streak_score = clamp01(closure_streak / 4.0, 0.0) or 0.0
+    closure_window_score = clamp01(closure_window_seconds / 1.5, 0.0) or 0.0
+    motion_stability = clamp01(details.get("motion_stability_score"), 1.0) or 1.0
+    motion_penalty = max(0.0, 1.0 - motion_stability)
+    quality_score = clamp01(details.get("visual_quality_score"), 0.0) or 0.0
+
+    fatigue = (
+        0.28 * closed_eye_ratio
+        + 0.16 * closure_ratio
+        + 0.25 * eye_aperture
+        + 0.15 * closure_streak_score
+        + 0.1 * closure_window_score
+        + 0.1 * motion_penalty
+        + 0.05 * max(0.0, 1.0 - quality_score)
+    )
+    if closed_eye_ratio >= EYE_CLOSURE_SUSTAINED_THRESHOLD:
+        fatigue += 0.14
+    if (eye_aperture_drift or {}).get("below_threshold"):
+        fatigue += 0.12
+    if baseline_flags:
+        fatigue += min(0.04 * len(baseline_flags), 0.12)
+    if (quality or {}).get("weak"):
+        fatigue += 0.04
+    return round(clamp01(fatigue, 0.0) or 0.0, 4)
+
+
+def _audio_fatigue_signal(
+    *,
+    signals: dict | None,
+    quality: dict | None,
+    baseline_flags: list[str] | None,
+    voice_energy_drift: dict | None,
+    speech_rate_drift: dict | None,
+) -> float:
+    details = _raw_signal_details(signals, "voice")
+    if not details:
+        return 0.0
+
+    speech_presence_score = clamp01(details.get("speech_presence_score"), 0.0) or 0.0
+    rms_energy = float(details.get("rms_energy") or details.get("energy") or 0.0)
+    silence_ratio = clamp01(details.get("silence_ratio"), 0.0) or 0.0
+    speech_rate = details.get("speech_rate")
+    quiet_but_usable = bool(details.get("quiet_but_usable"))
+    normalized_energy = clamp01(rms_energy / max(VOICE_FATIGUE_ENERGY_THRESHOLD * 2.0, 1e-6), 0.0) or 0.0
+    speech_rate_factor = 0.0
+    if speech_rate is not None:
+        speech_rate_factor = 1.0 - (clamp01(float(speech_rate) / 2.1, 0.0) or 0.0)
+
+    fatigue = (
+        0.3 * (1.0 - speech_presence_score)
+        + 0.24 * (1.0 - normalized_energy)
+        + 0.2 * max(0.0, silence_ratio - (VOICE_FATIGUE_SILENCE_THRESHOLD - 0.1))
+        + 0.14 * speech_rate_factor
+    )
+    if quiet_but_usable:
+        fatigue = max(fatigue, 0.36)
+    if speech_presence_score < VOICE_FATIGUE_SPEECH_THRESHOLD:
+        fatigue += 0.06
+    if (voice_energy_drift or {}).get("below_threshold"):
+        fatigue += 0.1
+    if (speech_rate_drift or {}).get("below_threshold"):
+        fatigue += 0.06
+    if baseline_flags:
+        fatigue += min(0.03 * len(baseline_flags), 0.09)
+    if (quality or {}).get("weak"):
+        fatigue += 0.03
+    return round(clamp01(fatigue, 0.0) or 0.0, 4)
+
+
+def _fatigue_signal_context(
+    *,
+    signals: dict | None,
+    quality: dict | None,
+    baseline_used: bool,
+    baseline_flags: list[str],
+    eye_aperture_drift: dict | None,
+    voice_energy_drift: dict | None,
+    speech_rate_drift: dict | None,
+) -> dict[str, Any]:
+    video_fatigue = _video_fatigue_signal(
+        signals=signals,
+        quality=quality,
+        baseline_flags=baseline_flags,
+        eye_aperture_drift=eye_aperture_drift if baseline_used else None,
+    )
+    audio_fatigue = _audio_fatigue_signal(
+        signals=signals,
+        quality=quality,
+        baseline_flags=baseline_flags,
+        voice_energy_drift=voice_energy_drift if baseline_used else None,
+        speech_rate_drift=speech_rate_drift if baseline_used else None,
+    )
+    combined = 0.62 * video_fatigue + 0.33 * audio_fatigue
+    if baseline_used and baseline_flags:
+        combined += min(0.03 * len(baseline_flags), 0.08)
+    if (quality or {}).get("weak"):
+        combined += 0.04
+    combined = round(clamp01(combined, 0.0) or 0.0, 4)
+    return {
+        "video": safe_number(video_fatigue),
+        "audio": safe_number(audio_fatigue),
+        "combined": safe_number(combined),
+    }
 
 
 def _build_signal_profiles(signals: dict, task_score: float | None, quality: dict | None = None) -> dict[str, dict]:
@@ -325,21 +472,34 @@ def _confirmed_sustained_eye_closure(quality: dict) -> bool:
     return "sustained_eye_closure" in set(quality.get("warnings") or [])
 
 
-def _risk_level(readiness_score: int, confidence: float, baseline_flags: list[str], quality: dict) -> str:
+def _risk_level(
+    readiness_score: int,
+    confidence: float,
+    baseline_flags: list[str],
+    quality: dict,
+    *,
+    fatigue_evidence: float = 0.0,
+) -> str:
     quality_failed = quality.get("status") == "failed"
     media_quality_too_weak = quality.get("failure_reason") in {"low_quality_media", "missing_media"}
     missing_major_media = bool({"video", "audio"} & set(quality.get("missing_modalities") or []))
     sustained_eye_closure = _confirmed_sustained_eye_closure(quality)
     if sustained_eye_closure:
-        return "high_risk"
+        return "elevated_fatigue"
     if quality_failed or media_quality_too_weak or missing_major_media or confidence < 0.45:
         return "low_focus"
-    if quality.get("weak") and readiness_score < 52 and not baseline_flags:
-        return "low_focus"
+    if fatigue_evidence >= 0.82 and confidence >= 0.5:
+        return "high_risk"
     if readiness_score < 35 and confidence >= 0.62:
         return "high_risk"
+    if fatigue_evidence >= 0.6:
+        return "elevated_fatigue"
+    if quality.get("weak") and readiness_score < 52 and not baseline_flags:
+        return "low_focus"
     if readiness_score < 52 and confidence >= 0.5:
         return "elevated_fatigue"
+    if readiness_score < 68 and fatigue_evidence >= 0.3:
+        return "low_focus"
     if readiness_score < 68:
         return "low_focus"
     return "stable"
@@ -364,12 +524,14 @@ def _explanation(
     quality: dict,
     risk_level: str | None,
     confidence: float,
+    fatigue_context: dict[str, Any] | None = None,
     baseline_notes: list[str] | None = None,
 ) -> str:
     positives: list[str] = []
     negatives: list[str] = []
     warning_reasons: list[str] = []
     baseline_notes = baseline_notes or []
+    fatigue_context = fatigue_context or {}
     if profiles["video"]["score"] is not None and (profiles["video"]["quality"] or 0.0) >= 0.55:
         positives.append("Video quality was acceptable")
     if profiles["audio"]["score"] is not None and (profiles["audio"]["quality"] or 0.0) >= 0.55:
@@ -414,6 +576,14 @@ def _explanation(
     if "sustained_eye_closure" in quality.get("warnings", []):
         negatives.append("reliable sustained eye closure was observed")
         warning_reasons.append("repeated eye-closure evidence lowered the readiness result")
+    if (fatigue_context.get("video") or 0.0) >= 0.45:
+        negatives.append("video showed fatigue-like eye behavior")
+        warning_reasons.append("eye behavior suggested the person may be tired")
+    if (fatigue_context.get("audio") or 0.0) >= 0.45:
+        negatives.append("voice energy and pacing suggested fatigue")
+        warning_reasons.append("voice pattern suggested the person may be tired")
+    if (fatigue_context.get("combined") or 0.0) >= 0.55:
+        warning_reasons.append("combined video and audio fatigue cues were elevated")
     if "low_quality_media" in quality.get("warnings", []) or quality.get("failure_reason") == "low_quality_media":
         warning_reasons.append("overall media quality was low")
     if "missing_media" in quality.get("warnings", []) or quality.get("failure_reason") == "missing_media":
@@ -538,6 +708,28 @@ def compute_result(
     if "sustained_eye_closure" in set(quality.get("warnings") or []):
         fused_score = max(0.0, fused_score - 0.14)
 
+    fatigue_context = _fatigue_signal_context(
+        signals=signals,
+        quality=quality,
+        baseline_used=baseline_used,
+        baseline_flags=baseline_flags,
+        eye_aperture_drift=eye_aperture_drift,
+        voice_energy_drift=voice_energy_drift,
+        speech_rate_drift=speech_rate_drift,
+    )
+    if baseline_used:
+        baseline_fatigue_boost = 0.0
+        if (eye_aperture_drift or {}).get("below_threshold"):
+            baseline_fatigue_boost += 0.08
+        if (voice_energy_drift or {}).get("below_threshold"):
+            baseline_fatigue_boost += 0.07
+        if (speech_rate_drift or {}).get("below_threshold"):
+            baseline_fatigue_boost += 0.05
+        if baseline_fatigue_boost:
+            fatigue_context["combined"] = safe_number(
+                clamp01((fatigue_context.get("combined") or 0.0) + baseline_fatigue_boost, 0.0)
+            )
+
     baseline_notes: list[str] = []
     if baseline_used:
         eye_aperture_reference = baseline_feature_reference(baseline, "face_avg", "open_eye_aperture")
@@ -572,6 +764,7 @@ def compute_result(
     )
     readiness_score = int(round((clamp01(fused_score, 0.0) or 0.0) * 100))
     confirmed_sustained_eye_closure = _confirmed_sustained_eye_closure(quality)
+    fatigue_evidence = float(fatigue_context.get("combined") or 0.0)
     scan_unreliable = (
         quality.get("status") == "failed"
         or quality.get("retake_required")
@@ -585,13 +778,26 @@ def compute_result(
         readiness_score = min(readiness_score, 30)
     if scan_unreliable:
         readiness_score, confidence = _invalid_scan_outcome(readiness_score, confidence, quality)
-    risk_level = None if scan_unreliable else _risk_level(readiness_score, confidence, baseline_flags, quality)
+    risk_level = None if scan_unreliable else _risk_level(
+        readiness_score,
+        confidence,
+        baseline_flags,
+        quality,
+        fatigue_evidence=fatigue_evidence,
+    )
     if risk_level is not None and risk_level not in VALID_RISK_LEVELS:
         risk_level = "low_focus"
     suggested_action = _suggested_action(risk_level, confidence, quality)
     if suggested_action not in VALID_ACTIONS:
         suggested_action = "rescan_recommended"
-    explanation = _explanation(profiles, quality, risk_level, confidence, baseline_notes=baseline_notes)
+    explanation = _explanation(
+        profiles,
+        quality,
+        risk_level,
+        confidence,
+        fatigue_context=fatigue_context,
+        baseline_notes=baseline_notes,
+    )
 
     previous = clamp01(previous_confidence, confidence)
     confidence_drift = safe_number(confidence - (previous if previous is not None else confidence))
@@ -601,7 +807,10 @@ def compute_result(
         "image": safe_number(profiles["image"]["score"]),
         "task": safe_number(task_score),
     }
-    observed_fatigue_score = int(round((1.0 - (clamp01(fused_score, 0.0) or 0.0)) * 100))
+    observed_fatigue_score = int(round(max(
+        1.0 - (clamp01(fused_score, 0.0) or 0.0),
+        fatigue_evidence,
+    ) * 100))
     retake_required = bool((scan_unreliable or quality.get("retake_required")) and not confirmed_sustained_eye_closure)
 
     return {
@@ -617,6 +826,7 @@ def compute_result(
         "task_performance_score": int(round((task_score or 0.0) * 100)) if task_score is not None else None,
         "baseline_used": baseline_used,
         "confidence_drift": confidence_drift,
+        "fatigue_evidence_score": safe_number(fatigue_evidence),
         "face_metrics": {
             "image_score": safe_number(image_score),
             "video_score": safe_number(video_score),
@@ -655,6 +865,8 @@ def compute_result(
             "quality_penalty": safe_number(quality_penalty),
             "fused_score": safe_number(fused_score),
             "observed_fatigue_score": observed_fatigue_score,
+            "fatigue_evidence_score": safe_number(fatigue_evidence),
+            "fatigue_context": fatigue_context,
             "calibration": calibration,
         },
     }

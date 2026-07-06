@@ -89,6 +89,7 @@ OPTIONAL_SCAN_RESULT_FIELDS = [
     "capture_quality_score",
     "measurement_reliability_score",
     "observed_fatigue_score",
+    "fatigue_evidence_score",
     "personal_deviation_score",
     "task_completion_status",
     "baseline_status_at_inference",
@@ -114,6 +115,7 @@ SCAN_RESULT_NUMERIC_FIELDS: dict[str, bool] = {
     "measurement_reliability_score": False,
     "personal_deviation_score": False,
     "baseline_confidence": False,
+    "fatigue_evidence_score": False,
 }
 
 SCAN_RESULT_CHOICE_ALIASES: dict[str, dict[str, list[str]]] = {
@@ -1174,6 +1176,7 @@ def _build_scan_result_payload(scan_id: str, result: dict, internal_analysis: di
         "suggested_action": sanitize_text(result.get("suggested_action"), fallback="review_required", max_len=255),
         "ai_model_version": MODEL_VERSION,
         "confidence_drift": result.get("confidence_drift"),
+        "fatigue_evidence_score": result.get("fatigue_evidence_score"),
         "baseline_used": result.get("baseline_used"),
         "face_metrics": result.get("face_metrics"),
         "voice_metrics": result.get("voice_metrics"),
