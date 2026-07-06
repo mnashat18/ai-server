@@ -646,6 +646,110 @@ class PipelineTests(unittest.TestCase):
         self.assertNotEqual(result["risk_level"], "stable")
         self.assertIn("eye closure", result["explanation"].lower())
 
+    def test_video_and_audio_fatigue_signals_raise_fatigue_level(self):
+        signals = {
+            "camera": _signal(0.84, {"status": "ok", "image_confidence": 0.84, "image_quality_score": 0.84, "image_warnings": [], "face_detected": True}),
+            "video": _signal(
+                0.78,
+                {
+                    "status": "ok",
+                    "visual_confidence": 0.78,
+                    "visual_quality_score": 0.78,
+                    "visual_warnings": [],
+                    "reliable_eye_landmarks": True,
+                    "sustained_eye_closure": False,
+                    "closed_eye_ratio": 0.58,
+                    "avg_eye_aperture": 0.16,
+                    "longest_eye_closure_streak": 5,
+                    "eye_closure_window_seconds": 1.0,
+                    "motion_stability_score": 0.74,
+                    "eye_closure_sample_count": 12,
+                },
+            ),
+            "voice": _signal(
+                0.72,
+                {
+                    "status": "ok",
+                    "audio_confidence": 0.72,
+                    "audio_quality_score": 0.71,
+                    "audio_warnings": [],
+                    "speech_presence_score": 0.46,
+                    "rms_energy": 0.011,
+                    "silence_ratio": 0.61,
+                    "speech_rate": 0.78,
+                    "quiet_but_usable": True,
+                },
+            ),
+        }
+        result = compute_result(signals=signals, quality=assess_quality(signals))
+
+        self.assertIn(result["risk_level"], {"elevated_fatigue", "high_risk"})
+        self.assertGreaterEqual(result["observed_fatigue_score"], 55)
+        self.assertGreaterEqual(result["fatigue_evidence_score"], 0.45)
+        self.assertIn("fatigue", result["explanation"].lower())
+
+    def test_baseline_strengthens_fatigue_detection(self):
+        signals = {
+            "camera": _signal(0.84, {"status": "ok", "image_confidence": 0.84, "image_quality_score": 0.84, "image_warnings": [], "face_detected": True}),
+            "video": _signal(
+                0.78,
+                {
+                    "status": "ok",
+                    "visual_confidence": 0.78,
+                    "visual_quality_score": 0.78,
+                    "visual_warnings": [],
+                    "reliable_eye_landmarks": True,
+                    "sustained_eye_closure": False,
+                    "closed_eye_ratio": 0.52,
+                    "avg_eye_aperture": 0.17,
+                    "longest_eye_closure_streak": 4,
+                    "eye_closure_window_seconds": 0.9,
+                    "motion_stability_score": 0.76,
+                    "eye_closure_sample_count": 10,
+                },
+            ),
+            "voice": _signal(
+                0.72,
+                {
+                    "status": "ok",
+                    "audio_confidence": 0.72,
+                    "audio_quality_score": 0.71,
+                    "audio_warnings": [],
+                    "speech_presence_score": 0.5,
+                    "rms_energy": 0.012,
+                    "silence_ratio": 0.58,
+                    "speech_rate": 0.82,
+                    "quiet_but_usable": True,
+                },
+            ),
+        }
+        baseline = {
+            "scan_count": 4,
+            "is_active": True,
+            "face_avg": {
+                "schema_version": 2,
+                "feature_stats": {
+                    "open_eye_aperture": {"median": 0.27, "mad": 0.02, "count": 4},
+                    "left_right_eye_asymmetry": {"median": 0.02, "mad": 0.01, "count": 4},
+                },
+            },
+            "voice_avg": {
+                "schema_version": 2,
+                "feature_stats": {
+                    "normalized_voice_energy": {"median": 0.03, "mad": 0.01, "count": 4},
+                    "speech_rate": {"median": 1.9, "mad": 0.1, "count": 4},
+                },
+            },
+            "reaction_avg": {"schema_version": 2, "feature_stats": {}},
+        }
+
+        without_baseline = compute_result(signals=signals, quality=assess_quality(signals))
+        with_baseline = compute_result(signals=signals, quality=assess_quality(signals), baseline=baseline, baseline_used=True)
+
+        self.assertGreater(with_baseline["fatigue_evidence_score"], without_baseline["fatigue_evidence_score"])
+        self.assertIn(with_baseline["risk_level"], {"elevated_fatigue", "high_risk"})
+        self.assertNotEqual(with_baseline["risk_level"], "stable")
+
     def test_hard_safety_signals_are_not_rescued_by_baseline(self):
         baseline = {
             "scan_count": 4,
