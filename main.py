@@ -30,7 +30,7 @@ from ml.features import features_from_signals, vector_from_features
 from ml.runtime import MLRuntime
 from quality import assess_quality
 from scoring import compute_result
-from utils import directus_auth_headers, download_temp_file, is_url, remove_temp_file, sanitize_payload, sanitize_text
+from utils import directus_auth_headers, download_temp_file, is_url, remove_temp_file, safe_number, sanitize_payload, sanitize_text
 from validation import ValidationPolicy, fail_validation, failure_message, validate_scan_inputs
 
 
@@ -543,6 +543,20 @@ def _schema_aware_scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]
     return filtered
 
 
+def _directus_payload_preserve_nulls(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _directus_payload_preserve_nulls(raw) for key, raw in value.items()}
+    if isinstance(value, list):
+        return [_directus_payload_preserve_nulls(raw) for raw in value]
+    if isinstance(value, tuple):
+        return [_directus_payload_preserve_nulls(raw) for raw in value]
+    if isinstance(value, float):
+        return safe_number(value, digits=6)
+    if isinstance(value, str):
+        return sanitize_text(value)
+    return value
+
+
 def _log_step(scan_id: str, step: str, **details: Any) -> None:
     if details:
         logger.info("scan_id=%s step=%s details=%s", scan_id, step, sanitize_payload(details))
@@ -1015,7 +1029,7 @@ def _scan_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 extras[key] = payload[key]
         if extras:
             filtered[metadata_field] = extras
-    return sanitize_payload(filtered)
+    return _directus_payload_preserve_nulls(filtered)
 
 
 def _safe_analyze(fn, path: str | None, missing_warning: str) -> dict:
@@ -1575,48 +1589,9 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             quality_result["suggested_action"] = "rescan_recommended"
             quality_result["status"] = "weak"
             quality_result["weak"] = True
-            result = _quality_failure_response(
-                scan_id,
-                quality_result,
-                {"quality": quality_result, "validation": phrase_validation, "signals": raw_signals},
-                {},
-            )
-            result.update(
-                {
-                    "result_status": "retake_required",
-                    "explanation": "Face and eye landmarks were not reliably detected, so the scan could not be assessed. Please retake with your face clearly visible.",
-                    "expected_phrase": expected_phrase,
-                    "phrase_match_score": phrase_score,
-                    "audio_quality_score": phrase_validation["quality_scores"].get("audio"),
-                    "video_quality_score": phrase_validation["quality_scores"].get("video"),
-                    "image_quality_score": phrase_validation["quality_scores"].get("image"),
-                    "validation_warnings": quality_result.get("warnings"),
-                }
-            )
-            internal_analysis = sanitize_payload(
-                {
-                    "quality": quality_result,
-                    "signals": raw_signals,
-                    "validation": phrase_validation,
-                    "failure_reason": "unreliable_face_eye_evidence",
-                }
-            )
             _log_step(scan_id, "validation_retake_required", reason="unreliable_face_eye_evidence", warnings=quality_result.get("warnings"))
-            _log_step(scan_id, "directus_writeback_start")
-            writeback_started = time.perf_counter()
-            writeback_status = _write_success(
-                scan_id=scan_id,
-                scan_context=scan_context,
-                identifiers=identifiers,
-                result=result,
-                internal_analysis=internal_analysis,
-            )
-            _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
-            _log_step(scan_id, "directus_writeback_done", writeback_status=writeback_status)
-            _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
-            return {"status": SCAN_STATUS_COMPLETED, "failure_reason": None, "writeback_status": writeback_status}
 
-        _log_step(scan_id, "validation_passed", scores=phrase_validation["quality_scores"], warnings=quality_result.get("warnings"))
+        _log_step(scan_id, "validation_completed", scores=phrase_validation["quality_scores"], warnings=quality_result.get("warnings"))
         _log_step(scan_id, "analysis_start")
         stage_started = time.perf_counter()
         feature_map, _ = features_from_signals(raw_signals, task=task)
