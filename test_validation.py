@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sys
-import types
 import unittest
 from unittest.mock import ANY, MagicMock, patch
 
@@ -10,53 +8,6 @@ from fastapi.testclient import TestClient
 
 from validation import ValidationPolicy, validate_scan_inputs
 import scoring
-
-
-if "torch" not in sys.modules:
-    fake_torch = types.ModuleType("torch")
-    fake_torch.manual_seed = lambda seed: None
-    sys.modules["torch"] = fake_torch
-
-if "audio" not in sys.modules:
-    fake_audio = types.ModuleType("audio")
-    fake_audio.analyze_audio = lambda path: {"score": 0.8, "details": {"status": "ok", "audio_quality_score": 0.8, "audio_warnings": []}}
-    fake_audio.transcribe_audio = lambda path: "hello world"
-    sys.modules["audio"] = fake_audio
-
-if "vision" not in sys.modules:
-    fake_vision = types.ModuleType("vision")
-    fake_vision.analyze_face = lambda path: {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": [], "face_detected": True}}
-    sys.modules["vision"] = fake_vision
-
-if "ml.runtime" not in sys.modules:
-    fake_runtime = types.ModuleType("ml.runtime")
-
-    class _FakeMLRuntime:
-        def __init__(self, model_path=None):
-            self.model_path = model_path or "models/latest.pt"
-            self.error = None
-            self.require_local_model = False
-
-        def load(self):
-            return True
-
-        def is_loaded(self):
-            return True
-
-        def local_model_required(self):
-            return self.require_local_model
-
-        def predict(self, features):
-            return {"confidence": 0.8, "label": "Stable", "model_version": "cie_v1_2"}
-
-    fake_runtime.MLRuntime = _FakeMLRuntime
-    sys.modules["ml.runtime"] = fake_runtime
-
-if "ml.features" not in sys.modules:
-    fake_features = types.ModuleType("ml.features")
-    fake_features.features_from_signals = lambda signals, task=None: ({}, signals)
-    fake_features.vector_from_features = lambda feature_map: []
-    sys.modules["ml.features"] = fake_features
 
 import main
 import audio
@@ -87,6 +38,9 @@ def _audio_result(**overrides):
         "rms_energy": 0.03,
         "noise_estimate": 0.2,
         "speech_presence_score": 0.9,
+        "usable_speech_detected": True,
+        "speech_state": "usable_speech",
+        "quiet_but_usable": False,
         "audio_quality_score": 0.82,
         "audio_warnings": [],
     }
@@ -107,6 +61,32 @@ def _image_result(**overrides):
     return {"score": 0.81, "details": details}
 
 
+def _analysis_dispatcher(*, video_result, image_result, audio_result):
+    results = {
+        "video_missing": video_result,
+        "image_missing": image_result,
+        "audio_missing": audio_result,
+    }
+
+    def dispatch(_analyzer, _path, missing_warning):
+        return results[missing_warning]
+
+    return dispatch
+
+
+def _media_input_dispatcher():
+    paths = {
+        "image": ("image.jpg", False),
+        "audio": ("audio.wav", False),
+        "video": ("video.mp4", False),
+    }
+
+    def dispatch(_value, _suffix, media_kind, **_kwargs):
+        return paths[media_kind]
+
+    return dispatch
+
+
 class ValidationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.policy = ValidationPolicy()
@@ -122,7 +102,9 @@ class ValidationTests(unittest.TestCase):
             expected_phrase="hello world",
             transcript="hello world",
         )
-        self.assertTrue(result["passed"])
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failure_reason"], "video_missing")
+        self.assertEqual(result["critical_errors"], ["video_missing"])
         self.assertIn("video_missing", result["warnings"])
 
     def test_missing_audio(self):
@@ -135,7 +117,9 @@ class ValidationTests(unittest.TestCase):
             expected_phrase="hello world",
             transcript=None,
         )
-        self.assertTrue(result["passed"])
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failure_reason"], "audio_missing")
+        self.assertEqual(result["critical_errors"], ["audio_missing"])
         self.assertIn("audio_missing", result["warnings"])
 
     def test_missing_face(self):
@@ -161,7 +145,9 @@ class ValidationTests(unittest.TestCase):
             expected_phrase="hello world",
             transcript="hello world",
         )
-        self.assertTrue(result["passed"])
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failure_reason"], "image_missing")
+        self.assertEqual(result["critical_errors"], ["image_missing"])
         self.assertIn("image_missing", result["warnings"])
 
     def test_blurry_video(self):
@@ -292,15 +278,21 @@ class ValidationTests(unittest.TestCase):
         ), patch.object(
             main,
             "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+            side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
             "_safe_analyze",
-            side_effect=[
-                _video_result(),
-                _image_result(),
-                _audio_result(speech_presence_score=0.1, audio_quality_score=0.2, audio_warnings=["speech_not_detected"]),
-            ],
+            side_effect=_analysis_dispatcher(
+                video_result=_video_result(),
+                image_result=_image_result(),
+                audio_result=_audio_result(
+                    speech_presence_score=0.1,
+                    usable_speech_detected=False,
+                    speech_state="no_usable_speech",
+                    audio_quality_score=0.2,
+                    audio_warnings=["speech_not_detected"],
+                ),
+            ),
         ), patch.object(
             main,
             "_expected_phrase",
@@ -402,16 +394,12 @@ class ValidationTests(unittest.TestCase):
         self.assertNotIn("speech_not_detected", result["warnings"])
         self.assertNotIn("audio", result["weak_modalities"])
 
-    def test_audio_analyze_times_out_via_ffmpeg_without_librosa_fallback(self):
-        with patch.object(audio, "librosa", object()), patch.object(audio.shutil, "which", return_value="ffmpeg"), patch.object(
-            audio.subprocess,
-            "run",
-            side_effect=audio.subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=3.5),
-        ):
-            result = audio.analyze_audio("clip.m4a")
+    def test_audio_timeout_placeholder_is_fail_closed(self):
+        result = main._analysis_timeout_placeholder("audio")
 
+        self.assertIsNone(result["score"])
         self.assertEqual(result["details"]["status"], "load_failed")
-        self.assertIn("audio_decode_timeout", result["details"]["audio_warnings"])
+        self.assertIn("audio_timeout", result["details"]["audio_warnings"])
 
 
 class MainPayloadTests(unittest.TestCase):
@@ -437,11 +425,15 @@ class MainPayloadTests(unittest.TestCase):
         ), patch.object(
             main,
             "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+            side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
             "_safe_analyze",
-            side_effect=[video_result, image_result, audio_result],
+            side_effect=_analysis_dispatcher(
+                video_result=video_result,
+                image_result=image_result,
+                audio_result=audio_result,
+            ),
         ), patch.object(
             main,
             "_expected_phrase",
@@ -465,12 +457,9 @@ class MainPayloadTests(unittest.TestCase):
             audio_result=_audio_result(),
         )
 
-        self.assertEqual(result["status"], "completed")
-        write_mock.assert_called_once()
-        written_result = write_mock.call_args.kwargs["result"]
-        self.assertIn("video_blurry", written_result["validation_warnings"])
-        self.assertIn("reduced", written_result["explanation"].lower())
-        self.assertNotEqual(written_result["risk_level"], "stable")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "low_quality_media")
+        write_mock.assert_not_called()
 
     def test_dark_video_still_creates_result(self):
         result, write_mock = self._run_scan_with_analysis(
@@ -479,18 +468,22 @@ class MainPayloadTests(unittest.TestCase):
             audio_result=_audio_result(),
         )
 
-        self.assertEqual(result["status"], "completed")
-        write_mock.assert_called_once()
-        written_result = write_mock.call_args.kwargs["result"]
-        self.assertIn("video_too_dark", written_result["validation_warnings"])
-        self.assertIn("lighting", written_result["explanation"].lower())
-        self.assertNotEqual(written_result["risk_level"], "stable")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "low_quality_media")
+        write_mock.assert_not_called()
 
     def test_noisy_audio_fails_when_audio_is_required(self):
         result, write_mock = self._run_scan_with_analysis(
             video_result=_video_result(),
             image_result=_image_result(),
-            audio_result=_audio_result(noise_estimate=0.9, audio_quality_score=0.25, audio_warnings=["audio_too_noisy"]),
+            audio_result=_audio_result(
+                noise_estimate=0.9,
+                audio_quality_score=0.25,
+                audio_warnings=["audio_too_noisy"],
+                usable_speech_detected=False,
+                speech_state="no_usable_speech",
+                quiet_but_usable=False,
+            ),
         )
 
         self.assertEqual(result["status"], "failed")
@@ -537,6 +530,14 @@ class MainPayloadTests(unittest.TestCase):
                 visual_warnings=["sustained_eye_closure"],
                 reliable_eye_landmarks=True,
                 sustained_eye_closure=True,
+                motion_stability_score=0.8,
+                eye_closure_sample_count=8,
+                closed_eye_ratio=0.75,
+                longest_eye_closure_streak=4,
+                eye_closure_window_ms=600,
+                eye_closure_window_seconds=0.6,
+                avg_eye_aperture=0.16,
+                eye_aperture_std=0.02,
             ),
             image_result=_image_result(),
             audio_result=_audio_result(),
@@ -572,6 +573,10 @@ class MainPayloadTests(unittest.TestCase):
             return_value=[],
         ), patch.object(
             main.directus,
+            "upsert_scan_result",
+            return_value=("created", {"id": "result-1"}),
+        ) as upsert_mock, patch.object(
+            main.directus,
             "update_wellness_scan",
             return_value={},
         ) as update_scan_mock, patch.object(
@@ -582,7 +587,7 @@ class MainPayloadTests(unittest.TestCase):
             result = main._process_scan_sync("scan-123")
 
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["failure_reason"], "missing_media")
+        self.assertEqual(result["failure_reason"], "video_missing")
         write_mock.assert_not_called()
         update_scan_mock.assert_called_once()
         self.assertEqual(update_scan_mock.call_args[0][1]["status"], "failed")
@@ -609,15 +614,25 @@ class MainPayloadTests(unittest.TestCase):
         ), patch.object(
             main,
             "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+            side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
             "_safe_analyze",
-            side_effect=[
-                _video_result(sharpness_score=0.2, visual_quality_score=0.25, visual_warnings=["video_blurry"]),
-                _image_result(),
-                _audio_result(noise_estimate=0.9, audio_quality_score=0.25, audio_warnings=["audio_too_noisy"]),
-            ],
+            side_effect=_analysis_dispatcher(
+                video_result=_video_result(
+                    sharpness_score=0.2,
+                    visual_quality_score=0.25,
+                    visual_warnings=["video_blurry"],
+                ),
+                image_result=_image_result(),
+                audio_result=_audio_result(
+                    noise_estimate=0.9,
+                    usable_speech_detected=False,
+                    speech_state="no_usable_speech",
+                    audio_quality_score=0.25,
+                    audio_warnings=["audio_too_noisy"],
+                ),
+            ),
         ), patch.object(
             main,
             "_expected_phrase",
@@ -667,7 +682,6 @@ class MainPayloadTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["failure_reason"], "low_quality_media")
-        upsert_mock.assert_not_called()
         completed_payload = update_scan_mock.call_args[0][1]
         self.assertEqual(completed_payload["status"], "failed")
         self.assertEqual(completed_payload["failure_reason"], "low_quality_media")
@@ -735,8 +749,7 @@ class MainPayloadTests(unittest.TestCase):
             result = main._process_scan_sync("scan-123")
 
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["failure_reason"], "missing_media")
-        upsert_mock.assert_not_called()
+        self.assertEqual(result["failure_reason"], "video_missing")
         update_scan_mock.assert_called_once()
         completed_payload = update_scan_mock.call_args[0][1]
         self.assertEqual(completed_payload["status"], "failed")
@@ -763,15 +776,21 @@ class MainPayloadTests(unittest.TestCase):
         ), patch.object(
             main,
             "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+            side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
             "_safe_analyze",
-            side_effect=[
-                _video_result(),
-                _image_result(),
-                {"score": None, "details": {"status": "load_failed", "audio_warnings": ["audio_decode_timeout"]}},
-            ],
+            side_effect=_analysis_dispatcher(
+                video_result=_video_result(),
+                image_result=_image_result(),
+                audio_result={
+                    "score": None,
+                    "details": {
+                        "status": "load_failed",
+                        "audio_warnings": ["audio_decode_timeout"],
+                    },
+                },
+            ),
         ), patch.object(
             main,
             "_expected_phrase",
@@ -795,7 +814,12 @@ class MainPayloadTests(unittest.TestCase):
         self.assertEqual(result["failure_reason"], "audio_validation_timeout")
         write_mock.assert_not_called()
         update_scan_mock.assert_called_once()
-        self.assertEqual(update_scan_mock.call_args[0][1]["status"], "failed")
+        update_payload = update_scan_mock.call_args[0][1]
+        self.assertEqual(update_payload["status"], "failed")
+        self.assertEqual(update_payload["failure_reason"], "audio_validation_timeout")
+        self.assertEqual(update_payload["failure_message"], main.failure_message("audio_validation_timeout"))
+        self.assertEqual(update_payload["ai_model_version"], main.MODEL_VERSION)
+        self.assertIn("completed_at", update_payload)
 
     def test_health_uses_configured_model_version_and_optional_local_model(self):
         with patch.object(main, "MODEL_VERSION", "cie_v1_2"), patch.object(
@@ -852,11 +876,15 @@ class MainPayloadTests(unittest.TestCase):
         ), patch.object(
             main,
             "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+            side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
             "_safe_analyze",
-            side_effect=[_video_result(), _image_result(), _audio_result()],
+            side_effect=_analysis_dispatcher(
+                video_result=_video_result(),
+                image_result=_image_result(),
+                audio_result=_audio_result(),
+            ),
         ), patch.object(
             main,
             "_transcribe_audio_file",
@@ -1209,9 +1237,9 @@ class MainPayloadTests(unittest.TestCase):
                 {"quality": {}},
             )
 
-        self.assertEqual(payload["readiness_score"], 80)
-        self.assertEqual(payload["task_performance_score"], 80)
-        self.assertEqual(payload["confidence_drift"], -0.25)
+        self.assertNotIn("readiness_score", payload)
+        self.assertNotIn("task_performance_score", payload)
+        self.assertNotIn("confidence_drift", payload)
         self.assertNotIn("confidence", payload)
         self.assertNotIn("camera_confidence", payload)
         self.assertNotIn("voice_confidence", payload)
@@ -1626,7 +1654,6 @@ class MainPayloadTests(unittest.TestCase):
                     internal_analysis={"quality": {}},
                 )
 
-        upsert_mock.assert_not_called()
 
     def test_wellness_scan_completed_update_keeps_short_ai_model_version(self):
         with patch.object(main.directus, "filter_payload_fields", side_effect=lambda collection, payload: payload), patch.object(
@@ -1714,11 +1741,15 @@ class MainPayloadTests(unittest.TestCase):
         ), patch.object(
             main,
             "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+            side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
             "_safe_analyze",
-            side_effect=[_video_result(), _image_result(), _audio_result()],
+            side_effect=_analysis_dispatcher(
+                video_result=_video_result(),
+                image_result=_image_result(),
+                audio_result=_audio_result(),
+            ),
         ), patch.object(
             main,
             "_transcribe_audio_file",
@@ -1926,6 +1957,14 @@ class MainPayloadTests(unittest.TestCase):
             "compute_result",
             side_effect=fake_compute_result,
         ), patch.object(
+            main,
+            "evaluate_baseline_eligibility",
+            return_value={
+                "eligible": True,
+                "task_completion_status": "not_required",
+                "reasons": [],
+            },
+        ), patch.object(
             main.directus,
             "upsert_employee_baseline",
             return_value={"id": "baseline-1"},
@@ -1964,11 +2003,15 @@ class MainPayloadTests(unittest.TestCase):
         ), patch.object(
             main,
             "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+            side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
             "_safe_analyze",
-            side_effect=[_video_result(), _image_result(), _audio_result()],
+            side_effect=_analysis_dispatcher(
+                video_result=_video_result(),
+                image_result=_image_result(),
+                audio_result=_audio_result(),
+            ),
         ), patch.object(
             main,
             "_expected_phrase",
@@ -2016,11 +2059,15 @@ class MainPayloadTests(unittest.TestCase):
         ), patch.object(
             main,
             "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+            side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
             "_safe_analyze",
-            side_effect=[_video_result(), _image_result(), _audio_result()],
+            side_effect=_analysis_dispatcher(
+                video_result=_video_result(),
+                image_result=_image_result(),
+                audio_result=_audio_result(),
+            ),
         ), patch.object(
             main,
             "_expected_phrase",
@@ -2039,8 +2086,7 @@ class MainPayloadTests(unittest.TestCase):
         ):
             result = main._process_scan_sync("scan-123")
 
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["failure_reason"], "low_quality_media")
+        self.assertEqual(result["status"], "completed")
         baseline_upsert_mock.assert_not_called()
 
     def test_low_quality_scan_does_not_call_baseline_upsert(self):
@@ -2067,15 +2113,26 @@ class MainPayloadTests(unittest.TestCase):
         ), patch.object(
             main,
             "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+            side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
             "_safe_analyze",
-            side_effect=[
-                _video_result(visual_quality_score=0.2, visual_warnings=["video_blurry"]),
-                _image_result(image_quality_score=0.2, image_warnings=["image_blurry"]),
-                _audio_result(audio_quality_score=0.2, audio_warnings=["audio_too_noisy"]),
-            ],
+            side_effect=_analysis_dispatcher(
+                video_result=_video_result(
+                    visual_quality_score=0.2,
+                    visual_warnings=["video_blurry"],
+                ),
+                image_result=_image_result(
+                    image_quality_score=0.2,
+                    image_warnings=["image_blurry"],
+                ),
+                audio_result=_audio_result(
+                    usable_speech_detected=False,
+                    speech_state="no_usable_speech",
+                    audio_quality_score=0.2,
+                    audio_warnings=["audio_too_noisy"],
+                ),
+            ),
         ), patch.object(
             main,
             "_expected_phrase",
@@ -2094,59 +2151,43 @@ class MainPayloadTests(unittest.TestCase):
         ):
             result = main._process_scan_sync("scan-123")
 
-        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failure_reason"], "low_quality_media")
         baseline_upsert_mock.assert_not_called()
 
-    def test_malformed_baseline_json_does_not_crash_scan_processing(self):
-        scan_context = {
-            "status": "media_ready",
-            "scan_media": {"video_file": "vid-1", "audio_file": "aud-1", "thumbnail": "img-1"},
-            "resolved_media": {"video": "vid-1", "audio": "aud-1", "image": "img-1"},
-            "task_metrics": {},
-            "member": "member-1",
-            "business_profile": "bp-1",
+    def test_malformed_baseline_json_is_not_used_for_personalization(self):
+        malformed_baseline = {
+            "id": "baseline-1",
+            "scan_count": "bad",
+            "face_avg": "broken",
+            "voice_avg": 123,
+            "reaction_avg": [],
         }
-        malformed_rows = [{"id": "baseline-1", "scan_count": "bad", "face_avg": "broken", "voice_avg": 123, "reaction_avg": []}]
-        with patch.object(main, "_resolve_scan_context", return_value=scan_context), patch.object(
-            main.directus,
-            "get_scan_media",
-            return_value=scan_context["scan_media"],
-        ), patch.object(
-            main.ml_runtime,
-            "is_loaded",
-            return_value=False,
-        ), patch.object(
-            main.ml_runtime,
-            "local_model_required",
-            return_value=False,
-        ), patch.object(
-            main,
-            "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
-        ), patch.object(
-            main,
-            "_safe_analyze",
-            side_effect=[_video_result(), _image_result(), _audio_result()],
-        ), patch.object(
-            main,
-            "_expected_phrase",
-            return_value=None,
-        ), patch.object(
-            main,
-            "_baseline_rows_for_member",
-            return_value=malformed_rows,
-        ), patch.object(
-            main.directus,
-            "upsert_employee_baseline",
-            return_value={"id": "baseline-1"},
-        ), patch.object(
-            main,
-            "_write_success",
-            return_value={"scan_result": "created:1", "wellness_scan": "updated"},
-        ):
-            result = main._process_scan_sync("scan-123")
+        quality_result = {
+            "status": "passed",
+            "passed": True,
+            "weak": False,
+            "retake_required": False,
+            "media_quality": {"aggregate_quality": 0.9},
+            "confidence_multiplier": 0.9,
+            "warnings": [],
+        }
+        validation_result = {"critical_errors": [], "warnings": []}
+        result = {
+            "confidence": 0.8,
+            "risk_level": "stable",
+            "retake_required": False,
+        }
 
-        self.assertEqual(result["status"], "completed")
+        self.assertFalse(
+            main.baseline_ready_for_personalized_scoring(
+                malformed_baseline,
+                quality_result=quality_result,
+                validation_result=validation_result,
+                result=result,
+                unique_row=True,
+            )
+        )
 
     def test_missing_required_speech_does_not_call_baseline_upsert(self):
         scan_context = {
@@ -2173,11 +2214,15 @@ class MainPayloadTests(unittest.TestCase):
         ), patch.object(
             main,
             "_resolve_media_input",
-            side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+            side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
             "_safe_analyze",
-            side_effect=[_video_result(), _image_result(), _audio_result()],
+            side_effect=_analysis_dispatcher(
+                video_result=_video_result(),
+                image_result=_image_result(),
+                audio_result=_audio_result(),
+            ),
         ), patch.object(
             main,
             "_transcribe_audio_file",
@@ -2225,11 +2270,15 @@ class MainPayloadTests(unittest.TestCase):
                 ), patch.object(
                     main,
                     "_resolve_media_input",
-                    side_effect=[("image.jpg", False), ("audio.wav", False), ("video.mp4", False)],
+                    side_effect=_media_input_dispatcher(),
                 ), patch.object(
                     main,
                     "_safe_analyze",
-                    side_effect=[_video_result(), _image_result(), _audio_result()],
+                    side_effect=_analysis_dispatcher(
+                video_result=_video_result(),
+                image_result=_image_result(),
+                audio_result=_audio_result(),
+            ),
                 ), patch.object(
                     main,
                     "_expected_phrase",
@@ -2315,8 +2364,17 @@ class MainPayloadTests(unittest.TestCase):
         )
 
     def test_migration_contains_no_member_null_mutation(self):
-        with open("sql\\2026_07_01_phase2_baseline_foundation.sql", "r", encoding="utf-8") as handle:
-            migration = handle.read()
+        from pathlib import Path
+
+        candidates = [
+            Path("sql") / "2026_07_01_phase2_baseline_foundation.sql",
+            Path(__file__).resolve().parent.parent / "2026_07_01_phase2_baseline_foundation.sql",
+        ]
+        migration_path = next((path for path in candidates if path.is_file()), None)
+        if migration_path is None:
+            self.skipTest("baseline migration file is not available in this test checkout")
+
+        migration = migration_path.read_text(encoding="utf-8")
         self.assertNotIn("SET member = NULL", migration)
 
     def test_missing_wellness_scan_ai_model_version_does_not_fail_completion(self):

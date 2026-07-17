@@ -1,4 +1,5 @@
 import unittest
+import json
 from unittest.mock import MagicMock
 
 from baseline import (
@@ -14,6 +15,7 @@ from utils import sanitize_payload
 import requests
 import scoring
 import video
+import main
 
 
 def _signal(score, details):
@@ -169,10 +171,10 @@ class PipelineTests(unittest.TestCase):
 
     def test_static_eyes_closed_is_not_sustained_eye_closure(self):
         eligible = is_scan_eligible_for_baseline(
-            quality_result={"status": "passed", "weak": False, "retake_required": False, "media_quality": {"aggregate_quality": 0.9}, "confidence_multiplier": 0.9},
-            validation_result={"critical_errors": [], "warnings": []},
+            quality_result={"status": "passed", "passed": True, "weak": False, "retake_required": False, "media_quality": {"aggregate_quality": 0.9}, "confidence_multiplier": 0.9},
+            validation_result={"passed": True, "critical_errors": [], "warnings": []},
             result={"confidence": 0.8, "risk_level": "stable", "retake_required": False},
-            signals={"camera": {"details": {"avg_ear": 0.22, "left_right_eye_asymmetry": 0.01, "eyes_closed": True}}, "voice": {"details": {"rms_energy": 0.03}}},
+            signals={"camera": {"details": {"status": "ok", "avg_ear": 0.22, "left_right_eye_asymmetry": 0.01, "eyes_closed": True}}, "voice": {"details": {"status": "ok", "rms_energy": 0.03}}},
         )
         self.assertTrue(eligible)
 
@@ -261,10 +263,10 @@ class PipelineTests(unittest.TestCase):
 
     def test_naturally_narrow_eye_user_can_create_baseline_without_temporal_gate(self):
         eligible = is_scan_eligible_for_baseline(
-            quality_result={"status": "passed", "weak": False, "retake_required": False, "media_quality": {"aggregate_quality": 0.9}, "confidence_multiplier": 0.9},
-            validation_result={"critical_errors": [], "warnings": []},
+            quality_result={"status": "passed", "passed": True, "weak": False, "retake_required": False, "media_quality": {"aggregate_quality": 0.9}, "confidence_multiplier": 0.9},
+            validation_result={"passed": True, "critical_errors": [], "warnings": []},
             result={"confidence": 0.8, "risk_level": "stable", "retake_required": False},
-            signals={"camera": {"details": {"avg_ear": 0.16, "left_right_eye_asymmetry": 0.01}}, "voice": {"details": {"rms_energy": 0.03}}},
+            signals={"camera": {"details": {"status": "ok", "avg_ear": 0.16, "left_right_eye_asymmetry": 0.01}}, "voice": {"details": {"status": "ok", "rms_energy": 0.03}}},
         )
         self.assertTrue(eligible)
 
@@ -281,15 +283,15 @@ class PipelineTests(unittest.TestCase):
             "face_avg": {
                 "schema_version": 2,
                 "feature_stats": {
-                    "open_eye_aperture": {"median": 0.30, "mad": 0.01},
-                    "left_right_eye_asymmetry": {"median": 0.01, "mad": 0.005},
+                    "open_eye_aperture": {"median": 0.30, "mad": 0.01, "count": 6},
+                    "left_right_eye_asymmetry": {"median": 0.01, "mad": 0.005, "count": 6},
                 },
             },
             "voice_avg": {
                 "schema_version": 2,
                 "feature_stats": {
-                    "normalized_voice_energy": {"median": 0.03, "mad": 0.002},
-                    "speech_rate": {"median": 2.1, "mad": 0.2},
+                    "normalized_voice_energy": {"median": 0.03, "mad": 0.002, "count": 6},
+                    "speech_rate": {"median": 2.1, "mad": 0.2, "count": 6},
                 },
             },
         }
@@ -357,8 +359,8 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(personalized["risk_level"] == "high_risk")
 
     def test_personalized_gate_requires_active_valid_baseline(self):
-        quality_result = {"status": "passed", "weak": False, "retake_required": False, "media_quality": {"aggregate_quality": 0.9}, "confidence_multiplier": 0.9, "warnings": []}
-        validation_result = {"critical_errors": [], "warnings": []}
+        quality_result = {"status": "passed", "passed": True, "weak": False, "retake_required": False, "media_quality": {"aggregate_quality": 0.9}, "confidence_multiplier": 0.9, "warnings": []}
+        validation_result = {"passed": True, "critical_errors": [], "warnings": []}
         result = {"confidence": 0.8, "risk_level": "stable", "retake_required": False}
         active_baseline = {
             "scan_count": 4,
@@ -367,7 +369,7 @@ class PipelineTests(unittest.TestCase):
             "voice_avg": {"schema_version": 2, "feature_stats": {"normalized_voice_energy": {"median": 0.014, "mad": 0.02, "count": 4}}},
             "reaction_avg": {"schema_version": 2, "feature_stats": {}},
         }
-        inactive_baseline = dict(active_baseline, is_active=False)
+        inactive_baseline = dict(active_baseline, scan_count=2, is_active=False)
         malformed_baseline = {
             "scan_count": 4,
             "is_active": True,
@@ -394,9 +396,38 @@ class PipelineTests(unittest.TestCase):
                 unique_row=True,
             )
         )
-        self.assertFalse(
+        # A malformed face reference does not cancel a valid supported voice
+        # reference. Personalization requires at least one valid supported reference.
+        self.assertTrue(
             baseline_ready_for_personalized_scoring(
                 malformed_baseline,
+                quality_result=quality_result,
+                validation_result=validation_result,
+                result=result,
+                unique_row=True,
+            )
+        )
+
+        no_valid_reference_baseline = {
+            "scan_count": 4,
+            "is_active": True,
+            "face_avg": {
+                "schema_version": 2,
+                "feature_stats": {
+                    "open_eye_aperture": {"median": None, "mad": 0.02, "count": 4}
+                },
+            },
+            "voice_avg": {
+                "schema_version": 2,
+                "feature_stats": {
+                    "normalized_voice_energy": {"median": None, "mad": 0.02, "count": 4}
+                },
+            },
+            "reaction_avg": {"schema_version": 2, "feature_stats": {}},
+        }
+        self.assertFalse(
+            baseline_ready_for_personalized_scoring(
+                no_valid_reference_baseline,
                 quality_result=quality_result,
                 validation_result=validation_result,
                 result=result,
@@ -455,9 +486,32 @@ class PipelineTests(unittest.TestCase):
 
     def test_low_quality_media_warning(self):
         signals = {
-            "camera": _signal(0.2, {"status": "ok", "image_warnings": ["image_blurry"]}),
-            "video": _signal(0.25, {"status": "ok", "visual_warnings": ["video_blurry"]}),
-            "voice": _signal(0.22, {"status": "ok", "audio_warnings": ["audio_too_noisy"]}),
+            "camera": _signal(
+                0.2,
+                {
+                    "status": "ok",
+                    "image_quality_score": 0.2,
+                    "image_warnings": ["image_blurry"],
+                },
+            ),
+            "video": _signal(
+                0.25,
+                {
+                    "status": "ok",
+                    "duration_seconds": 5.0,
+                    "visual_quality_score": 0.25,
+                    "visual_warnings": ["video_blurry"],
+                },
+            ),
+            "voice": _signal(
+                0.22,
+                {
+                    "status": "ok",
+                    "duration_seconds": 4.0,
+                    "audio_quality_score": 0.22,
+                    "audio_warnings": ["audio_too_noisy"],
+                },
+            ),
         }
         result = assess_quality(signals)
         self.assertTrue(result["passed"])
@@ -630,6 +684,14 @@ class PipelineTests(unittest.TestCase):
                     "visual_warnings": ["sustained_eye_closure"],
                     "reliable_eye_landmarks": True,
                     "sustained_eye_closure": True,
+                    "motion_stability_score": 0.88,
+                    "eye_closure_sample_count": 8,
+                    "closed_eye_ratio": 0.75,
+                    "longest_eye_closure_streak": 4,
+                    "eye_closure_window_ms": 720.0,
+                    "eye_closure_window_seconds": 0.72,
+                    "avg_eye_aperture": 0.12,
+                    "eye_aperture_std": 0.025,
                 },
             ),
             "voice": _signal(0.8, {"status": "ok", "audio_confidence": 0.8, "audio_quality_score": 0.8, "audio_warnings": []}),
@@ -676,7 +738,9 @@ class PipelineTests(unittest.TestCase):
                     "speech_presence_score": 0.46,
                     "rms_energy": 0.011,
                     "silence_ratio": 0.61,
-                    "speech_rate": 0.78,
+                    "speech_rate": None,
+                    "speech_state": "quiet_usable_speech",
+                    "usable_speech_detected": True,
                     "quiet_but_usable": True,
                 },
             ),
@@ -718,7 +782,9 @@ class PipelineTests(unittest.TestCase):
                     "speech_presence_score": 0.5,
                     "rms_energy": 0.012,
                     "silence_ratio": 0.58,
-                    "speech_rate": 0.82,
+                    "speech_rate": None,
+                    "speech_state": "quiet_usable_speech",
+                    "usable_speech_detected": True,
                     "quiet_but_usable": True,
                 },
             ),
@@ -895,6 +961,8 @@ class PipelineTests(unittest.TestCase):
                     "audio_quality_score": 0.62,
                     "audio_warnings": [],
                     "speech_presence_score": 0.64,
+                    "speech_state": "quiet_usable_speech",
+                    "usable_speech_detected": True,
                     "quiet_but_usable": True,
                 },
             ),
@@ -926,6 +994,108 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["risk_level"], "low_focus")
         self.assertNotEqual(result["risk_level"], "high_risk")
         self.assertLess(result["confidence"], 0.45)
+
+    def test_task_score_requires_exact_positive_integer_attempts(self):
+        invalid_attempts = [None, 0, -1, 3.0, "3", True]
+        for attempts in invalid_attempts:
+            with self.subTest(attempts=attempts):
+                self.assertIsNone(
+                    scoring.compute_task_score(
+                        {
+                            "reaction_time": 0.5,
+                            "errors": 0,
+                            "attempts": attempts,
+                        }
+                    )
+                )
+
+        self.assertIsNotNone(
+            scoring.compute_task_score(
+                {"reaction_time": 0.5, "errors": 0, "attempts": 3}
+            )
+        )
+
+    def test_bool_only_eye_closure_is_not_confirmed(self):
+        signals = {
+            "video": _signal(
+                0.8,
+                {
+                    "status": "ok",
+                    "reliable_eye_landmarks": True,
+                    "sustained_eye_closure": True,
+                },
+            )
+        }
+        self.assertFalse(scoring._confirmed_sustained_eye_closure(signals))
+
+    def test_complete_consistent_eye_closure_is_confirmed(self):
+        signals = {
+            "video": _signal(
+                0.8,
+                {
+                    "status": "ok",
+                    "reliable_eye_landmarks": True,
+                    "sustained_eye_closure": True,
+                    "motion_stability_score": 0.9,
+                    "eye_closure_sample_count": 8,
+                    "closed_eye_ratio": 0.75,
+                    "longest_eye_closure_streak": 4,
+                    "eye_closure_window_ms": 720.0,
+                    "eye_closure_window_seconds": 0.72,
+                    "avg_eye_aperture": 0.12,
+                    "eye_aperture_std": 0.02,
+                },
+            )
+        }
+        self.assertTrue(scoring._confirmed_sustained_eye_closure(signals))
+
+    def test_audio_usable_speech_requires_consistent_state_and_flags(self):
+        self.assertTrue(
+            scoring._audio_usable_speech(
+                {
+                    "speech_state": "usable_speech",
+                    "usable_speech_detected": True,
+                    "quiet_but_usable": False,
+                },
+                [],
+            )
+        )
+        self.assertTrue(
+            scoring._audio_usable_speech(
+                {
+                    "speech_state": "quiet_usable_speech",
+                    "usable_speech_detected": True,
+                    "quiet_but_usable": True,
+                },
+                [],
+            )
+        )
+
+        rejected = [
+            ({"speech_state": "usable_speech"}, []),
+            ({"usable_speech_detected": True}, []),
+            (
+                {
+                    "speech_state": "quiet_usable_speech",
+                    "usable_speech_detected": True,
+                    "quiet_but_usable": False,
+                },
+                [],
+            ),
+            (
+                {
+                    "speech_state": "usable_speech",
+                    "usable_speech_detected": True,
+                    "quiet_but_usable": False,
+                },
+                ["audio_too_noisy"],
+            ),
+        ]
+        for details, warnings in rejected:
+            with self.subTest(details=details, warnings=warnings):
+                self.assertFalse(
+                    scoring._audio_usable_speech(details, warnings)
+                )
 
     def test_duplicate_scan_result_prevention(self):
         client = DirectusClient(base_url="http://example.com", token="x")
@@ -961,7 +1131,7 @@ class PipelineTests(unittest.TestCase):
         _, kwargs = client.list_items.call_args
         self.assertEqual(kwargs["sort"], "-scan_count,-date_updated")
 
-    def test_directus_400_logs_response_body(self):
+    def test_directus_400_logs_sanitized_summary_without_response_body(self):
         client = DirectusClient(base_url="http://example.com", token="x")
         response = requests.Response()
         response.status_code = 400
@@ -981,22 +1151,36 @@ class PipelineTests(unittest.TestCase):
                     )
 
         combined = "\n".join(logs.output)
-        self.assertIn("status_code=400", combined)
+        self.assertIn("response_summary={'status_code': 400", combined)
         self.assertIn("/items/scan_results", combined)
         self.assertIn("payload_keys=['confidence', 'risk_level', 'scan_id']", combined)
-        self.assertIn("Invalid payload", combined)
+        self.assertNotIn("Invalid payload", combined)
+        self.assertNotIn("one-to-many", combined)
 
-    def test_directus_value_too_long_body_is_logged(self):
+
+    def test_directus_value_too_long_logs_only_sanitized_error_code(self):
         client = DirectusClient(base_url="http://example.com", token="x")
         response = requests.Response()
         response.status_code = 400
         response.url = "http://example.com/items/scan_results"
-        response._content = (
-            b'{"errors":[{"message":"Value \\"Conntinuity Intelligence Engine v1.2\\" for field '
-            b'\\"ai_model_version\\" in collection \\"scan_results\\" is too long.",'
-            b'"extensions":{"collection":"scan_results","field":"ai_model_version",'
-            b'"value":"Conntinuity Intelligence Engine v1.2","code":"VALUE_TOO_LONG"}}]}'
-        )
+        response._content = json.dumps(
+            {
+                "errors": [
+                    {
+                        "message": (
+                            "Value 'Conntinuity Intelligence Engine v1.2' for field "
+                            "'ai_model_version' in collection 'scan_results' is too long."
+                        ),
+                        "extensions": {
+                            "collection": "scan_results",
+                            "field": "ai_model_version",
+                            "value": "Conntinuity Intelligence Engine v1.2",
+                            "code": "VALUE_TOO_LONG",
+                        },
+                    }
+                ]
+            }
+        ).encode("utf-8")
 
         with unittest.mock.patch("directus_client.requests.request", return_value=response):
             with self.assertLogs("ai-server", level="ERROR") as logs:
@@ -1010,9 +1194,11 @@ class PipelineTests(unittest.TestCase):
                     )
 
         combined = "\n".join(logs.output)
-        self.assertIn("VALUE_TOO_LONG", combined)
+        self.assertIn("'code': 'VALUE_TOO_LONG'", combined)
         self.assertIn("ai_model_version", combined)
-        self.assertIn("Conntinuity Intelligence Engine v1.2", combined)
+        self.assertNotIn("for field", combined)
+        self.assertNotIn("is too long", combined)
+
 
 
 if __name__ == "__main__":

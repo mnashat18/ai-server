@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+import math
 from statistics import median
 from typing import Any
 
 from config import (
     BASELINE_ACTIVE_AFTER,
-    BASELINE_EVENING_START_HOUR,
     BASELINE_HIGH_CONFIDENCE_AFTER,
-    BASELINE_MORNING_END_HOUR,
     BASELINE_PROVISIONAL_AFTER,
     BASELINE_USE_AFTER,
     BASELINE_MAX_STORED_SAMPLES,
@@ -31,7 +29,6 @@ PERSONALIZATION_FEATURES = (
     ("face_avg", "open_eye_aperture"),
     ("face_avg", "left_right_eye_asymmetry"),
     ("voice_avg", "normalized_voice_energy"),
-    ("voice_avg", "speech_rate"),
 )
 
 BASELINE_CALIBRATION_WARNING_BLOCKLIST = {
@@ -61,38 +58,89 @@ BASELINE_CALIBRATION_WARNING_BLOCKLIST = {
     "fatigue_hard_gate",
 }
 
-
-def _utc_now() -> str:
-    return datetime.utcnow().isoformat() + "Z"
-
-
-def _to_datetime(value: str | None) -> datetime:
-    if not value:
-        return datetime.utcnow()
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception:
-        return datetime.utcnow()
+def _normalized_status(details: dict[str, Any] | None) -> str | None:
+    if not isinstance(details, dict):
+        return None
+    status = details.get("status")
+    if not isinstance(status, str):
+        return None
+    normalized = status.strip().lower()
+    return normalized or None
 
 
-def _time_bucket(scanned_at: str | None) -> str:
-    hour = _to_datetime(scanned_at).hour
-    if hour < BASELINE_MORNING_END_HOUR:
-        return "morning"
-    if hour >= BASELINE_EVENING_START_HOUR:
-        return "evening"
-    return "midday"
+def _is_finite_number(value: Any) -> bool:
+    return type(value) in {int, float} and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _strict_float(value: Any, *, min_value: float | None = None, max_value: float | None = None) -> float | None:
+    if not _is_finite_number(value):
+        return None
+    numeric = float(value)
+    if min_value is not None and numeric < min_value:
+        return None
+    if max_value is not None and numeric > max_value:
+        return None
+    return numeric
+
+
+def _legacy_float(value: Any, *, min_value: float | None = None, max_value: float | None = None) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            return None
+    elif not _is_finite_number(value):
+        return None
+    return _strict_float(value, min_value=min_value, max_value=max_value)
+
+
+def _strict_int(value: Any, *, min_value: int | None = None, max_value: int | None = None) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if type(value) is int:
+        numeric = value
+    else:
+        return None
+    if min_value is not None and numeric < min_value:
+        return None
+    if max_value is not None and numeric > max_value:
+        return None
+    return numeric
+
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _append_unique(items: list[str], value: str | None) -> None:
+    if isinstance(value, str):
+        value = value.strip()
+        if value and value not in items:
+            items.append(value)
+
+
+def _feature_valid(value: Any, *, non_negative: bool = True, normalized: bool = True) -> float | None:
+    if normalized:
+        return _strict_float(value, min_value=0.0, max_value=1.0)
+    if non_negative:
+        return _strict_float(value, min_value=0.0)
+    return _strict_float(value)
 
 
 def _baseline_count(baseline: dict | None) -> int:
-    current = baseline or {}
-    value = current.get("eligible_scan_count")
-    if value is None:
-        value = current.get("scan_count", 0)
-    try:
-        return max(int(value or 0), 0)
-    except (TypeError, ValueError):
-        return 0
+    current = _safe_dict(baseline)
+    eligible = _strict_int(current.get("eligible_scan_count"), min_value=0)
+    if eligible is not None:
+        return eligible
+    scan_count = _strict_int(current.get("scan_count"), min_value=0)
+    if scan_count is not None:
+        return scan_count
+    return 0
 
 
 def _baseline_status_from_count(count: int) -> str:
@@ -120,20 +168,17 @@ def _baseline_confidence_from_count(count: int) -> float:
 
 
 def _coerce_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    return _strict_float(value)
 
 
 def _clean_sample_list(values: Any) -> list[float]:
     cleaned: list[float] = []
-    for raw in values or []:
-        value = _coerce_float(raw)
+    if not isinstance(values, (list, tuple)):
+        return cleaned
+    for raw in values:
+        value = _strict_float(raw, min_value=0.0)
         if value is not None:
-            cleaned.append(float(value))
+            cleaned.append(value)
     return cleaned[-BASELINE_SAMPLE_LIMIT:]
 
 
@@ -152,34 +197,46 @@ def _empty_robust_payload(feature_names: list[str]) -> dict[str, Any]:
 
 
 def _legacy_feature_seed(value: Any, count: int) -> list[float]:
-    numeric = _coerce_float(value)
-    if numeric is None or count <= 0:
+    numeric = _legacy_float(value, min_value=0.0, max_value=1.0)
+    valid_count = _strict_int(count, min_value=0)
+    if numeric is None or valid_count is None or valid_count <= 0:
         return []
-    sample_count = min(max(count, 1), 5)
+    sample_count = min(max(valid_count, 1), 5)
     return [float(numeric)] * sample_count
 
 
 def _legacy_feature_stats(value: Any, std: Any) -> dict[str, float]:
-    center = _coerce_float(value) or 0.0
-    spread = _coerce_float(std) or 0.0
+    center = _legacy_float(value, min_value=0.0, max_value=1.0)
+    spread = _legacy_float(std, min_value=0.0)
+    if center is None or spread is None:
+        return {}
     mad = spread / BASELINE_STD_TO_MAD if spread > 0 else 0.0
     return {
         "median": round(float(center), 4),
         "mad": round(max(float(mad), 0.0), 4),
-        "count": 1 if center is not None else 0,
+        "count": 1,
     }
 
 
+def _bucket_count_entry(value: Any) -> int:
+    if not isinstance(value, dict):
+        return 0
+    count = _strict_int(value.get("count"), min_value=0)
+    return count if count is not None else 0
+
+
 def _existing_feature_samples(baseline: dict | None, field_name: str, feature_names: list[str]) -> dict[str, list[float]]:
-    current = baseline or {}
-    metadata = current.get("baseline_metadata") or {}
-    sample_root = metadata.get("samples") or {}
-    field_samples = sample_root.get(field_name) or {}
+    current = _safe_dict(baseline)
+    metadata = _safe_dict(current.get("baseline_metadata"))
+    sample_root = _safe_dict(metadata.get("samples"))
+    field_samples = _safe_dict(sample_root.get(field_name))
+    if not isinstance(field_samples, dict):
+        field_samples = {}
     existing = {
         name: _clean_sample_list(field_samples.get(name))
         for name in feature_names
     }
-    payload = current.get(field_name)
+    payload = _safe_dict(current).get(field_name)
     if isinstance(payload, dict) and payload.get("schema_version") == BASELINE_SCHEMA_VERSION:
         for name in feature_names:
             if existing[name]:
@@ -196,7 +253,7 @@ def _existing_feature_samples(baseline: dict | None, field_name: str, feature_na
         elif field_name == "voice_avg":
             if not existing["normalized_voice_energy"]:
                 existing["normalized_voice_energy"] = _legacy_feature_seed(legacy_value, count)
-            if not existing["speech_rate"]:
+            if not existing.get("speech_rate"):
                 existing["speech_rate"] = []
         elif field_name == "reaction_avg":
             existing = {}
@@ -237,21 +294,21 @@ def _build_feature_payload(
 
 
 def _bucket_counts(baseline: dict | None) -> dict[str, int]:
-    current = baseline or {}
-    metadata = current.get("baseline_metadata") or {}
-    counts = metadata.get("bucket_counts") or {}
-    if counts:
+    current = _safe_dict(baseline)
+    metadata = _safe_dict(current.get("baseline_metadata"))
+    counts = metadata.get("bucket_counts")
+    if isinstance(counts, dict) and counts:
         return {
-            "morning": int(counts.get("morning") or 0),
-            "midday": int(counts.get("midday") or 0),
-            "evening": int(counts.get("evening") or 0),
+            "morning": _bucket_count_entry(counts.get("morning")),
+            "midday": _bucket_count_entry(counts.get("midday")),
+            "evening": _bucket_count_entry(counts.get("evening")),
         }
-    face_avg = current.get("face_avg") or {}
-    buckets = face_avg.get("buckets") or {}
+    face_avg = _safe_dict(current.get("face_avg"))
+    buckets = _safe_dict(face_avg.get("buckets"))
     return {
-        "morning": int((buckets.get("morning") or {}).get("count", 0)),
-        "midday": int((buckets.get("midday") or {}).get("count", 0)),
-        "evening": int((buckets.get("evening") or {}).get("count", 0)),
+        "morning": _bucket_count_entry(buckets.get("morning")),
+        "midday": _bucket_count_entry(buckets.get("midday")),
+        "evening": _bucket_count_entry(buckets.get("evening")),
     }
 
 
@@ -268,16 +325,32 @@ def current_baseline_features(
     signals: dict | None,
     result: dict | None = None,
 ) -> dict[str, dict[str, float | None]]:
-    signals = signals or {}
-    camera_details = ((signals.get("camera") or {}).get("details") or {}) if isinstance(signals.get("camera"), dict) else {}
-    voice_details = ((signals.get("voice") or {}).get("details") or {}) if isinstance(signals.get("voice"), dict) else {}
+    _ = result
+    signals = _safe_dict(signals)
 
-    left_eye = _coerce_float(camera_details.get("left_eye_aperture"))
-    right_eye = _coerce_float(camera_details.get("right_eye_aperture"))
-    avg_eye = _coerce_float(camera_details.get("avg_ear"))
-    asymmetry = _coerce_float(camera_details.get("left_right_eye_asymmetry"))
-    if asymmetry is None and left_eye is not None and right_eye is not None:
-        asymmetry = abs(left_eye - right_eye)
+    camera_wrapper = _safe_dict(signals.get("camera"))
+    voice_wrapper = _safe_dict(signals.get("voice"))
+    camera_details = _safe_dict(camera_wrapper.get("details"))
+    voice_details = _safe_dict(voice_wrapper.get("details"))
+
+    camera_status = _normalized_status(camera_details)
+    voice_status = _normalized_status(voice_details)
+
+    avg_eye = None
+    asymmetry = None
+    if camera_status == "ok":
+        avg_eye = _feature_valid(camera_details.get("avg_ear"), normalized=True)
+        left_eye = _feature_valid(camera_details.get("left_eye_aperture"), normalized=True)
+        right_eye = _feature_valid(camera_details.get("right_eye_aperture"), normalized=True)
+        explicit_asymmetry = _feature_valid(camera_details.get("left_right_eye_asymmetry"), normalized=True)
+        if explicit_asymmetry is not None:
+            asymmetry = explicit_asymmetry
+        elif left_eye is not None and right_eye is not None:
+            asymmetry = abs(left_eye - right_eye)
+
+    voice_energy = None
+    if voice_status == "ok":
+        voice_energy = _feature_valid(voice_details.get("rms_energy"), normalized=True)
 
     return {
         "face_avg": {
@@ -285,8 +358,8 @@ def current_baseline_features(
             "left_right_eye_asymmetry": asymmetry,
         },
         "voice_avg": {
-            "normalized_voice_energy": _coerce_float(voice_details.get("rms_energy")),
-            "speech_rate": _coerce_float(voice_details.get("speech_rate")),
+            "normalized_voice_energy": voice_energy,
+            "speech_rate": None,
         },
         "reaction_avg": {},
     }
@@ -317,18 +390,37 @@ def _task_completion_status(
     expected_phrase: str | None,
     task: Any = None,
 ) -> str:
-    warnings = set((validation_result or {}).get("warnings") or [])
-    if expected_phrase and warnings.intersection({"speech_not_detected", "transcription_failed", "expected_phrase_missing", "phrase_mismatch"}):
+    validation_result = validation_result if isinstance(validation_result, dict) else {}
+    quality_result = quality_result if isinstance(quality_result, dict) else {}
+    warnings = set(clean_warning_codes(validation_result.get("warnings") or []))
+    expected_phrase_value = expected_phrase.strip() if isinstance(expected_phrase, str) and expected_phrase.strip() else None
+    if expected_phrase_value and warnings.intersection({"speech_not_detected", "transcription_failed", "expected_phrase_missing", "phrase_mismatch"}):
         return "incomplete_required_speech"
-    task_quality = (quality_result or {}).get("task_quality")
+    task_quality = quality_result.get("task_quality")
     task_present = False
     if isinstance(task, dict):
-        task_present = any(task.get(key) is not None for key in ["reaction_time", "errors", "attempts"])
+        attempts = _strict_int(task.get("attempts"), min_value=0)
+        errors = _strict_int(task.get("errors"), min_value=0)
+        reaction_time = _strict_float(task.get("reaction_time"), min_value=0.0)
+        if reaction_time is not None and reaction_time <= 0:
+            reaction_time = None
+        task_present = attempts is not None or errors is not None or reaction_time is not None
     elif task is not None:
-        task_present = any(getattr(task, key, None) is not None for key in ["reaction_time", "errors", "attempts"])
+        values = []
+        for key in ["reaction_time", "errors", "attempts"]:
+            try:
+                values.append(getattr(task, key, None))
+            except Exception:
+                values.append(None)
+        reaction_time = _strict_float(values[0], min_value=0.0)
+        if reaction_time is not None and reaction_time <= 0:
+            reaction_time = None
+        errors = _strict_int(values[1], min_value=0)
+        attempts = _strict_int(values[2], min_value=0)
+        task_present = attempts is not None or errors is not None or reaction_time is not None
     if task_present and task_quality in {"weak", "failed"}:
         return "incomplete_required_task"
-    if expected_phrase or task_present:
+    if expected_phrase_value or task_present:
         return "completed"
     return "not_required"
 
@@ -343,9 +435,10 @@ def evaluate_baseline_eligibility(
     task: Any = None,
     manually_unreliable: bool = False,
 ) -> dict[str, Any]:
-    quality_result = quality_result or {}
-    validation_result = validation_result or {}
-    result = result or {}
+    quality_result = quality_result if isinstance(quality_result, dict) else {}
+    validation_result = validation_result if isinstance(validation_result, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    signals = signals if isinstance(signals, dict) else {}
     features_present, feature_reasons, _ = _feature_presence_requirements(signals)
     hard_gates_triggered = _hard_gates_from_signals(signals)
     task_completion_status = _task_completion_status(
@@ -356,39 +449,53 @@ def evaluate_baseline_eligibility(
     )
     reasons: list[str] = []
 
-    quality_warnings = set(clean_warning_codes((quality_result or {}).get("warnings") or []))
-    validation_warnings = set(clean_warning_codes((validation_result or {}).get("warnings") or []))
+    quality_warnings = set(clean_warning_codes(quality_result.get("warnings") or []))
+    validation_warnings = set(clean_warning_codes(validation_result.get("warnings") or []))
     combined_warnings = quality_warnings | validation_warnings
-    capture_quality = _coerce_float((quality_result.get("media_quality") or {}).get("aggregate_quality"))
-    measurement_reliability = _coerce_float(quality_result.get("confidence_multiplier"))
-    baseline_confidence = _coerce_float(result.get("confidence"))
+    capture_quality = _strict_float(_safe_dict(quality_result.get("media_quality")).get("aggregate_quality"), min_value=0.0, max_value=1.0)
+    measurement_reliability = _strict_float(quality_result.get("confidence_multiplier"), min_value=0.0, max_value=1.0)
+    baseline_confidence = _strict_float(result.get("confidence"), min_value=0.0, max_value=1.0)
+    quality_status = quality_result.get("status")
+    quality_passed_flag = quality_result.get("passed")
+    quality_passed = quality_status == "passed" and (quality_passed_flag is None or quality_passed_flag is True)
+    if "passed" in quality_result and not isinstance(quality_passed_flag, bool):
+        quality_passed = False
+    if quality_passed_flag is False:
+        quality_passed = False
+    weak_flag = quality_result.get("weak") is True
+    retake_flag = quality_result.get("retake_required") is True
+    result_retake_flag = result.get("retake_required") is True
+    critical_errors = validation_result.get("critical_errors") or []
+    if not isinstance(critical_errors, list):
+        critical_errors = list(critical_errors) if isinstance(critical_errors, tuple) else [critical_errors]
 
-    if quality_result.get("status") != "passed" or quality_result.get("weak"):
-        reasons.append("insufficient_capture_quality")
-    if quality_result.get("retake_required") or result.get("retake_required"):
-        reasons.append("retake_required")
+    if not quality_passed or weak_flag:
+        _append_unique(reasons, "insufficient_capture_quality")
+    if retake_flag or result_retake_flag:
+        _append_unique(reasons, "retake_required")
     if not features_present:
-        reasons.extend(feature_reasons)
-    if validation_result.get("critical_errors"):
-        reasons.append("validation_failure")
+        for reason in feature_reasons:
+            _append_unique(reasons, reason)
+    if critical_errors:
+        _append_unique(reasons, "validation_failure")
     if task_completion_status not in {"completed", "not_required"}:
-        reasons.append(task_completion_status)
+        _append_unique(reasons, task_completion_status)
     if capture_quality is None or capture_quality < BASELINE_MIN_CAPTURE_QUALITY:
-        reasons.append("capture_quality_too_low")
+        _append_unique(reasons, "capture_quality_too_low")
     if measurement_reliability is None or measurement_reliability < BASELINE_MIN_CAPTURE_QUALITY:
-        reasons.append("measurement_reliability_too_low")
+        _append_unique(reasons, "measurement_reliability_too_low")
     if baseline_confidence is None or baseline_confidence < BASELINE_MIN_CONFIDENCE:
-        reasons.append("low_confidence")
+        _append_unique(reasons, "low_confidence")
     if combined_warnings & BASELINE_CALIBRATION_WARNING_BLOCKLIST:
-        reasons.append("measurement_warning")
+        _append_unique(reasons, "measurement_warning")
     if hard_gates_triggered:
-        reasons.append("fatigue_hard_gate")
+        _append_unique(reasons, "fatigue_hard_gate")
     if str(result.get("risk_level") or "").strip().lower() != "stable":
-        reasons.append("risk_not_stable")
-    if manually_unreliable:
-        reasons.append("manually_unreliable")
+        _append_unique(reasons, "risk_not_stable")
+    if manually_unreliable is True:
+        _append_unique(reasons, "manually_unreliable")
     if validation_warnings & {"speech_not_detected", "expected_phrase_missing", "phrase_mismatch", "transcription_failed"}:
-        reasons.append("speech_required_not_completed")
+        _append_unique(reasons, "speech_required_not_completed")
 
     return {
         "eligible": len(reasons) == 0,
@@ -410,9 +517,8 @@ def baseline_signal_payload(
     signals: dict,
     scanned_at: str | None = None,
 ) -> dict:
-    current = baseline or {}
+    current = _safe_dict(baseline)
     next_count = _baseline_count(current) + 1
-    bucket = _time_bucket(scanned_at)
     features = current_baseline_features(signals=signals)
 
     face_samples = _existing_feature_samples(current, "face_avg", FACE_FEATURES)
@@ -426,13 +532,7 @@ def baseline_signal_payload(
     for name, value in (features.get("reaction_avg") or {}).items():
         _append_feature_sample(reaction_samples, name, value)
 
-    bucket_counts = _bucket_counts(current)
-    bucket_counts[bucket] = int(bucket_counts.get(bucket) or 0) + 1
     baseline_status = _baseline_status_from_count(next_count)
-    baseline_confidence = _baseline_confidence_from_count(next_count)
-    activated_at = current.get("activated_at")
-    if baseline_status == "active" and not activated_at:
-        activated_at = _utc_now()
 
     face_avg = _build_feature_payload(FACE_FEATURES, face_samples)
     voice_avg = _build_feature_payload(VOICE_FEATURES, voice_samples)
@@ -447,12 +547,16 @@ def baseline_signal_payload(
 
 
 def baseline_status_payload(baseline: dict | None) -> dict:
+    baseline = _safe_dict(baseline)
     count = _baseline_count(baseline)
-    status = _baseline_status_from_count(count)
-    is_active = status == "active"
+    stored_is_active = baseline.get("is_active") is True
+    count_status = _baseline_status_from_count(count)
+    is_active = stored_is_active and count >= BASELINE_ACTIVE_AFTER and count_status == "active"
+    status = "active" if is_active else ("provisional" if count >= BASELINE_PROVISIONAL_AFTER else "collecting")
     is_provisional = status == "provisional"
     buckets = _bucket_counts(baseline)
     scans_remaining = max(BASELINE_ACTIVE_AFTER - count, 0)
+    stored_confidence = _strict_float(baseline.get("baseline_confidence"), min_value=0.0, max_value=1.0)
 
     if is_active:
         message = "Baseline active. Current scans are compared against the employee's own readiness pattern."
@@ -470,19 +574,21 @@ def baseline_status_payload(baseline: dict | None) -> dict:
         "scans_remaining": scans_remaining,
         "is_provisional": is_provisional,
         "baseline_status": status,
-        "baseline_confidence": _coerce_float((baseline or {}).get("baseline_confidence")) or _baseline_confidence_from_count(count),
-        "needs_morning_scan": int(buckets.get("morning", 0)) == 0,
-        "needs_evening_scan": int(buckets.get("evening", 0)) == 0,
+        "baseline_confidence": stored_confidence if stored_confidence is not None else _baseline_confidence_from_count(count),
+        "needs_morning_scan": (buckets.get("morning", 0) == 0),
+        "needs_evening_scan": (buckets.get("evening", 0) == 0),
         "message": message,
     }
 
 
 def baseline_ready_for_scoring(baseline: dict | None) -> bool:
+    baseline = baseline if isinstance(baseline, dict) else {}
     status = baseline_status_payload(baseline)
-    return bool(status["is_active"]) and int(status["scan_count"]) >= BASELINE_USE_AFTER
+    return baseline.get("is_active") is True and bool(status["is_active"]) and status["scan_count"] >= BASELINE_USE_AFTER
 
 
 def baseline_has_valid_personalization_references(baseline: dict | None) -> bool:
+    baseline = _safe_dict(baseline)
     return any(
         baseline_feature_reference(baseline, field_name, feature_name) is not None
         for field_name, feature_name in PERSONALIZATION_FEATURES
@@ -499,20 +605,25 @@ def baseline_ready_for_personalized_scoring(
     expected_phrase: str | None = None,
     unique_row: bool = True,
 ) -> bool:
-    if not unique_row:
+    if unique_row is not True:
         return False
+    baseline = _safe_dict(baseline)
     if not baseline_ready_for_scoring(baseline):
         return False
     if not baseline_has_valid_personalization_references(baseline):
         return False
 
-    quality_result = quality_result or {}
-    validation_result = validation_result or {}
-    result = result or {}
+    quality_result = quality_result if isinstance(quality_result, dict) else {}
+    validation_result = validation_result if isinstance(validation_result, dict) else {}
+    result = result if isinstance(result, dict) else {}
 
-    if quality_result.get("status") != "passed" or quality_result.get("weak") or quality_result.get("retake_required"):
+    passed_flag = quality_result.get("passed")
+    if quality_result.get("status") != "passed" or (passed_flag is not None and not isinstance(passed_flag, bool)) or passed_flag is False or quality_result.get("weak") is True or quality_result.get("retake_required") is True:
         return False
     if validation_result.get("critical_errors"):
+        return False
+    validation_passed_flag = validation_result.get("passed")
+    if validation_passed_flag is not True:
         return False
     if _task_completion_status(
         validation_result=validation_result,
@@ -522,46 +633,66 @@ def baseline_ready_for_personalized_scoring(
     ) not in {"completed", "not_required"}:
         return False
 
-    quality_warnings = set(clean_warning_codes((quality_result or {}).get("warnings") or []))
-    validation_warnings = set(clean_warning_codes((validation_result or {}).get("warnings") or []))
+    quality_warnings = set(clean_warning_codes(quality_result.get("warnings") or []))
+    validation_warnings = set(clean_warning_codes(validation_result.get("warnings") or []))
     if quality_warnings & BASELINE_CALIBRATION_WARNING_BLOCKLIST:
         return False
     if validation_warnings & {"speech_not_detected", "expected_phrase_missing", "phrase_mismatch", "transcription_failed"}:
         return False
-    if _coerce_float(quality_result.get("confidence_multiplier")) is not None and float(quality_result["confidence_multiplier"]) < BASELINE_MIN_CAPTURE_QUALITY:
+    confidence_multiplier = _strict_float(quality_result.get("confidence_multiplier"), min_value=0.0, max_value=1.0)
+    if confidence_multiplier is None:
         return False
-    if _coerce_float((quality_result.get("media_quality") or {}).get("aggregate_quality")) is not None and float((quality_result.get("media_quality") or {}).get("aggregate_quality")) < BASELINE_MIN_CAPTURE_QUALITY:
+    if confidence_multiplier < BASELINE_MIN_CAPTURE_QUALITY:
         return False
-    if _coerce_float(result.get("confidence")) is not None and float(result["confidence"]) < BASELINE_MIN_CONFIDENCE:
+    aggregate_quality = _strict_float(_safe_dict(quality_result.get("media_quality")).get("aggregate_quality"), min_value=0.0, max_value=1.0)
+    if aggregate_quality is None:
+        return False
+    if aggregate_quality < BASELINE_MIN_CAPTURE_QUALITY:
+        return False
+    result_confidence = _strict_float(result.get("confidence"), min_value=0.0, max_value=1.0)
+    if result_confidence is None:
+        return False
+    if result_confidence < BASELINE_MIN_CONFIDENCE:
         return False
     return True
 
 
 def legacy_baseline_stat(baseline: dict | None, key: str) -> dict[str, float] | None:
-    payload = (baseline or {}).get(key)
+    payload = _safe_dict(baseline).get(key)
     if not isinstance(payload, dict):
         return None
     if payload.get("schema_version") == BASELINE_SCHEMA_VERSION:
         return None
-    if payload.get("avg") is None:
+    center = _legacy_float(payload.get("avg"), min_value=0.0, max_value=1.0)
+    spread = payload.get("std")
+    if center is None:
         return None
+    if spread is None:
+        spread_value = 0.0
+    else:
+        spread_value = _legacy_float(spread, min_value=0.0)
+        if spread_value is None:
+            return None
     return {
-        "median": _coerce_float(payload.get("avg")) or 0.0,
-        "mad": max((_coerce_float(payload.get("std")) or 0.0) / BASELINE_STD_TO_MAD, BASELINE_MAD_FLOOR),
+        "median": center,
+        "mad": max((spread_value or 0.0) / BASELINE_STD_TO_MAD, BASELINE_MAD_FLOOR),
     }
 
 
 def baseline_feature_reference(baseline: dict | None, field_name: str, feature_name: str) -> dict[str, float] | None:
-    payload = (baseline or {}).get(field_name)
+    payload = _safe_dict(baseline).get(field_name)
     if isinstance(payload, dict) and payload.get("schema_version") == BASELINE_SCHEMA_VERSION:
-        stats = (payload.get("feature_stats") or {}).get(feature_name)
+        if (field_name, feature_name) not in PERSONALIZATION_FEATURES:
+            return None
+        stats = _safe_dict(payload.get("feature_stats")).get(feature_name)
         if isinstance(stats, dict):
-            center = _coerce_float(stats.get("median"))
-            mad = _coerce_float(stats.get("mad"))
-            if center is not None:
+            center = _strict_float(stats.get("median"), min_value=0.0, max_value=1.0)
+            mad = _strict_float(stats.get("mad"), min_value=0.0)
+            count = _strict_int(stats.get("count"), min_value=1)
+            if center is not None and mad is not None and count is not None:
                 return {
                     "median": round(center, 4),
-                    "mad": round(max(mad or 0.0, BASELINE_MAD_FLOOR), 4),
+                    "mad": round(max(mad, BASELINE_MAD_FLOOR), 4),
                 }
     if field_name == "face_avg" and feature_name == "open_eye_aperture":
         return legacy_baseline_stat(baseline, field_name)

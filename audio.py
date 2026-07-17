@@ -1,75 +1,323 @@
+from __future__ import annotations
+
+import math
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import wave
+from contextlib import suppress
 
 import numpy as np
 
 from logger import get_logger
-from utils import clamp01, clean_warning_codes, safe_number
+from utils import clean_warning_codes, clamp01, safe_number
 
-try:
+try:  # pragma: no cover - optional dependency
     import librosa
-except Exception:  # pragma: no cover
+except Exception:  # pragma: no cover - optional dependency
     librosa = None
 
-try:
+try:  # pragma: no cover - optional dependency
     import whisper
-except Exception:  # pragma: no cover
+except Exception:  # pragma: no cover - optional dependency
     whisper = None
 
-try:
+try:  # pragma: no cover - optional dependency
     from scipy import signal
-except Exception:  # pragma: no cover
+except Exception:  # pragma: no cover - optional dependency
     signal = None
+
 
 MIN_AUDIO_DURATION_SEC = 1.5
 MIN_RMS_ENERGY = 0.012
 MAX_REASONABLE_PEAK = 0.98
 TARGET_SAMPLE_RATE = 16000
 MAX_AUDIO_ANALYSIS_SEC = 3.0
-FFMPEG_CONVERSION_TIMEOUT_SECONDS = float(os.getenv("AUDIO_FFMPEG_CONVERSION_TIMEOUT_SECONDS", "3.5"))
+MAX_AUDIO_SAMPLES = int(TARGET_SAMPLE_RATE * MAX_AUDIO_ANALYSIS_SEC)
 CLIPPING_SAMPLE_THRESHOLD = 0.98
 MAX_CLIPPING_RATIO = 0.015
+MIN_SOURCE_SAMPLE_RATE = 8000
+MAX_SOURCE_SAMPLE_RATE = 192000
+MAX_SOURCE_CHANNELS = 8
+ALLOWED_SAMPLE_WIDTHS = {1, 2, 3, 4}
+
+
+def _parse_positive_timeout_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    if not isinstance(raw, str):
+        raise ValueError(f"{name} must be a finite positive number")
+    text = raw.strip()
+    if not text:
+        raise ValueError(f"{name} must be a finite positive number")
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a finite positive number") from None
+    if not math.isfinite(numeric) or numeric <= 0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return numeric
+
+
+FFMPEG_CONVERSION_TIMEOUT_SECONDS = _parse_positive_timeout_env(
+    "AUDIO_FFMPEG_CONVERSION_TIMEOUT_SECONDS",
+    3.5,
+)
+
 _WHISPER_MODEL = None
 _WHISPER_MODEL_NAME = None
+_WHISPER_LOCK = threading.RLock()
 logger = get_logger()
 
 
-def _safe_mean(values) -> float:
-    return float(np.mean(values)) if values is not None and len(values) else 0.0
+class _AudioEmptyError(RuntimeError):
+    pass
 
 
 def _elapsed_ms(started_at: float) -> int:
     return int(round((time.perf_counter() - started_at) * 1000))
 
 
+def _is_string_like(value) -> bool:
+    return isinstance(value, str)
+
+
+def _normalize_audio_path(audio_path) -> str | None:
+    if not isinstance(audio_path, str):
+        return None
+    normalized = audio_path.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _failure_result(status: str, warning: str) -> dict:
+    return {"score": None, "details": {"status": status, "audio_warnings": [warning]}}
+
+
+def _is_supported_pcm_width(sample_width: int) -> bool:
+    return isinstance(sample_width, int) and not isinstance(sample_width, bool) and sample_width in ALLOWED_SAMPLE_WIDTHS
+
+
+def _is_safe_sample_rate(sample_rate: int) -> bool:
+    return (
+        isinstance(sample_rate, int)
+        and not isinstance(sample_rate, bool)
+        and MIN_SOURCE_SAMPLE_RATE <= sample_rate <= MAX_SOURCE_SAMPLE_RATE
+    )
+
+
+def _is_safe_channel_count(channels: int) -> bool:
+    return isinstance(channels, int) and not isinstance(channels, bool) and 1 <= channels <= MAX_SOURCE_CHANNELS
+
+
+def _is_safe_frame_count(frame_count: int) -> bool:
+    return isinstance(frame_count, int) and not isinstance(frame_count, bool) and frame_count >= 0
+
+
+def _coerce_float32_array(values) -> np.ndarray:
+    if values is None:
+        raise ValueError("audio_array_missing")
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ValueError("audio_array_invalid")
+    arr = np.asarray(values)
+    if arr.dtype.kind in {"b", "O", "U", "S", "V", "c"}:
+        raise ValueError("audio_array_invalid")
+    if arr.ndim != 1:
+        raise ValueError("audio_array_invalid")
+    if arr.size == 0:
+        raise ValueError("audio_array_empty")
+    arr = np.ascontiguousarray(arr.astype(np.float32, copy=False).reshape(-1))
+    if arr.size > MAX_AUDIO_SAMPLES:
+        raise ValueError("audio_array_too_long")
+    if not np.isfinite(arr).all():
+        raise ValueError("audio_array_nonfinite")
+    return arr
+
+
+def _ensure_1d_float32(values) -> np.ndarray:
+    arr = _coerce_float32_array(values)
+    if arr.dtype != np.float32:
+        arr = np.ascontiguousarray(arr.astype(np.float32, copy=False))
+    return arr
+
+
+def _safe_mean(values) -> float | None:
+    if values is None:
+        return None
+    arr = np.asarray(values)
+    if arr.size == 0:
+        return None
+    if arr.dtype.kind in {"b", "O", "U", "S", "V", "c"}:
+        raise ValueError("invalid_numeric_array")
+    numeric = arr.astype(np.float64, copy=False).reshape(-1)
+    if not np.isfinite(numeric).all():
+        raise ValueError("nonfinite_numeric_array")
+    return float(np.mean(numeric))
+
+
+def _finite_row_means(matrix) -> list[float | None]:
+    arr = np.asarray(matrix)
+    if arr.ndim != 2:
+        raise ValueError("feature_matrix_must_be_2d")
+    if arr.shape[0] != 5:
+        raise ValueError("feature_matrix_shape_mismatch")
+    if arr.dtype.kind in {"b", "O", "U", "S", "V", "c"}:
+        raise ValueError("feature_matrix_invalid")
+    numeric = arr.astype(np.float64, copy=False)
+    if not np.isfinite(numeric).all():
+        raise ValueError("feature_matrix_nonfinite")
+    return [float(np.mean(row)) for row in numeric]
+
+
+def _require_librosa_feature_matrix(name: str, matrix, *, expected_rows: int | None = None) -> np.ndarray:
+    arr = np.asarray(matrix)
+    if arr.ndim != 2:
+        raise RuntimeError(f"{name}_feature_failed")
+    if expected_rows is not None and arr.shape[0] != expected_rows:
+        raise RuntimeError(f"{name}_feature_failed")
+    if arr.size == 0:
+        raise RuntimeError(f"{name}_feature_failed")
+    if arr.dtype.kind in {"b", "O", "U", "S", "V", "c"}:
+        raise RuntimeError(f"{name}_feature_failed")
+    numeric = arr.astype(np.float64, copy=False)
+    if not np.isfinite(numeric).all():
+        raise RuntimeError(f"{name}_feature_failed")
+    return arr
+
+
 def _rms_numpy(y: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
-    if frame_length <= 0 or hop_length <= 0:
-        raise ValueError("frame_length_and_hop_length_must_be_positive")
-    if y is None:
-        return np.zeros(1, dtype=np.float32)
-
-    samples = np.asarray(y, dtype=np.float32)
-    if samples.ndim != 1:
-        samples = np.ravel(samples)
-
+    if isinstance(frame_length, bool) or not isinstance(frame_length, int) or frame_length <= 0:
+        raise ValueError("frame_length_must_be_positive")
+    if isinstance(hop_length, bool) or not isinstance(hop_length, int) or hop_length <= 0:
+        raise ValueError("hop_length_must_be_positive")
+    samples = _ensure_1d_float32(y)
+    if samples.size == 0:
+        raise ValueError("audio_signal_empty")
     pad = frame_length // 2
     padded = np.pad(samples, (pad, pad), mode="constant")
     if padded.size < frame_length:
         padded = np.pad(padded, (0, frame_length - padded.size), mode="constant")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, frame_length)[::hop_length]
+    if windows.size == 0:
+        windows = padded[-frame_length:][np.newaxis, :]
+    rms = np.sqrt(np.mean(windows * windows, axis=-1, dtype=np.float64))
+    rms = np.ascontiguousarray(np.asarray(rms, dtype=np.float32).reshape(-1))
+    if not np.isfinite(rms).all():
+        raise ValueError("rms_nonfinite")
+    return rms
 
-    frame_count = 1 + ((padded.size - frame_length) // hop_length)
-    stride = padded.strides[0]
-    frames = np.lib.stride_tricks.as_strided(
-        padded,
-        shape=(frame_length, frame_count),
-        strides=(stride, hop_length * stride),
-        writeable=False,
-    )
-    return np.sqrt(np.mean(frames * frames, axis=0, dtype=np.float64)).astype(np.float32, copy=False)
+
+def _zero_crossing_rate_numpy(y: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
+    if isinstance(frame_length, bool) or not isinstance(frame_length, int) or frame_length <= 0:
+        raise ValueError("frame_length_must_be_positive")
+    if isinstance(hop_length, bool) or not isinstance(hop_length, int) or hop_length <= 0:
+        raise ValueError("hop_length_must_be_positive")
+    samples = _ensure_1d_float32(y)
+    if samples.size == 0:
+        raise ValueError("audio_signal_empty")
+    pad = frame_length // 2
+    padded = np.pad(samples, (pad, pad), mode="constant")
+    if padded.size < frame_length:
+        padded = np.pad(padded, (0, frame_length - padded.size), mode="constant")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, frame_length)[::hop_length]
+    if windows.size == 0:
+        windows = padded[-frame_length:][np.newaxis, :]
+    signs = np.signbit(windows)
+    zcr = np.mean(signs[:, 1:] != signs[:, :-1], axis=-1, dtype=np.float64)
+    zcr = np.ascontiguousarray(np.asarray(zcr, dtype=np.float32).reshape(-1))
+    if not np.isfinite(zcr).all():
+        raise ValueError("zcr_nonfinite")
+    return zcr
+
+
+def _frame_spectrum(y: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    samples = _ensure_1d_float32(y)
+    if isinstance(sr, bool) or not isinstance(sr, int) or sr <= 0:
+        raise ValueError("sample_rate_must_be_positive")
+    window = np.hanning(samples.size).astype(np.float32, copy=False) if samples.size > 1 else np.ones(1, dtype=np.float32)
+    weighted = samples * window
+    spectrum = np.abs(np.fft.rfft(weighted))
+    freqs = np.fft.rfftfreq(samples.size, d=1.0 / float(sr)) if samples.size > 1 else np.asarray([0.0], dtype=np.float64)
+    spectrum = np.asarray(spectrum, dtype=np.float64).reshape(-1)
+    freqs = np.asarray(freqs, dtype=np.float64).reshape(-1)
+    return freqs, spectrum, weighted.astype(np.float32, copy=False)
+
+
+def _spectral_centroid(y: np.ndarray, sr: int, *, hop_length: int, n_fft: int) -> float:
+    if librosa is None:
+        raise RuntimeError("spectral_centroid_feature_failed")
+    try:
+        matrix = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length, n_fft=n_fft)
+        arr = _require_librosa_feature_matrix("spectral_centroid", matrix)
+        return float(np.mean(arr, axis=1, dtype=np.float64)[0])
+    except KeyboardInterrupt:
+        raise
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise RuntimeError("spectral_centroid_feature_failed") from exc
+
+
+def _spectral_flatness(y: np.ndarray, sr: int, *, hop_length: int, n_fft: int) -> float:
+    if librosa is None:
+        raise RuntimeError("spectral_flatness_feature_failed")
+    try:
+        matrix = librosa.feature.spectral_flatness(y=y, hop_length=hop_length, n_fft=n_fft)
+        arr = _require_librosa_feature_matrix("spectral_flatness", matrix)
+        return float(np.mean(arr, axis=1, dtype=np.float64)[0])
+    except KeyboardInterrupt:
+        raise
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise RuntimeError("spectral_flatness_feature_failed") from exc
+
+
+def _mfcc_summary_like(y: np.ndarray, sr: int, *, hop_length: int, n_fft: int) -> list[float | None]:
+    if librosa is None:
+        raise RuntimeError("mfcc_feature_failed")
+    try:
+        matrix = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5, hop_length=hop_length, n_fft=n_fft)
+        arr = _require_librosa_feature_matrix("mfcc", matrix, expected_rows=5)
+        return _finite_row_means(arr)
+    except KeyboardInterrupt:
+        raise
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise RuntimeError("mfcc_feature_failed") from exc
+
+
+def _resample_if_needed(y: np.ndarray, sr: int) -> tuple[np.ndarray, int]:
+    if sr == TARGET_SAMPLE_RATE:
+        return np.ascontiguousarray(y.astype(np.float32, copy=False).reshape(-1)), sr
+    if y.size == 0:
+        raise _AudioEmptyError("audio_signal_empty")
+    if signal is not None and hasattr(signal, "resample_poly"):
+        gcd = int(np.gcd(sr, TARGET_SAMPLE_RATE))
+        up = TARGET_SAMPLE_RATE // gcd
+        down = sr // gcd
+        resampled = signal.resample_poly(y, up, down)
+    else:
+        target_count = int(round(y.size * TARGET_SAMPLE_RATE / float(sr)))
+        if target_count <= 0:
+            raise _AudioEmptyError("audio_signal_empty")
+        source_x = np.linspace(0.0, 1.0, num=y.size, endpoint=True, dtype=np.float64)
+        target_x = np.linspace(0.0, 1.0, num=target_count, endpoint=True, dtype=np.float64)
+        resampled = np.interp(target_x, source_x, y.astype(np.float64, copy=False))
+    resampled = np.ascontiguousarray(np.asarray(resampled, dtype=np.float32).reshape(-1))
+    if resampled.size == 0:
+        raise _AudioEmptyError("audio_signal_empty")
+    if resampled.size > MAX_AUDIO_SAMPLES:
+        raise ValueError("resampled_audio_too_long")
+    if not np.isfinite(resampled).all():
+        raise ValueError("resampled_audio_nonfinite")
+    return resampled, TARGET_SAMPLE_RATE
 
 
 def _pcm_bytes_to_float32(raw: bytes, sample_width: int) -> np.ndarray:
@@ -79,7 +327,10 @@ def _pcm_bytes_to_float32(raw: bytes, sample_width: int) -> np.ndarray:
     if sample_width == 2:
         return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
     if sample_width == 3:
-        bytes_view = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+        data = np.frombuffer(raw, dtype=np.uint8)
+        if data.size % 3 != 0:
+            raise ValueError("invalid_wav_payload")
+        bytes_view = data.reshape(-1, 3)
         values = (
             bytes_view[:, 0].astype(np.int32)
             | (bytes_view[:, 1].astype(np.int32) << 8)
@@ -92,90 +343,103 @@ def _pcm_bytes_to_float32(raw: bytes, sample_width: int) -> np.ndarray:
     raise ValueError("unsupported_wav_sample_width")
 
 
-def _resample_if_needed(y: np.ndarray, sr: int) -> tuple[np.ndarray, int]:
-    if sr == TARGET_SAMPLE_RATE:
-        return y.astype(np.float32, copy=False), sr
-    if signal is None:
-        return y.astype(np.float32, copy=False), sr
-    gcd = int(np.gcd(sr, TARGET_SAMPLE_RATE))
-    resampled = signal.resample_poly(y, TARGET_SAMPLE_RATE // gcd, sr // gcd)
-    return resampled.astype(np.float32, copy=False), TARGET_SAMPLE_RATE
-
-
 def _decode_wav_slice(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
-    with wave.open(audio_path, "rb") as handle:
-        source_sr = int(handle.getframerate())
-        channels = int(handle.getnchannels())
-        sample_width = int(handle.getsampwidth())
-        frame_count = int(handle.getnframes())
-        source_duration_seconds = frame_count / float(source_sr) if source_sr else 0.0
-        frames_to_read = min(frame_count, int(round(MAX_AUDIO_ANALYSIS_SEC * source_sr)))
-        raw = handle.readframes(frames_to_read)
+    try:
+        with wave.open(audio_path, "rb") as handle:
+            source_sr = handle.getframerate()
+            channels = handle.getnchannels()
+            sample_width = handle.getsampwidth()
+            frame_count = handle.getnframes()
+            if not _is_safe_sample_rate(source_sr):
+                raise ValueError("unsafe_sample_rate")
+            if not _is_safe_channel_count(channels):
+                raise ValueError("unsafe_channel_count")
+            if not _is_supported_pcm_width(sample_width):
+                raise ValueError("unsupported_wav_sample_width")
+            if not _is_safe_frame_count(frame_count):
+                raise ValueError("unsafe_frame_count")
+            if frame_count == 0:
+                raise _AudioEmptyError("empty_wav")
+            source_duration_seconds = frame_count / float(source_sr)
+            frames_to_read = min(frame_count, int(math.ceil(MAX_AUDIO_ANALYSIS_SEC * source_sr)))
+            raw = handle.readframes(frames_to_read)
+    except _AudioEmptyError:
+        raise
+    except (wave.Error, EOFError, OSError) as exc:
+        raise RuntimeError("audio_decode_failed") from exc
 
-    if not raw or source_sr <= 0 or channels <= 0:
-        return np.array([], dtype=np.float32), source_sr, source_duration_seconds, 0.0, "wave", 1
-
-    y = _pcm_bytes_to_float32(raw, sample_width)
+    if not raw:
+        raise _AudioEmptyError("empty_wav")
+    decoded = _pcm_bytes_to_float32(raw, sample_width)
+    expected_samples = frames_to_read * channels
+    if decoded.size != expected_samples:
+        raise RuntimeError("audio_decode_failed")
     if channels > 1:
-        y = y.reshape(-1, channels).mean(axis=1)
-    y, sr = _resample_if_needed(y, source_sr)
-    analysis_duration_seconds = len(y) / float(sr) if sr else 0.0
-    return y, sr, source_duration_seconds, analysis_duration_seconds, "wave", 1
+        if decoded.size % channels != 0:
+            raise RuntimeError("audio_decode_failed")
+        decoded = decoded.reshape(-1, channels).mean(axis=1)
+    decoded = np.ascontiguousarray(decoded.astype(np.float32, copy=False).reshape(-1))
+    if decoded.size == 0:
+        raise _AudioEmptyError("empty_wav")
+    if not np.isfinite(decoded).all():
+        raise RuntimeError("audio_decode_failed")
+    decoded, sr = _resample_if_needed(decoded, source_sr)
+    analysis_duration_seconds = decoded.size / float(sr)
+    return decoded, sr, source_duration_seconds, analysis_duration_seconds, "wave", frames_to_read
 
 
 def _decode_with_ffmpeg(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
-        raise RuntimeError("ffmpeg_not_installed")
-
-    fd, converted_path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        audio_path,
-        "-t",
-        str(MAX_AUDIO_ANALYSIS_SEC),
-        "-ac",
-        "1",
-        "-ar",
-        str(TARGET_SAMPLE_RATE),
-        "-f",
-        "wav",
-        converted_path,
-    ]
+        raise RuntimeError("audio_decode_failed")
+    fd = None
+    converted_path = None
     try:
-        subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-            timeout=FFMPEG_CONVERSION_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
+        fd, converted_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        fd = None
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            audio_path,
+            "-t",
+            str(MAX_AUDIO_ANALYSIS_SEC),
+            "-ac",
+            "1",
+            "-ar",
+            str(TARGET_SAMPLE_RATE),
+            "-f",
+            "wav",
+            converted_path,
+        ]
         try:
-            os.remove(converted_path)
-        except Exception:
-            pass
-        raise TimeoutError("audio_decode_timeout") from exc
-    except Exception as exc:
-        try:
-            os.remove(converted_path)
-        except Exception:
-            pass
-        raise RuntimeError("audio_decode_failed") from exc
-
-    try:
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+                timeout=FFMPEG_CONVERSION_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError("audio_decode_timeout") from exc
         return _decode_wav_slice(converted_path)
+    except _AudioEmptyError:
+        raise
+    except TimeoutError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("audio_decode_failed") from exc
     finally:
-        try:
-            os.remove(converted_path)
-        except Exception:
-            pass
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+        if converted_path:
+            with suppress(OSError):
+                os.remove(converted_path)
 
 
 def _decode_audio_once(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
@@ -183,179 +447,209 @@ def _decode_audio_once(audio_path: str) -> tuple[np.ndarray, int, float, float, 
     if ext.lower() in {".wav", ".wave"}:
         try:
             return _decode_wav_slice(audio_path)
+        except _AudioEmptyError:
+            raise
         except Exception:
             return _decode_with_ffmpeg(audio_path)
     return _decode_with_ffmpeg(audio_path)
 
 
-def _load_whisper_model():
-    global _WHISPER_MODEL, _WHISPER_MODEL_NAME
-    if whisper is None:
-        raise RuntimeError("whisper_not_installed")
-    model_name = "tiny.en"
-    if _WHISPER_MODEL is not None and _WHISPER_MODEL_NAME == model_name:
-        return _WHISPER_MODEL
-    _WHISPER_MODEL = whisper.load_model(model_name)
-    _WHISPER_MODEL_NAME = model_name
-    return _WHISPER_MODEL
-
-
-def transcribe_audio(audio_path: str) -> str:
-    if not audio_path:
-        raise RuntimeError("audio_missing")
-    model = _load_whisper_model()
-    result = model.transcribe(audio_path, language="en", fp16=False)
-    text = (result or {}).get("text")
-    if not text:
-        raise RuntimeError("transcription_failed")
-    return str(text).strip()
-
-
-def analyze_audio(audio_path: str) -> dict:
-    timings_ms: dict[str, int] = {"audio_decode_ms": 0, "audio_quality_ms": 0, "voice_activity_ms": 0}
-    if not audio_path:
-        return {
-            "score": None,
-            "details": {
-                "status": "missing",
-                "audio_warnings": ["audio_missing"],
-            },
-        }
-
-    if librosa is None:
-        return {
-            "score": None,
-            "details": {
-                "status": "load_failed",
-                "audio_warnings": ["audio_decode_failed"],
-            },
-        }
-
+def _prepare_audio_source(audio_path: str) -> tuple[str, str | None]:
+    normalized = _normalize_audio_path(audio_path)
+    if normalized is None:
+        return "missing", None
     try:
-        decode_started = time.perf_counter()
-        y, sr, source_duration_seconds, analyzed_duration_seconds, decode_backend, decode_count = _decode_audio_once(audio_path)
-        timings_ms["audio_decode_ms"] = int(round((time.perf_counter() - decode_started) * 1000))
-        logger.info(
-            "[AUDIO_DECODE_DETAIL] backend=%s decode_count=%s source_duration_ms=%s analysis_duration_ms=%s",
-            decode_backend,
-            decode_count,
-            int(round(source_duration_seconds * 1000)),
-            int(round(analyzed_duration_seconds * 1000)),
-        )
-    except TimeoutError:
-        return {
-            "score": None,
-            "details": {
-                "status": "load_failed",
-                "audio_warnings": ["audio_decode_timeout"],
-            },
-        }
-    except Exception:
-        return {
-            "score": None,
-            "details": {
-                "status": "load_failed",
-                "audio_warnings": ["audio_decode_failed"],
-            },
-        }
+        if not os.path.exists(normalized) or not os.path.isfile(normalized):
+            return "load_failed", normalized
+        if os.path.getsize(normalized) == 0:
+            return "empty_audio", normalized
+    except OSError:
+        return "load_failed", normalized
+    return "ok", normalized
 
-    if y is None or len(y) == 0:
-        return {
-            "score": None,
-            "details": {
-                "status": "empty_audio",
-                "audio_warnings": ["audio_decode_failed"],
-            },
-        }
 
-    quality_started = time.perf_counter()
-    quality_steps_ms: dict[str, int] = {}
-    duration_seconds = source_duration_seconds
+def _quality_from_features(
+    *,
+    duration_seconds: float,
+    rms_energy: float,
+    silence_ratio: float,
+    noise_estimate: float,
+    peak_volume: float,
+    clipping_ratio: float,
+) -> float:
+    duration_factor = clamp01(duration_seconds / MAX_AUDIO_ANALYSIS_SEC, 0.0) or 0.0
+    level_factor = clamp01(rms_energy / max(MIN_RMS_ENERGY * 2.5, 1e-6), 0.0) or 0.0
+    activity_factor = clamp01(1.0 - silence_ratio, 0.0) or 0.0
+    noise_factor = clamp01(1.0 - noise_estimate, 0.0) or 0.0
+    headroom_loss = max(0.0, peak_volume - MAX_REASONABLE_PEAK) / max(1.0 - MAX_REASONABLE_PEAK, 1e-6)
+    headroom_factor = clamp01(1.0 - headroom_loss - min(clipping_ratio * 6.0, 0.6), 0.0) or 0.0
+    quality = (
+        0.24 * duration_factor
+        + 0.22 * level_factor
+        + 0.20 * activity_factor
+        + 0.19 * noise_factor
+        + 0.15 * headroom_factor
+    )
+    return float(np.clip(quality, 0.0, 1.0))
+
+
+def _presence_from_features(
+    *,
+    rms_energy: float,
+    silence_ratio: float,
+    noise_estimate: float,
+    centroid: float,
+    zcr_mean: float,
+    tonal_concentration: float,
+    rms_variation: float,
+) -> float:
+    activity_factor = clamp01(1.0 - silence_ratio, 0.0) or 0.0
+    level_factor = clamp01(rms_energy / max(MIN_RMS_ENERGY * 1.75, 1e-6), 0.0) or 0.0
+    centroid_factor = clamp01(1.0 - abs(centroid - 1700.0) / 1700.0, 0.0) or 0.0
+    silence_band = clamp01(1.0 - abs(silence_ratio - 0.45) / 0.45, 0.0) or 0.0
+    tone_penalty = clamp01((tonal_concentration - 0.58) / 0.22, 0.0) or 0.0
+    variation_gate = clamp01(rms_variation / 0.30, 0.0) or 0.0
+    cleanliness = clamp01(1.0 - noise_estimate, 0.0) or 0.0
+    structure = 0.30 * silence_band + 0.30 * cleanliness + 0.20 * centroid_factor + 0.20 * level_factor
+    speech_gate = activity_factor * (0.35 + 0.65 * variation_gate) * (1.0 - min(tone_penalty, 0.95))
+    score = speech_gate * structure
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _voice_clarity_from_features(
+    *,
+    speech_presence_score: float,
+    rms_energy: float,
+    noise_estimate: float,
+) -> float:
+    speech_gate = clamp01(speech_presence_score, 0.0) or 0.0
+    activity_factor = clamp01(rms_energy / max(MIN_RMS_ENERGY * 1.5, 1e-6), 0.0) or 0.0
+    cleanliness = clamp01(1.0 - noise_estimate, 0.0) or 0.0
+    score = speech_gate * (0.35 + 0.25 * activity_factor + 0.40 * cleanliness)
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _feature_pipeline(y: np.ndarray, sr: int) -> dict:
+    if librosa is None:
+        raise RuntimeError("audio_decode_failed")
     frame_length = min(2048, max(512, int(sr * 0.032)))
     hop_length = max(256, int(frame_length / 4))
-    rms_impl = "numpy_stride_centered"
+
     step_started = time.perf_counter()
     rms = _rms_numpy(y=y, frame_length=frame_length, hop_length=hop_length)
-    quality_steps_ms["rms_ms"] = _elapsed_ms(step_started)
-    step_started = time.perf_counter()
-    zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame_length, hop_length=hop_length)[0]
-    quality_steps_ms["zcr_ms"] = _elapsed_ms(step_started)
-    step_started = time.perf_counter()
-    centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
-    quality_steps_ms["spectral_centroid_ms"] = _elapsed_ms(step_started)
-    step_started = time.perf_counter()
-    flatness = librosa.feature.spectral_flatness(y=y, hop_length=hop_length)[0]
-    quality_steps_ms["spectral_flatness_ms"] = _elapsed_ms(step_started)
-    step_started = time.perf_counter()
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5, hop_length=hop_length)
-    quality_steps_ms["mfcc_ms"] = _elapsed_ms(step_started)
-    step_started = time.perf_counter()
-    peak_volume = float(np.max(np.abs(y))) if len(y) else 0.0
-    clipping_ratio = float(np.mean(np.abs(y) >= CLIPPING_SAMPLE_THRESHOLD)) if len(y) else 0.0
-    rms_energy = _safe_mean(rms)
-    silence_ratio = float(np.mean(rms < max(MIN_RMS_ENERGY * 0.6, rms_energy * 0.35))) if len(rms) else 1.0
-    noise_estimate = float(np.clip((_safe_mean(flatness) * 0.75) + (silence_ratio * 0.25), 0.0, 1.0))
-    quality_steps_ms["derived_metrics_ms"] = _elapsed_ms(step_started)
-    timings_ms["audio_quality_ms"] = int(round((time.perf_counter() - quality_started) * 1000))
-    logger.info(
-        "[AUDIO_QUALITY_DETAIL] rms_impl=%s rms_ms=%s zcr_ms=%s spectral_centroid_ms=%s spectral_flatness_ms=%s mfcc_ms=%s derived_metrics_ms=%s",
-        rms_impl,
-        quality_steps_ms["rms_ms"],
-        quality_steps_ms["zcr_ms"],
-        quality_steps_ms["spectral_centroid_ms"],
-        quality_steps_ms["spectral_flatness_ms"],
-        quality_steps_ms["mfcc_ms"],
-        quality_steps_ms["derived_metrics_ms"],
-    )
+    rms_ms = _elapsed_ms(step_started)
 
-    voice_started = time.perf_counter()
-    speech_presence_score = float(
-        np.clip(
-            0.5 * (1.0 - silence_ratio)
-            + 0.2 * min(rms_energy / max(MIN_RMS_ENERGY, 1e-6), 1.0)
-            + 0.2 * (1.0 - min(noise_estimate, 1.0))
-            + 0.1 * (1.0 - min(abs(_safe_mean(centroid) - 1700.0) / 1700.0, 1.0)),
-            0.0,
-            1.0,
-        )
+    step_started = time.perf_counter()
+    zcr = _zero_crossing_rate_numpy(y=y, frame_length=frame_length, hop_length=hop_length)
+    zcr_ms = _elapsed_ms(step_started)
+
+    step_started = time.perf_counter()
+    centroid = _spectral_centroid(y, sr, hop_length=hop_length, n_fft=frame_length)
+    centroid_ms = _elapsed_ms(step_started)
+
+    step_started = time.perf_counter()
+    flatness = _spectral_flatness(y, sr, hop_length=hop_length, n_fft=frame_length)
+    flatness_ms = _elapsed_ms(step_started)
+
+    step_started = time.perf_counter()
+    mfcc_summary = _mfcc_summary_like(y, sr, hop_length=hop_length, n_fft=frame_length)
+    mfcc_ms = _elapsed_ms(step_started)
+
+    derived_started = time.perf_counter()
+    peak_volume = float(np.max(np.abs(y))) if y.size else 0.0
+    clipping_ratio = float(np.mean(np.abs(y) >= CLIPPING_SAMPLE_THRESHOLD)) if y.size else 0.0
+    rms_energy = float(np.mean(rms)) if rms.size else 0.0
+    silence_ratio = float(np.mean(rms < max(MIN_RMS_ENERGY * 0.6, rms_energy * 0.35))) if rms.size else 1.0
+    zcr_mean = float(np.mean(zcr)) if zcr.size else 0.0
+    rms_variation = float(np.std(rms) / max(rms_energy, 1e-6)) if rms.size else 0.0
+    spectrum = np.abs(np.fft.rfft(y * np.hanning(y.size).astype(np.float32, copy=False))) if y.size else np.asarray([], dtype=np.float32)
+    dominant_concentration = float(np.max(spectrum) / max(float(np.sum(spectrum)), 1e-6)) if spectrum.size else 0.0
+    tonal_concentration = float(np.clip(0.55 * dominant_concentration + 0.25 * (1.0 - flatness) + 0.20 * clamp01(1.0 - rms_variation / 1.5, 0.0), 0.0, 1.0))
+    noise_estimate = float(np.clip(0.65 * flatness + 0.35 * zcr_mean, 0.0, 1.0))
+    if rms_energy < MIN_RMS_ENERGY * 0.2 and silence_ratio > 0.95:
+        noise_estimate_value = 0.0
+    else:
+        noise_estimate_value = noise_estimate
+    derived_ms = _elapsed_ms(derived_started)
+    speech_presence_score = _presence_from_features(
+        rms_energy=rms_energy,
+        silence_ratio=silence_ratio,
+        noise_estimate=noise_estimate_value,
+        centroid=centroid,
+        zcr_mean=zcr_mean,
+        tonal_concentration=tonal_concentration,
+        rms_variation=rms_variation,
     )
-    speech_frames = int(np.sum(rms >= max(MIN_RMS_ENERGY * 0.6, rms_energy * 0.35))) if len(rms) else 0
-    speech_rate = float(speech_frames / max(analyzed_duration_seconds, 1e-6)) if analyzed_duration_seconds else None
+    voice_clarity_score = _voice_clarity_from_features(
+        speech_presence_score=speech_presence_score,
+        rms_energy=rms_energy,
+        noise_estimate=noise_estimate_value,
+    )
+    return {
+        "frame_length": frame_length,
+        "hop_length": hop_length,
+        "rms": rms,
+        "zcr": zcr,
+        "centroid": centroid,
+        "flatness": flatness,
+        "mfcc_summary": mfcc_summary,
+        "peak_volume": peak_volume,
+        "clipping_ratio": clipping_ratio,
+        "rms_energy": rms_energy,
+        "silence_ratio": silence_ratio,
+        "noise_estimate": noise_estimate_value,
+        "speech_presence_score": speech_presence_score,
+        "voice_clarity_score": voice_clarity_score,
+        "tonal_concentration": tonal_concentration,
+        "rms_variation": rms_variation,
+        "zcr_mean": zcr_mean,
+        "timings_ms": {
+            "rms_ms": rms_ms,
+            "zcr_ms": zcr_ms,
+            "spectral_centroid_ms": centroid_ms,
+            "spectral_flatness_ms": flatness_ms,
+            "mfcc_ms": mfcc_ms,
+            "derived_metrics_ms": derived_ms,
+        },
+    }
+
+
+def _speech_state_and_warnings(
+    *,
+    duration_seconds: float,
+    rms_energy: float,
+    noise_estimate: float,
+    silence_ratio: float,
+    speech_presence_score: float,
+    clipping_ratio: float,
+    tonal_concentration: float,
+    rms_variation: float,
+) -> tuple[list[str], str, bool, bool]:
     minimum_usable_energy = MIN_RMS_ENERGY * 0.75
     quiet_but_usable = bool(
-        rms_energy < MIN_RMS_ENERGY
-        and rms_energy >= minimum_usable_energy
-        and duration_seconds >= MIN_AUDIO_DURATION_SEC
-        and speech_presence_score >= 0.58
+        duration_seconds >= MIN_AUDIO_DURATION_SEC
+        and MIN_RMS_ENERGY * 0.65 <= rms_energy <= MIN_RMS_ENERGY * 1.15
+        and speech_presence_score >= 0.12
         and noise_estimate <= 0.68
-        and silence_ratio <= 0.45
+        and silence_ratio <= 0.55
+    )
+    obvious_tone_like = bool(
+        tonal_concentration >= 0.42
+        and rms_variation <= 0.35
+        and noise_estimate <= 0.35
+        and silence_ratio <= 0.75
     )
     no_usable_speech = bool(
-        speech_presence_score < 0.3
-        or silence_ratio > 0.8
-        or (rms_energy < minimum_usable_energy and silence_ratio > 0.6)
+        obvious_tone_like
+        or silence_ratio > 0.80
+        or (speech_presence_score < 0.15 and rms_energy < minimum_usable_energy and noise_estimate < 0.55 and clipping_ratio <= MAX_CLIPPING_RATIO)
     )
-
-    pitch_stability_score = None
-    timings_ms["voice_activity_ms"] = int(round((time.perf_counter() - voice_started) * 1000))
-
-    voice_clarity_score = float(
-        np.clip(
-            0.45 * speech_presence_score
-            + 0.25 * min(rms_energy / max(MIN_RMS_ENERGY * 1.5, 1e-6), 1.0)
-            + 0.2 * (1.0 - noise_estimate)
-            + 0.1 * (pitch_stability_score if pitch_stability_score is not None else 0.5),
-            0.0,
-            1.0,
-        )
-    )
-
     warnings: list[str] = []
     if duration_seconds < MIN_AUDIO_DURATION_SEC:
         warnings.append("audio_too_short")
     if rms_energy < minimum_usable_energy and not quiet_but_usable:
         warnings.append("audio_too_quiet")
-    if noise_estimate > 0.72:
+    if noise_estimate > 0.72 and not no_usable_speech:
         warnings.append("audio_too_noisy")
     if silence_ratio > 0.55:
         warnings.append("too_much_silence")
@@ -363,37 +657,79 @@ def analyze_audio(audio_path: str) -> dict:
         warnings.append("speech_not_detected")
     if clipping_ratio > MAX_CLIPPING_RATIO:
         warnings.append("audio_clipping")
-
+    if obvious_tone_like and "speech_not_detected" not in warnings:
+        warnings.append("speech_not_detected")
+    warnings = clean_warning_codes(warnings)
     speech_state = "usable_speech"
-    if no_usable_speech:
-        speech_state = "no_speech"
-    elif "audio_clipping" in warnings or "audio_too_noisy" in warnings or ("audio_too_quiet" in warnings and not quiet_but_usable):
+    if "audio_clipping" in warnings or "audio_too_noisy" in warnings or ("audio_too_quiet" in warnings and not quiet_but_usable and not no_usable_speech):
         speech_state = "unusable_quality"
+    elif no_usable_speech:
+        speech_state = "no_speech"
     elif quiet_but_usable:
         speech_state = "quiet_usable_speech"
+    usable_speech_detected = speech_state in {"usable_speech", "quiet_usable_speech"}
+    return warnings, speech_state, quiet_but_usable, usable_speech_detected
 
-    duration_factor = clamp01(duration_seconds / 4.0, 0.0) or 0.0
-    level_factor = clamp01(rms_energy / (MIN_RMS_ENERGY * 2.5), 0.0) or 0.0
-    headroom_factor = max(0.0, 1.0 - max(0.0, peak_volume - MAX_REASONABLE_PEAK) - min(clipping_ratio * 12.0, 0.4))
+
+def _build_success_details(
+    *,
+    y: np.ndarray,
+    sr: int,
+    source_duration_seconds: float,
+    analyzed_duration_seconds: float,
+) -> dict:
+    prepared = _ensure_1d_float32(y)
+    if prepared.size == 0:
+        raise _AudioEmptyError("audio_signal_empty")
+    if prepared.size > MAX_AUDIO_SAMPLES:
+        raise RuntimeError("audio_decode_failed")
+    quality_started = time.perf_counter()
+    features = _feature_pipeline(prepared, sr)
+
+    duration_seconds = float(prepared.size / float(sr))
+    if not math.isfinite(duration_seconds) or duration_seconds < 0.0:
+        raise RuntimeError("audio_decode_failed")
+    voice_started = time.perf_counter()
+    warnings, speech_state, quiet_but_usable, usable_speech_detected = _speech_state_and_warnings(
+        duration_seconds=duration_seconds,
+        rms_energy=features["rms_energy"],
+        noise_estimate=features["noise_estimate"],
+        silence_ratio=features["silence_ratio"],
+        speech_presence_score=features["speech_presence_score"],
+        clipping_ratio=features["clipping_ratio"],
+        tonal_concentration=features["tonal_concentration"],
+        rms_variation=features["rms_variation"],
+    )
+    voice_activity_ms = _elapsed_ms(voice_started)
+    pitch_stability_score = None
+    duration_factor = clamp01(duration_seconds / MAX_AUDIO_ANALYSIS_SEC, 0.0) or 0.0
+    level_factor = clamp01(features["rms_energy"] / max(MIN_RMS_ENERGY * 2.5, 1e-6), 0.0) or 0.0
+    headroom_loss = max(0.0, features["peak_volume"] - MAX_REASONABLE_PEAK) / max(1.0 - MAX_REASONABLE_PEAK, 1e-6)
+    headroom_factor = clamp01(1.0 - headroom_loss - min(features["clipping_ratio"] * 6.0, 0.6), 0.0) or 0.0
+    noise_factor = clamp01(1.0 - features["noise_estimate"], 0.0) or 0.0
+    activity_factor = clamp01(1.0 - features["silence_ratio"], 0.0) or 0.0
     audio_quality_score = float(
         np.clip(
-            0.25 * duration_factor
-            + 0.2 * level_factor
-            + 0.2 * (1.0 - silence_ratio)
-            + 0.2 * (1.0 - noise_estimate)
+            0.24 * duration_factor
+            + 0.22 * level_factor
+            + 0.20 * activity_factor
+            + 0.19 * noise_factor
             + 0.15 * headroom_factor,
             0.0,
             1.0,
         )
     )
+    voice_clarity_score = features["voice_clarity_score"]
     audio_confidence = float(
         np.clip(
-            0.55 * audio_quality_score + 0.45 * voice_clarity_score,
+            (0.45 * audio_quality_score + 0.55 * voice_clarity_score)
+            * clamp01(0.25 + 0.75 * features["speech_presence_score"], 0.0),
             0.0,
             1.0,
         )
     )
-
+    audio_quality_ms = _elapsed_ms(quality_started)
+    silent = bool(features["silence_ratio"] > 0.80 or features["rms_energy"] < (MIN_RMS_ENERGY * 0.5))
     details = {
         "status": "ok",
         "duration_seconds": safe_number(duration_seconds, 3),
@@ -401,29 +737,144 @@ def analyze_audio(audio_path: str) -> dict:
         "analyzed_duration_seconds": safe_number(analyzed_duration_seconds, 3),
         "analysis_sample_limit_seconds": safe_number(MAX_AUDIO_ANALYSIS_SEC, 3),
         "sample_rate": int(sr),
-        "rms_energy": safe_number(rms_energy, 6),
-        "energy": safe_number(rms_energy, 6),
-        "peak_volume": safe_number(peak_volume, 6),
-        "clipping_ratio": safe_number(clipping_ratio, 6),
-        "silence_ratio": safe_number(silence_ratio, 4),
-        "noise_estimate": safe_number(noise_estimate, 4),
-        "speech_presence_score": safe_number(speech_presence_score, 4),
-        "speech_rate": safe_number(speech_rate, 4),
-        "voice_clarity_score": safe_number(voice_clarity_score, 4),
-        "pitch_stability_score": safe_number(pitch_stability_score, 4),
+        "rms_energy": safe_number(features["rms_energy"], 6),
+        "energy": safe_number(features["rms_energy"], 6),
+        "peak_volume": safe_number(features["peak_volume"], 6),
+        "clipping_ratio": safe_number(features["clipping_ratio"], 6),
+        "silence_ratio": safe_number(features["silence_ratio"], 6),
+        "noise_estimate": safe_number(features["noise_estimate"], 6),
+        "speech_presence_score": safe_number(features["speech_presence_score"], 6),
+        "speech_rate": None,
+        "voice_clarity_score": safe_number(voice_clarity_score, 6),
+        "pitch_stability_score": safe_number(pitch_stability_score, 6),
         "speech_state": speech_state,
-        "usable_speech_detected": speech_state in {"usable_speech", "quiet_usable_speech"},
+        "usable_speech_detected": usable_speech_detected,
         "quiet_but_usable": quiet_but_usable,
-        "spectral_centroid": safe_number(_safe_mean(centroid), 2),
-        "centroid": safe_number(_safe_mean(centroid), 2),
-        "zero_crossing_rate": safe_number(_safe_mean(zcr), 6),
-        "zcr": safe_number(_safe_mean(zcr), 6),
-        "mfcc_summary": [safe_number(v, 4) for v in np.mean(mfcc, axis=1).tolist()],
-        "audio_quality_score": safe_number(audio_quality_score, 4),
-        "audio_confidence": safe_number(audio_confidence, 4),
-        "audio_warnings": clean_warning_codes(warnings),
-        "silent": silence_ratio > 0.8 or rms_energy < (MIN_RMS_ENERGY * 0.5),
-        "timings_ms": timings_ms,
-        "audio_quality_timings_ms": quality_steps_ms,
+        "spectral_centroid": safe_number(features["centroid"], 2),
+        "centroid": safe_number(features["centroid"], 2),
+        "spectral_flatness": safe_number(features["flatness"], 6),
+        "zero_crossing_rate": safe_number(features["zcr_mean"], 6),
+        "zcr": safe_number(features["zcr_mean"], 6),
+        "mfcc_summary": [safe_number(value, 4) if value is not None else None for value in features["mfcc_summary"]],
+        "audio_quality_score": safe_number(audio_quality_score, 6),
+        "audio_confidence": safe_number(audio_confidence, 6),
+        "audio_warnings": warnings,
+        "silent": silent,
+        "timings_ms": {
+            "audio_decode_ms": None,
+            "audio_quality_ms": audio_quality_ms,
+            "voice_activity_ms": voice_activity_ms,
+        },
+        "audio_quality_timings_ms": features["timings_ms"],
     }
-    return {"score": details["audio_confidence"], "details": details}
+    return details
+
+
+def analyze_audio(audio_path: str) -> dict:
+    if _normalize_audio_path(audio_path) is None:
+        return _failure_result("missing", "audio_missing")
+
+    path_state, normalized_path = _prepare_audio_source(audio_path)
+    if path_state == "missing":
+        return _failure_result("missing", "audio_missing")
+    if path_state == "empty_audio":
+        return _failure_result("empty_audio", "audio_decode_failed")
+    if path_state == "load_failed":
+        return _failure_result("load_failed", "audio_decode_failed")
+
+    if librosa is None:
+        return _failure_result("load_failed", "audio_decode_failed")
+
+    try:
+        decode_started = time.perf_counter()
+        y, sr, source_duration_seconds, analyzed_duration_seconds, decode_backend, decode_count = _decode_audio_once(normalized_path)
+        decode_ms = _elapsed_ms(decode_started)
+        logger.info(
+            "[AUDIO_DECODE_DETAIL] backend=%s decode_count=%s source_duration_ms=%s analysis_duration_ms=%s",
+            decode_backend,
+            decode_count,
+            int(round(source_duration_seconds * 1000)),
+            int(round(analyzed_duration_seconds * 1000)),
+        )
+        details = _build_success_details(
+            y=y,
+            sr=sr,
+            source_duration_seconds=source_duration_seconds,
+            analyzed_duration_seconds=analyzed_duration_seconds,
+        )
+        details["timings_ms"]["audio_decode_ms"] = decode_ms
+        return {"score": details["audio_confidence"], "details": details}
+    except TimeoutError:
+        return _failure_result("load_failed", "audio_decode_timeout")
+    except _AudioEmptyError:
+        return _failure_result("empty_audio", "audio_decode_failed")
+    except Exception:
+        return _failure_result("load_failed", "audio_decode_failed")
+
+
+def _load_whisper_model():
+    global _WHISPER_MODEL, _WHISPER_MODEL_NAME
+    if whisper is None:
+        raise RuntimeError("whisper_not_installed")
+    model_name = "tiny.en"
+    with _WHISPER_LOCK:
+        if _WHISPER_MODEL is not None and _WHISPER_MODEL_NAME == model_name:
+            return _WHISPER_MODEL
+        _WHISPER_MODEL = whisper.load_model(model_name)
+        _WHISPER_MODEL_NAME = model_name
+        return _WHISPER_MODEL
+
+
+def transcribe_audio(audio_path: str) -> str:
+    normalized_path = _normalize_audio_path(audio_path)
+    if normalized_path is None:
+        raise RuntimeError("audio_missing")
+    path_state, _ = _prepare_audio_source(normalized_path)
+    if path_state == "missing":
+        raise RuntimeError("audio_missing")
+    if path_state in {"empty_audio", "load_failed"}:
+        raise RuntimeError("audio_decode_failed")
+
+    try:
+        _decode_audio_once(normalized_path)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except TimeoutError as exc:
+        raise RuntimeError("audio_decode_failed") from exc
+    except _AudioEmptyError as exc:
+        raise RuntimeError("audio_decode_failed") from exc
+    except Exception as exc:
+        raise RuntimeError("audio_decode_failed") from exc
+
+    with _WHISPER_LOCK:
+        model = _load_whisper_model()
+        try:
+            result = model.transcribe(normalized_path, language="en", fp16=False)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            raise RuntimeError("transcription_failed") from exc
+
+    if not isinstance(result, dict):
+        raise RuntimeError("transcription_failed")
+    text = result.get("text")
+    if not isinstance(text, str):
+        raise RuntimeError("transcription_failed")
+    normalized_text = text.strip()
+    if not normalized_text:
+        raise RuntimeError("transcription_failed")
+    return normalized_text
+
+
+def analyze_audio_worker(audio_path, result_queue):
+    try:
+        result = analyze_audio(audio_path)
+        payload = {"ok": True, "result": result}
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        payload = {"ok": False, "error": type(exc).__name__}
+    try:
+        result_queue.put(payload)
+    except Exception:
+        logger.warning("[AUDIO_WORKER_QUEUE_FAILED] payload_not_delivered")

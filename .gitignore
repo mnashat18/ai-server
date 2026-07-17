@@ -1,12 +1,23 @@
-.venv
-.vscode/
+# Python environments
+.venv/
+venv/
+
+# Local environment and secrets
 .env
 .env.*
 !.env.example
+
+# Editors
+.vscode/
+
+# Python caches and test artifacts
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.pycache_tmp/
+.tmp/
+utils-test-*/
+
+# Local runtime data and model artifacts
 data/baselines.json
 models/*.pt
-.venv/
-venv/
-.pytest_cache/
