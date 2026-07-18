@@ -3,6 +3,11 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from logger import get_logger
+
+
+logger = get_logger()
+
 
 def _elapsed_ms(started_at: float) -> int:
     return int(round((time.perf_counter() - started_at) * 1000))
@@ -24,6 +29,212 @@ def _missing_placeholder(analyzer_name: str, missing_warning: str) -> dict[str, 
             _warning_key(analyzer_name): [missing_warning],
         },
     }
+
+
+def _load_analyzer_callable(analyzer_name: str):
+    if analyzer_name == "video":
+        from video import analyze_video as analyzer
+    elif analyzer_name == "audio":
+        from audio import analyze_audio as analyzer
+    elif analyzer_name == "image":
+        from vision import analyze_face as analyzer
+    else:
+        raise ValueError("invalid_analyzer")
+    return analyzer
+
+
+def _ready_payload(analyzer_name: str, worker_generation: int, started_at: float, import_started_at: float) -> dict[str, Any]:
+    return {
+        "type": "ready",
+        "ok": True,
+        "analyzer": analyzer_name,
+        "worker_generation": worker_generation,
+        "metrics": {
+            "child_entry_ms": _elapsed_ms(started_at),
+            "analyzer_import_ms": _elapsed_ms(import_started_at),
+            "total_worker_ms": _elapsed_ms(started_at),
+        },
+    }
+
+
+def _structured_error_payload(
+    *,
+    analyzer_name: str,
+    worker_generation: int,
+    job_id: str | None = None,
+    scan_id: str | None = None,
+    error_type: str,
+    started_at: float,
+    execution_started_at: float | None = None,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "child_entry_ms": _elapsed_ms(started_at),
+        "analyzer_execution_ms": None,
+        "response_send_ms": None,
+        "total_worker_ms": None,
+    }
+    if execution_started_at is not None:
+        metrics["analyzer_execution_ms"] = _elapsed_ms(execution_started_at)
+    return {
+        "type": "result",
+        "job_id": job_id,
+        "scan_id": scan_id,
+        "worker_generation": worker_generation,
+        "ok": False,
+        "error_type": error_type,
+        "metrics": metrics,
+    }
+
+
+def _structured_success_payload(
+    *,
+    analyzer_name: str,
+    worker_generation: int,
+    job_id: str | None = None,
+    scan_id: str | None = None,
+    result: Any,
+    started_at: float,
+    execution_started_at: float,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "child_entry_ms": _elapsed_ms(started_at),
+        "analyzer_execution_ms": _elapsed_ms(execution_started_at),
+        "response_send_ms": None,
+        "total_worker_ms": None,
+    }
+    return {
+        "type": "result",
+        "job_id": job_id,
+        "scan_id": scan_id,
+        "worker_generation": worker_generation,
+        "ok": True,
+        "result": result if isinstance(result, dict) else _missing_placeholder(analyzer_name, f"{analyzer_name}_missing"),
+        "metrics": metrics,
+    }
+
+
+def worker_main(result_conn: Any, analyzer_name: str, worker_generation: int) -> None:
+    started_at = time.perf_counter()
+    analyzer = None
+    try:
+        import_started_at = time.perf_counter()
+        analyzer = _load_analyzer_callable(analyzer_name)
+        ready = _ready_payload(analyzer_name, worker_generation, started_at, import_started_at)
+        try:
+            result_conn.send(ready)
+        except Exception:
+            return
+    except Exception as exc:
+        error_type = type(exc).__name__
+        logger.error(
+            "analysis_worker_start_failed analyzer=%s error_type=%s",
+            analyzer_name,
+            error_type,
+        )
+        try:
+            result_conn.send(
+                {
+                    "type": "ready",
+                    "ok": False,
+                    "analyzer": analyzer_name,
+                    "worker_generation": worker_generation,
+                    "error_type": error_type,
+                    "metrics": {
+                        "child_entry_ms": _elapsed_ms(started_at),
+                        "analyzer_import_ms": None,
+                        "total_worker_ms": _elapsed_ms(started_at),
+                    },
+                }
+            )
+        except Exception:
+            pass
+        try:
+            result_conn.close()
+        except Exception:
+            pass
+        return
+
+    try:
+        while True:
+            try:
+                message = result_conn.recv()
+            except EOFError:
+                break
+            except Exception as exc:
+                logger.error(
+                    "analysis_worker_recv_failed analyzer=%s error_type=%s",
+                    analyzer_name,
+                    type(exc).__name__,
+                )
+                break
+
+            if not isinstance(message, dict):
+                continue
+
+            message_type = message.get("type")
+            if message_type == "shutdown":
+                break
+            if message_type != "job":
+                continue
+
+            job_started_at = time.perf_counter()
+            job_id = message.get("job_id")
+            scan_id = message.get("scan_id")
+            path = message.get("path")
+            response_started_at = time.perf_counter()
+            if not path:
+                payload = {
+                    "type": "result",
+                    "job_id": job_id,
+                    "scan_id": scan_id,
+                    "worker_generation": worker_generation,
+                    "ok": True,
+                    "result": _missing_placeholder(analyzer_name, f"{analyzer_name}_missing"),
+                    "metrics": {
+                        "child_entry_ms": _elapsed_ms(started_at),
+                        "analyzer_execution_ms": 0,
+                        "response_send_ms": None,
+                        "total_worker_ms": None,
+                    },
+                }
+            else:
+                try:
+                    execution_started_at = time.perf_counter()
+                    result = analyzer(path)
+                except Exception as exc:
+                    payload = _structured_error_payload(
+                        analyzer_name=analyzer_name,
+                        worker_generation=worker_generation,
+                        job_id=job_id,
+                        scan_id=scan_id,
+                        error_type=type(exc).__name__,
+                        started_at=job_started_at,
+                        execution_started_at=execution_started_at,
+                    )
+                else:
+                    payload = _structured_success_payload(
+                        analyzer_name=analyzer_name,
+                        worker_generation=worker_generation,
+                        job_id=job_id,
+                        scan_id=scan_id,
+                        result=result,
+                        started_at=job_started_at,
+                        execution_started_at=execution_started_at,
+                    )
+
+            try:
+                result_conn.send(payload)
+            except Exception:
+                break
+            finally:
+                metrics = payload.setdefault("metrics", {})
+                metrics["response_send_ms"] = _elapsed_ms(response_started_at)
+                metrics["total_worker_ms"] = _elapsed_ms(job_started_at)
+    finally:
+        try:
+            result_conn.close()
+        except Exception:
+            pass
 
 
 def run_analysis_worker(

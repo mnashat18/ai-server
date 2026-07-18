@@ -21,6 +21,7 @@ from scoring import clamp_confidence, compute_result
 from utils import sanitize_payload
 import requests
 import analysis_worker
+import analysis_runtime
 import scoring
 import video
 import main
@@ -31,11 +32,19 @@ def _signal(score, details):
 
 
 class _FakePipeEndpoint:
-    def __init__(self, shared_state):
+    NO_RESPONSE = object()
+
+    def __init__(self, shared_state, on_send=None):
         self._shared_state = shared_state
+        self._on_send = on_send
         self.closed = False
 
     def send(self, payload):
+        if self._on_send is not None:
+            callback_result = self._on_send(payload, self._shared_state)
+            if callback_result is self.NO_RESPONSE:
+                return
+            payload = callback_result
         self._shared_state["payload"] = payload
         self._shared_state["ready"] = True
 
@@ -112,6 +121,43 @@ class _FakeContext:
         process = _FakeProcess(target, args, daemon, behavior)
         self.processes.append(process)
         return process
+
+
+class _FakeRuntime:
+    def __init__(self, run_scan_result=None, ready=True):
+        self.run_scan_result = run_scan_result or (
+            {
+                "video": {"score": 0.9, "details": {"status": "ok", "analyzer": "video"}},
+                "audio": {"score": 0.9, "details": {"status": "ok", "analyzer": "audio"}},
+                "image": {"score": 0.9, "details": {"status": "ok", "analyzer": "image"}},
+            },
+            {
+                "video": {"timed_out": False, "analyzer_error": False, "final_alive": False, "result_received": True, "worker_generation": 1},
+                "audio": {"timed_out": False, "analyzer_error": False, "final_alive": False, "result_received": True, "worker_generation": 1},
+                "image": {"timed_out": False, "analyzer_error": False, "final_alive": False, "result_received": True, "worker_generation": 1},
+            },
+        )
+        self.ready = ready
+        self.start_calls = 0
+        self.shutdown_calls = 0
+        self.run_scan_calls = []
+
+    def start(self):
+        self.start_calls += 1
+        return {"analyzer_runtime_start_ms": 1, "analyzer_runtime_ready_ms": 1, "workers": {}}
+
+    def shutdown(self):
+        self.shutdown_calls += 1
+
+    def is_ready(self):
+        return self.ready
+
+    def health(self):
+        return {"ready": self.ready, "workers": {}, "started": self.start_calls > 0, "stopped": self.shutdown_calls > 0}
+
+    def run_scan(self, scan_id, media, *, deadline_seconds):
+        self.run_scan_calls.append((scan_id, media, deadline_seconds))
+        return self.run_scan_result
 
 
 class PipelineTests(unittest.TestCase):
@@ -1292,40 +1338,20 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("is too long", combined)
 
     def test_run_parallel_analysis_returns_real_results_before_deadline(self):
-        fake_context = _FakeContext()
+        fake_runtime = _FakeRuntime()
 
-        def fake_worker(result_conn, analyzer_name, path, missing_warning, scan_id, parent_started_at):
-            result_conn.send(
-                {
-                    "ok": True,
-                    "result": {"score": 0.9, "details": {"status": "ok", "analyzer": analyzer_name}},
-                    "metrics": {
-                        "child_entry_ms": 1,
-                        "analyzer_import_ms": 0,
-                        "analyzer_execution_ms": 0,
-                        "result_send_ms": 0,
-                        "total_worker_ms": 1,
-                    },
-                }
+        with unittest.mock.patch.object(main, "get_analyzer_runtime", return_value=fake_runtime):
+            results, worker_states = main._run_parallel_analysis(
+                "scan-1",
+                main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"),
             )
-            result_conn.close()
-
-        with unittest.mock.patch.object(main.multiprocessing, "get_context", return_value=fake_context):
-            with unittest.mock.patch.object(analysis_worker, "run_analysis_worker", side_effect=fake_worker):
-                with unittest.mock.patch.object(main, "multiprocessing_wait", side_effect=lambda handles, timeout=None: {handle for handle in handles if hasattr(handle, "poll") and handle.poll()}):
-                    results, worker_states = main._run_parallel_analysis(
-                        "scan-1",
-                        main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"),
-                    )
 
         self.assertEqual(results["video"]["details"]["analyzer"], "video")
         self.assertEqual(results["audio"]["details"]["analyzer"], "audio")
         self.assertEqual(results["image"]["details"]["analyzer"], "image")
         self.assertTrue(all(not state["timed_out"] for state in worker_states.values()))
-        self.assertTrue(all(not state["alive"] for state in worker_states.values()))
-        self.assertTrue(all(not state["terminated"] for state in worker_states.values()))
-        self.assertTrue(all(not state["killed"] for state in worker_states.values()))
         self.assertTrue(all(state["result_received"] for state in worker_states.values()))
+        self.assertEqual(len(fake_runtime.run_scan_calls), 1)
 
     def test_finalize_analysis_worker_reads_completed_pipe_payload(self):
         shared_state = {
@@ -1497,6 +1523,141 @@ class PipelineTests(unittest.TestCase):
                 )
             )
             stack.enter_context(unittest.mock.patch.object(main, "baseline_ready_for_personalized_scoring", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "evaluate_baseline_eligibility",
+                    return_value={
+                        "eligible": False,
+                        "capture_quality_score": 0.0,
+                        "measurement_reliability_score": 0.0,
+                        "task_completion_status": "not_required",
+                        "hard_gates_triggered": [],
+                        "reasons": [],
+                    },
+                )
+            )
+            write_success = MagicMock(return_value={"scan_result": "updated:scan-1", "wellness_scan": "updated"})
+            stack.enter_context(unittest.mock.patch.object(main, "_write_success", write_success))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_step", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_perf", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_validation_decision", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_validation_lifecycle", side_effect=lambda *args, **kwargs: None))
+
+            result = main._process_scan_sync("scan-1")
+
+        self.assertEqual(result["status"], main.SCAN_STATUS_COMPLETED)
+        write_success.assert_called_once()
+
+    def test_process_scan_sync_partial_timeout_with_sufficient_evidence_completes(self):
+        with ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_resolve_scan_context",
+                    return_value={
+                        "status": main.SCAN_STATUS_MEDIA_READY,
+                        "scan_media": {"id": "media-1"},
+                        "resolved_media": {},
+                        "task_metrics": None,
+                        "expected_phrase": None,
+                        "user": None,
+                        "member": None,
+                        "business_profile": None,
+                        "department": None,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_media", return_value=main.Media(image="image.jpg", audio="audio.wav", video="video.mp4")))
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_task", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main, "_identifier_payload", return_value={"user_id": None, "member_id": None, "business_profile_id": None, "department_id": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_baseline_rows_for_member", return_value=[]))
+            stack.enter_context(unittest.mock.patch.object(main, "baseline_status_payload", return_value={"baseline_status": "inactive", "baseline_confidence": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_expected_phrase", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "local_model_required", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_resolve_media_input", side_effect=lambda path, *args, **kwargs: (path, False)))
+            stack.enter_context(unittest.mock.patch.object(main, "_should_convert_audio", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_run_parallel_analysis",
+                    return_value=(
+                        {
+                            "video": {"score": 0.8, "details": {"status": "ok", "visual_quality_score": 0.8, "visual_warnings": []}},
+                            "audio": main._analysis_timeout_placeholder("audio"),
+                            "image": {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": []}},
+                        },
+                        {
+                            "video": {"timed_out": False, "final_alive": False, "result_received": True, "analyzer_error": False, "process_exitcode": 0},
+                            "audio": {"timed_out": True, "final_alive": False, "result_received": False, "analyzer_error": False, "process_exitcode": -15},
+                            "image": {"timed_out": False, "final_alive": False, "result_received": True, "analyzer_error": False, "process_exitcode": 0},
+                        },
+                    ),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "validate_scan_inputs",
+                    return_value={
+                        "quality_scores": {"phrase_match": 0.9, "audio": 0.8, "video": 0.8, "image": 0.8},
+                        "warnings": [],
+                        "critical_errors": [],
+                        "failure_reason": None,
+                    },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "assess_quality",
+                    return_value={
+                        "warnings": [],
+                        "media_quality": {
+                            "video": {"usable": True, "present": True},
+                            "audio": {"usable": False, "present": False},
+                            "image": {"usable": True, "present": True},
+                        },
+                        "usable_modalities": 2,
+                        "failure_reason": None,
+                        "status": "passed",
+                        "weak": False,
+                        "retake_required": False,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_face_eye_evidence_unreliable", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_result_has_valid_evidence", return_value=True))
+            stack.enter_context(unittest.mock.patch.object(main, "features_from_signals", return_value=({}, {})))
+            stack.enter_context(unittest.mock.patch.object(main, "vector_from_features", return_value=[0.0] * 21))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "predict", return_value={"score": 0.5}))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "compute_result",
+                    return_value={
+                        "readiness_score": 80,
+                        "confidence": 0.8,
+                        "risk_level": "stable",
+                        "suggested_action": "continue_normal_activity",
+                        "explanation": "ok",
+                        "retake_required": False,
+                        "baseline_used": False,
+                        "fusion_details": {"baseline_flags": {}},
+                        "modality_scores": {},
+                        "face_metrics": {"baseline_drifts": {}},
+                        "voice_metrics": {"baseline_drifts": {}},
+                        "reaction_metrics": {"baseline_drifts": {}},
+                    },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "baseline_ready_for_personalized_scoring",
+                    return_value=False,
+                )
+            )
             stack.enter_context(
                 unittest.mock.patch.object(
                     main,
@@ -1930,45 +2091,33 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("token=secret", combined)
 
     def test_run_parallel_analysis_accepts_ready_pipe_payload_before_delayed_process_exit(self):
-        fake_context = _FakeContext(behaviors=[{"alive_after_target": True}, {"alive_after_target": True}, {"alive_after_target": True}])
-        wait_calls = []
-
-        def fake_worker(result_conn, analyzer_name, path, missing_warning, scan_id, parent_started_at):
-            result_conn.send(
+        fake_runtime = _FakeRuntime(
+            run_scan_result=(
                 {
-                    "ok": True,
-                    "result": {"score": 0.9, "details": {"status": "ok", "analyzer": analyzer_name}},
-                    "metrics": {
-                        "child_entry_ms": 2,
-                        "analyzer_import_ms": 0,
-                        "analyzer_execution_ms": 1,
-                        "result_send_ms": 0,
-                        "total_worker_ms": 3,
-                    },
-                }
+                    "video": {"score": 0.9, "details": {"status": "ok", "analyzer": "video"}},
+                    "audio": {"score": 0.9, "details": {"status": "ok", "analyzer": "audio"}},
+                    "image": {"score": 0.9, "details": {"status": "ok", "analyzer": "image"}},
+                },
+                {
+                    "video": {"timed_out": False, "analyzer_error": False, "final_alive": False, "result_received": True, "worker_generation": 2},
+                    "audio": {"timed_out": False, "analyzer_error": False, "final_alive": False, "result_received": True, "worker_generation": 2},
+                    "image": {"timed_out": False, "analyzer_error": False, "final_alive": False, "result_received": True, "worker_generation": 2},
+                },
             )
-            result_conn.close()
+        )
 
-        def fake_wait(handles, timeout=None):
-            wait_calls.append(list(handles))
-            return {handle for handle in handles if hasattr(handle, "poll") and handle.poll()}
+        with unittest.mock.patch.object(main, "get_analyzer_runtime", return_value=fake_runtime):
+            results, worker_states = main._run_parallel_analysis(
+                "scan-1",
+                main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"),
+            )
 
-        with unittest.mock.patch.object(main.multiprocessing, "get_context", return_value=fake_context):
-            with unittest.mock.patch.object(analysis_worker, "run_analysis_worker", side_effect=fake_worker):
-                with unittest.mock.patch.object(main, "multiprocessing_wait", side_effect=fake_wait):
-                    results, worker_states = main._run_parallel_analysis(
-                        "scan-1",
-                        main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"),
-                    )
-
-        self.assertTrue(wait_calls)
-        self.assertTrue(any(any(hasattr(handle, "poll") for handle in call) for call in wait_calls))
         self.assertTrue(all(state["result_received"] for state in worker_states.values()))
         self.assertTrue(all(not state["timed_out"] for state in worker_states.values()))
-        self.assertTrue(all(not state["alive"] for state in worker_states.values()))
         self.assertEqual(results["video"]["details"]["analyzer"], "video")
         self.assertEqual(results["audio"]["details"]["analyzer"], "audio")
         self.assertEqual(results["image"]["details"]["analyzer"], "image")
+        self.assertEqual(worker_states["video"]["worker_generation"], 2)
 
     def test_finalize_analysis_worker_reports_missing_payload_as_analyzer_error(self):
         conn = _FakePipeEndpoint({"payload": None, "ready": False})
@@ -2044,25 +2193,197 @@ class PipelineTests(unittest.TestCase):
         process.close()
 
     def test_run_parallel_analysis_leaves_environment_unchanged(self):
-        fake_context = _FakeContext()
+        fake_runtime = _FakeRuntime()
         original_value = os.environ.get("AI_SERVER_ANALYSIS_CHILD")
 
-        def fake_worker(result_conn, analyzer_name, path, missing_warning, scan_id, parent_started_at):
-            result_conn.send(
-                {
-                    "ok": True,
-                    "result": {"score": 0.9, "details": {"status": "ok", "analyzer": analyzer_name}},
-                    "metrics": {"child_entry_ms": 1, "analyzer_execution_ms": 0, "result_send_ms": 0, "total_worker_ms": 1},
-                }
-            )
-            result_conn.close()
-
-        with unittest.mock.patch.object(main.multiprocessing, "get_context", return_value=fake_context):
-            with unittest.mock.patch.object(analysis_worker, "run_analysis_worker", side_effect=fake_worker):
-                with unittest.mock.patch.object(main, "multiprocessing_wait", side_effect=lambda handles, timeout=None: {handle for handle in handles if hasattr(handle, "poll") and handle.poll()}):
-                    main._run_parallel_analysis("scan-1", main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"))
+        with unittest.mock.patch.object(main, "get_analyzer_runtime", return_value=fake_runtime):
+            main._run_parallel_analysis("scan-1", main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"))
 
         self.assertEqual(os.environ.get("AI_SERVER_ANALYSIS_CHILD"), original_value)
+
+    def test_warm_runtime_start_reports_ready_once(self):
+        fake_context = _FakeContext(behaviors=[
+            {"alive_after_target": True},
+            {"alive_after_target": True},
+            {"alive_after_target": True},
+        ])
+
+        def ready_worker(result_conn, analyzer_name, generation):
+            result_conn.send(
+                {
+                    "type": "ready",
+                    "ok": True,
+                    "worker_generation": generation,
+                    "metrics": {
+                        "child_entry_ms": 1,
+                        "analyzer_import_ms": 2,
+                        "total_worker_ms": 3,
+                    },
+                }
+            )
+
+        with unittest.mock.patch.object(analysis_runtime.multiprocessing, "get_context", return_value=fake_context):
+            with unittest.mock.patch.object(
+                analysis_runtime,
+                "_wait_handles",
+                side_effect=lambda handles, timeout=None: [handle for handle in handles if hasattr(handle, "poll") and handle.poll()],
+            ):
+                runtime = analysis_runtime.WarmAnalyzerRuntime(worker_entry_map={
+                    "video": ready_worker,
+                    "audio": ready_worker,
+                    "image": ready_worker,
+                })
+                startup = runtime.start()
+                second_start = runtime.start()
+
+        self.assertTrue(runtime.is_ready())
+        self.assertGreaterEqual(startup["analyzer_runtime_ready_ms"], 0)
+        self.assertTrue(second_start["ready"])
+        self.assertEqual(len(fake_context.processes), 3)
+        self.assertTrue(all(process.started for process in fake_context.processes))
+        self.assertEqual(startup["workers"]["video"]["spawn_metrics"]["analyzer_import_ms"], 2)
+        runtime.shutdown()
+
+    def test_worker_supervisor_reuses_same_generation_for_two_jobs(self):
+        fake_context = _FakeContext(behaviors=[{"alive_after_target": True}])
+
+        def ready_worker(result_conn, analyzer_name, generation):
+            result_conn.send(
+                {
+                    "type": "ready",
+                    "ok": True,
+                    "worker_generation": generation,
+                    "metrics": {
+                        "child_entry_ms": 1,
+                        "analyzer_import_ms": 2,
+                        "total_worker_ms": 3,
+                    },
+                }
+            )
+
+        def on_send(payload, state):
+            if isinstance(payload, dict) and payload.get("type") == "job":
+                return {
+                    "type": "result",
+                    "job_id": payload["job_id"],
+                    "scan_id": payload["scan_id"],
+                    "worker_generation": payload["worker_generation"],
+                    "ok": True,
+                    "result": {"score": 0.91, "details": {"status": "ok", "analyzer": "video"}},
+                    "metrics": {
+                        "child_entry_ms": 1,
+                        "analyzer_execution_ms": 2,
+                        "response_send_ms": 1,
+                        "total_worker_ms": 3,
+                    },
+                }
+            return payload
+
+        with unittest.mock.patch.object(analysis_runtime.multiprocessing, "get_context", return_value=fake_context):
+            with unittest.mock.patch.object(
+                analysis_runtime,
+                "_wait_handles",
+                side_effect=lambda handles, timeout=None: [handle for handle in handles if hasattr(handle, "poll") and handle.poll()],
+            ):
+                supervisor = analysis_runtime.WorkerSupervisor("video", worker_entry=ready_worker)
+                supervisor.start()
+                supervisor._parent_conn._on_send = on_send
+
+                job1 = analysis_runtime._WorkerJob(
+                    job_id="job-1",
+                    scan_id="scan-1",
+                    path="clip.mp4",
+                    deadline_at=time.perf_counter() + 1.0,
+                    submitted_at=time.perf_counter(),
+                    future=analysis_runtime.Future(),
+                )
+                job2 = analysis_runtime._WorkerJob(
+                    job_id="job-2",
+                    scan_id="scan-1",
+                    path="clip.mp4",
+                    deadline_at=time.perf_counter() + 1.0,
+                    submitted_at=time.perf_counter(),
+                    future=analysis_runtime.Future(),
+                )
+
+                first = supervisor._dispatch_job(job1)
+                second = supervisor._dispatch_job(job2)
+
+                self.assertTrue(first["state"]["result_received"])
+                self.assertTrue(second["state"]["result_received"])
+                self.assertEqual(first["state"]["worker_generation"], second["state"]["worker_generation"])
+                self.assertEqual(len(fake_context.processes), 1)
+                self.assertTrue(fake_context.processes[0].started)
+                supervisor.shutdown()
+
+    def test_worker_supervisor_timeout_restarts_generation(self):
+        fake_context = _FakeContext(behaviors=[
+            {"alive_after_target": True, "requires_kill": True},
+            {"alive_after_target": True},
+        ])
+
+        def ready_worker(result_conn, analyzer_name, generation):
+            result_conn.send(
+                {
+                    "type": "ready",
+                    "ok": True,
+                    "worker_generation": generation,
+                    "metrics": {
+                        "child_entry_ms": 1,
+                        "analyzer_import_ms": 2,
+                        "total_worker_ms": 3,
+                    },
+                }
+            )
+
+        with unittest.mock.patch.object(analysis_runtime.multiprocessing, "get_context", return_value=fake_context):
+            with unittest.mock.patch.object(
+                analysis_runtime,
+                "_wait_handles",
+                side_effect=lambda handles, timeout=None: [handle for handle in handles if hasattr(handle, "poll") and handle.poll()],
+            ):
+                supervisor = analysis_runtime.WorkerSupervisor("image", worker_entry=ready_worker)
+                supervisor.start()
+                supervisor._parent_conn._on_send = lambda payload, state: _FakePipeEndpoint.NO_RESPONSE if isinstance(payload, dict) and payload.get("type") == "job" else payload
+
+                job = analysis_runtime._WorkerJob(
+                    job_id="job-timeout",
+                    scan_id="scan-1",
+                    path="clip.jpg",
+                    deadline_at=time.perf_counter() + 0.01,
+                    submitted_at=time.perf_counter() - 0.05,
+                    future=analysis_runtime.Future(),
+                )
+
+                completion = supervisor._dispatch_job(job)
+
+        self.assertTrue(completion["state"]["timed_out"])
+        self.assertTrue(completion["state"]["terminated"])
+        self.assertTrue(completion["state"]["killed"])
+        self.assertTrue(completion["state"]["worker_restarted"])
+        self.assertEqual(supervisor._generation, 2)
+        self.assertEqual(len(fake_context.processes), 2)
+        supervisor.shutdown()
+
+    def test_persistent_runtime_spawn_smoke_reuses_same_worker(self):
+        runtime = analysis_runtime.WarmAnalyzerRuntime(worker_entry_map={
+            "video": analysis_runtime._smoke_worker_main,
+            "audio": analysis_runtime._smoke_worker_main,
+            "image": analysis_runtime._smoke_worker_main,
+        })
+        try:
+            runtime.start()
+            first = runtime.run_scan("scan-smoke-1", main.Media(image=None, audio=None, video=None), deadline_seconds=2.0)
+            second = runtime.run_scan("scan-smoke-2", main.Media(image=None, audio=None, video=None), deadline_seconds=2.0)
+        finally:
+            runtime.shutdown()
+
+        self.assertTrue(all(result["details"]["status"] == "missing" for result in first[0].values()))
+        self.assertTrue(all(result["details"]["status"] == "missing" for result in second[0].values()))
+        self.assertEqual(
+            first[1]["video"]["worker_generation"],
+            second[1]["video"]["worker_generation"],
+        )
 
 
 
