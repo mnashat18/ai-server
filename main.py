@@ -41,8 +41,11 @@ from validation import ValidationPolicy, fail_validation, failure_message, valid
 app = FastAPI()
 logger = get_logger()
 ml_runtime = MLRuntime()
-ml_runtime.load()
-directus = DirectusClient()
+_ANALYZER_CHILD_ENV = "AI_SERVER_ANALYSIS_CHILD"
+_ANALYZER_CHILD_MODE = os.getenv(_ANALYZER_CHILD_ENV) == "1"
+if not _ANALYZER_CHILD_MODE:
+    ml_runtime.load()
+directus = None if _ANALYZER_CHILD_MODE else DirectusClient()
 
 def _env_flag(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -70,7 +73,7 @@ def _env_positive_float(name: str, default: float) -> float:
     return numeric
 
 
-VALIDATION_POLICY = ValidationPolicy.from_env()
+VALIDATION_POLICY = None if _ANALYZER_CHILD_MODE else ValidationPolicy.from_env()
 AI_SERVER_ENV = os.getenv("AI_SERVER_ENV", "production").strip().lower()
 DEBUG_SCAN_ENDPOINT_ENABLED = (
     AI_SERVER_ENV in {"dev", "development", "local", "test"}
@@ -744,30 +747,67 @@ def _shutdown_executor(executor: concurrent.futures.ThreadPoolExecutor | None, *
 
 
 def _analysis_worker_entry(
-    result_queue: Any,
+    result_conn: Any,
     analyzer_name: str,
     path: str | None,
     missing_warning: str,
+    scan_id: str,
+    parent_started_at: float,
 ) -> None:
+    child_started_at = time.perf_counter()
+    analyzer_execution_started_at = None
     try:
         if analyzer_name == "video":
             from video import analyze_video
 
+            analyzer_execution_started_at = time.perf_counter()
             result = _safe_analyze(analyze_video, path, missing_warning)
         elif analyzer_name == "audio":
             from audio import analyze_audio
 
+            analyzer_execution_started_at = time.perf_counter()
             result = _safe_analyze(analyze_audio, path, missing_warning)
         elif analyzer_name == "image":
             from vision import analyze_face
 
+            analyzer_execution_started_at = time.perf_counter()
             result = _safe_analyze(analyze_face, path, missing_warning)
         else:
             result = {"score": None, "details": {"status": "invalid"}}
-        result_queue.put({"ok": True, "result": result})
+        payload = {
+            "ok": True,
+            "result": result,
+            "metrics": {
+                "child_boot_ms": _elapsed_ms(parent_started_at),
+                "analyzer_execution_ms": _elapsed_ms(analyzer_execution_started_at or child_started_at),
+            },
+        }
     except Exception as exc:
+        payload = {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "metrics": {
+                "child_boot_ms": _elapsed_ms(parent_started_at),
+            },
+        }
+
+    result_publish_started_at = time.perf_counter()
+    try:
+        result_conn.send(payload)
+    except Exception:
+        pass
+    finally:
+        result_publish_ms = _elapsed_ms(result_publish_started_at)
+        total_worker_ms = _elapsed_ms(parent_started_at)
+        metrics = payload.get("metrics") if isinstance(payload, dict) else {}
+        child_boot_ms = metrics.get("child_boot_ms")
+        analyzer_execution_ms = metrics.get("analyzer_execution_ms")
+        _log_perf(scan_id, f"{analyzer_name}_child_boot_ms", child_boot_ms)
+        _log_perf(scan_id, f"{analyzer_name}_analyzer_execution_ms", analyzer_execution_ms)
+        _log_perf(scan_id, f"{analyzer_name}_result_publish_ms", result_publish_ms)
+        _log_perf(scan_id, f"{analyzer_name}_total_worker_ms", total_worker_ms)
         try:
-            result_queue.put({"ok": False, "error": type(exc).__name__})
+            result_conn.close()
         except Exception:
             pass
 
@@ -776,18 +816,55 @@ def _analysis_worker_placeholder(analyzer_name: str) -> dict:
     return _analysis_timeout_placeholder(analyzer_name)
 
 
+def _finalize_analysis_process(process: multiprocessing.Process, *, timeout_seconds: float = 1.0) -> dict[str, Any]:
+    state = {
+        "terminated": False,
+        "killed": False,
+        "alive": process.is_alive(),
+        "exitcode": process.exitcode,
+    }
+    if process.is_alive():
+        process.terminate()
+        state["terminated"] = True
+        process.join(timeout_seconds)
+    if process.is_alive():
+        process.kill()
+        state["killed"] = True
+        process.join(timeout_seconds)
+    state["alive"] = process.is_alive()
+    state["exitcode"] = process.exitcode
+    try:
+        process.close()
+    except Exception:
+        pass
+    return state
+
+
 def _finalize_analysis_worker(
     *,
     scan_id: str,
     analyzer_name: str,
     process: multiprocessing.Process,
-    result_queue: Any,
+    result_conn: Any,
     started_at: float,
+    parent_process_start_ms: int | None,
     timeout_seconds: float | None,
     timed_out: bool,
-) -> dict:
+) -> tuple[dict, dict[str, Any]]:
     metric_name = f"{analyzer_name}_validation_ms"
     elapsed_ms = _elapsed_ms(started_at)
+    state: dict[str, Any] = {
+        "timed_out": timed_out,
+        "alive": process.is_alive(),
+        "terminated": False,
+        "killed": False,
+        "process_exitcode": process.exitcode,
+        "parent_process_start_ms": parent_process_start_ms,
+        "child_boot_ms": None,
+        "analyzer_execution_ms": None,
+        "result_publish_ms": None,
+        "total_worker_ms": None,
+    }
 
     if timed_out:
         logger.warning(
@@ -796,82 +873,120 @@ def _finalize_analysis_worker(
             scan_id,
             timeout_seconds,
         )
-        if process.is_alive():
-            process.terminate()
-        process.join(1.0)
+        state.update(_finalize_analysis_process(process))
         try:
-            result_queue.close()
-            result_queue.join_thread()
+            result_conn.close()
         except Exception:
             pass
+        _log_step(
+            scan_id,
+            "analysis_worker_finalized",
+            analyzer=analyzer_name,
+            timed_out=True,
+            process_exitcode=state["process_exitcode"],
+            terminated=state["terminated"],
+            killed=state["killed"],
+            alive=state["alive"],
+        )
         _log_perf(scan_id, metric_name, elapsed_ms)
-        return _analysis_worker_placeholder(analyzer_name)
+        return _analysis_worker_placeholder(analyzer_name), state
 
     payload = None
     try:
-        payload = result_queue.get(timeout=0.5)
-    except queue_module.Empty:
+        if result_conn.poll(0.5):
+            payload = result_conn.recv()
+    except EOFError:
         payload = None
     finally:
         try:
-            result_queue.close()
-            result_queue.join_thread()
+            result_conn.close()
         except Exception:
             pass
-        process.join(0.0)
-        try:
-            process.close()
-        except Exception:
-            pass
+        state.update(_finalize_analysis_process(process))
 
+    _log_step(
+        scan_id,
+        "analysis_worker_finalized",
+        analyzer=analyzer_name,
+        timed_out=False,
+        process_exitcode=state["process_exitcode"],
+        terminated=state["terminated"],
+        killed=state["killed"],
+        alive=state["alive"],
+    )
     _log_perf(scan_id, metric_name, elapsed_ms)
     if isinstance(payload, dict) and payload.get("ok"):
         result = payload.get("result")
         if isinstance(result, dict):
-            return result
-    if isinstance(payload, dict) and payload.get("error"):
+            metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+            state["child_boot_ms"] = metrics.get("child_boot_ms")
+            state["analyzer_execution_ms"] = metrics.get("analyzer_execution_ms")
+            state["result_publish_ms"] = metrics.get("result_publish_ms")
+            state["total_worker_ms"] = metrics.get("total_worker_ms")
+            return result, state
+    if isinstance(payload, dict) and payload.get("error_type"):
         logger.warning(
             "analysis_worker_error scan_id=%s analyzer=%s error_type=%s",
             scan_id,
             analyzer_name,
-            payload.get("error"),
+            payload.get("error_type"),
         )
-    return _analysis_worker_placeholder(analyzer_name)
+    return _analysis_worker_placeholder(analyzer_name), state
 
 
 def _run_parallel_analysis(
     scan_id: str,
     media: Media,
-) -> tuple[dict, list[str]]:
+) -> tuple[dict, dict[str, dict[str, Any]]]:
     ctx = multiprocessing.get_context("spawn")
     analyzer_specs = {
         "video": (media.video, "video_missing"),
         "audio": (media.audio, "audio_missing"),
         "image": (media.image, "image_missing"),
     }
-    processes: dict[str, tuple[multiprocessing.Process, Any, float]] = {}
+    processes: dict[str, dict[str, Any]] = {}
     results: dict[str, dict] = {}
+    worker_states: dict[str, dict[str, Any]] = {}
 
-    for analyzer_name, (path, missing_warning) in analyzer_specs.items():
-        result_queue = ctx.Queue(maxsize=1)
-        process = ctx.Process(
-            target=_analysis_worker_entry,
-            args=(result_queue, analyzer_name, path, missing_warning),
-            daemon=True,
-        )
-        process.start()
-        processes[analyzer_name] = (process, result_queue, time.perf_counter())
+    previous_child_mode = os.getenv(_ANALYZER_CHILD_ENV)
+    os.environ[_ANALYZER_CHILD_ENV] = "1"
+    try:
+        for analyzer_name, (path, missing_warning) in analyzer_specs.items():
+            parent_started_at = time.perf_counter()
+            parent_conn, child_conn = ctx.Pipe(duplex=False)
+            process = ctx.Process(
+                target=_analysis_worker_entry,
+                args=(child_conn, analyzer_name, path, missing_warning, scan_id, parent_started_at),
+                daemon=True,
+            )
+            process.start()
+            try:
+                child_conn.close()
+            except Exception:
+                pass
+            parent_process_start_ms = _elapsed_ms(parent_started_at)
+            _log_perf(scan_id, f"{analyzer_name}_parent_process_start_ms", parent_process_start_ms)
+            processes[analyzer_name] = {
+                "process": process,
+                "conn": parent_conn,
+                "started_at": parent_started_at,
+                "parent_process_start_ms": parent_process_start_ms,
+            }
+    finally:
+        if previous_child_mode is None:
+            os.environ.pop(_ANALYZER_CHILD_ENV, None)
+        else:
+            os.environ[_ANALYZER_CHILD_ENV] = previous_child_mode
 
     deadline = time.perf_counter() + MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS
     remaining_names = set(processes.keys())
-    sentinel_to_name = {process.sentinel: name for name, (process, _queue, _started) in processes.items()}
-    timed_out_modalities: list[str] = []
+    sentinel_to_name = {processes[name]["process"].sentinel: name for name in processes}
 
     while remaining_names:
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
             break
-        wait_handles = [processes[name][0].sentinel for name in remaining_names]
+        wait_handles = [processes[name]["process"].sentinel for name in remaining_names]
         ready = multiprocessing_wait(wait_handles, timeout=remaining)
         if not ready:
             break
@@ -879,37 +994,42 @@ def _run_parallel_analysis(
             analyzer_name = sentinel_to_name.get(handle)
             if analyzer_name is None or analyzer_name not in remaining_names:
                 continue
-            process, result_queue, started_at = processes[analyzer_name]
-            results[analyzer_name] = _finalize_analysis_worker(
+            process_state = processes[analyzer_name]
+            result, worker_state = _finalize_analysis_worker(
                 scan_id=scan_id,
                 analyzer_name=analyzer_name,
-                process=process,
-                result_queue=result_queue,
-                started_at=started_at,
+                process=process_state["process"],
+                result_conn=process_state["conn"],
+                started_at=process_state["started_at"],
+                parent_process_start_ms=process_state["parent_process_start_ms"],
                 timeout_seconds=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
                 timed_out=False,
             )
+            results[analyzer_name] = result
+            worker_states[analyzer_name] = worker_state
             remaining_names.discard(analyzer_name)
 
     for analyzer_name in list(remaining_names):
-        process, result_queue, started_at = processes[analyzer_name]
-        timed_out_modalities.append(analyzer_name)
-        results[analyzer_name] = _finalize_analysis_worker(
+        process_state = processes[analyzer_name]
+        result, worker_state = _finalize_analysis_worker(
             scan_id=scan_id,
             analyzer_name=analyzer_name,
-            process=process,
-            result_queue=result_queue,
-            started_at=started_at,
+            process=process_state["process"],
+            result_conn=process_state["conn"],
+            started_at=process_state["started_at"],
+            parent_process_start_ms=process_state["parent_process_start_ms"],
             timeout_seconds=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
             timed_out=True,
         )
+        results[analyzer_name] = result
+        worker_states[analyzer_name] = worker_state
         remaining_names.discard(analyzer_name)
 
     return {
         "video": results.get("video") or _analysis_worker_placeholder("video"),
         "audio": results.get("audio") or _analysis_worker_placeholder("audio"),
         "image": results.get("image") or _analysis_worker_placeholder("image"),
-    }, timed_out_modalities
+    }, worker_states
 
 
 def _has_meaningful_evidence(value: Any) -> bool:
@@ -1555,7 +1675,11 @@ def _safe_analyze(fn, path: str | None, missing_warning: str) -> dict:
         result = fn(path)
         return result if isinstance(result, dict) else {"score": None, "details": {"status": "invalid"}}
     except Exception as exc:
-        logger.exception("analyzer_error path=%s error=%s", path, exc)
+        logger.error(
+            "analyzer_error analyzer=%s error_type=%s",
+            getattr(fn, "__name__", "analyzer"),
+            type(exc).__name__,
+        )
     return {"score": None, "details": {"status": "error", "warnings": [missing_warning]}}
 
 
@@ -2432,10 +2556,15 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         _log_step(scan_id, "video_validation_start")
         media_validation_started = time.perf_counter()
         stage_started = media_validation_started
-        analysis_results, timed_out_modalities = _run_parallel_analysis(
+        analysis_results, worker_states = _run_parallel_analysis(
             scan_id,
             resolved_media,
         )
+        timed_out_modalities = [
+            modality
+            for modality, state in worker_states.items()
+            if state.get("timed_out")
+        ]
         video_result = analysis_results["video"]
         _log_step(scan_id, "video_validation_done", quality_score=((video_result.get("details") or {}).get("visual_quality_score")))
 
@@ -2539,23 +2668,33 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             for modality in ["video", "audio", "image"]
             if (quality_result.get("media_quality") or {}).get(modality, {}).get("usable")
         ]
-        running_modalities = list(timed_out_modalities)
+        running_modalities = [
+            modality
+            for modality, state in worker_states.items()
+            if state.get("alive")
+        ]
         all_workers_terminal = not running_modalities
-        terminal_failure_reason, _required_modalities = _required_modality_gate(
-            quality_result,
-            timed_out_modalities=running_modalities,
-        )
+        all_modalities_timed_out = bool(worker_states) and len(timed_out_modalities) == len(worker_states)
         terminal_reason = "validation_passed"
-        if phrase_failure_reason and terminal_failure_reason is None:
-            terminal_failure_reason = phrase_failure_reason
-            terminal_reason = "phrase_validation_failed"
-        if terminal_failure_reason == FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT:
-            terminal_reason = "audio_validation_timeout"
-        elif terminal_failure_reason:
-            terminal_reason = "validation_timeout" if timed_out_modalities else "validation_no_reliable_evidence"
-        elif quality_result.get("usable_modalities", 0) <= 0:
-            terminal_failure_reason = quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA
-            terminal_reason = "validation_timeout" if timed_out_modalities else "validation_no_reliable_evidence"
+        if all_modalities_timed_out:
+            terminal_failure_reason = "validation_timeout"
+            terminal_reason = "validation_timeout"
+            _required_modalities = ["video", "audio", "image"]
+        else:
+            terminal_failure_reason, _required_modalities = _required_modality_gate(
+                quality_result,
+                timed_out_modalities=timed_out_modalities,
+            )
+            if phrase_failure_reason and terminal_failure_reason is None:
+                terminal_failure_reason = phrase_failure_reason
+                terminal_reason = "phrase_validation_failed"
+            if terminal_failure_reason == FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT:
+                terminal_reason = "audio_validation_timeout"
+            elif terminal_failure_reason:
+                terminal_reason = "validation_timeout" if timed_out_modalities else "validation_no_reliable_evidence"
+            elif quality_result.get("usable_modalities", 0) <= 0:
+                terminal_failure_reason = quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA
+                terminal_reason = "validation_timeout" if timed_out_modalities else "validation_no_reliable_evidence"
         if not all_workers_terminal and terminal_failure_reason is None:
             terminal_failure_reason = FAILURE_REASON_ANALYSIS_EXCEPTION
             terminal_reason = "workers_not_terminal"

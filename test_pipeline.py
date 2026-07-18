@@ -1,5 +1,6 @@
 import unittest
 import json
+import time
 from contextlib import ExitStack
 from unittest.mock import MagicMock
 
@@ -21,6 +22,90 @@ import main
 
 def _signal(score, details):
     return {"score": score, "details": details}
+
+
+class _FakePipeEndpoint:
+    def __init__(self, shared_state):
+        self._shared_state = shared_state
+        self.closed = False
+
+    def send(self, payload):
+        self._shared_state["payload"] = payload
+        self._shared_state["ready"] = True
+
+    def poll(self, timeout=None):
+        return bool(self._shared_state.get("ready"))
+
+    def recv(self):
+        self._shared_state["ready"] = False
+        return self._shared_state.get("payload")
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeProcess:
+    def __init__(self, target, args, daemon, behavior):
+        self.target = target
+        self.args = args
+        self.daemon = daemon
+        self.behavior = behavior or {}
+        self.sentinel = object()
+        self.started = False
+        self.terminated = False
+        self.killed = False
+        self.join_calls = []
+        self.closed = False
+        self.exitcode = None
+        self._alive = bool(self.behavior.get("alive_after_start", False))
+
+    def start(self):
+        self.started = True
+        if self.behavior.get("invoke_target", True) and self.target is not None:
+            self.target(*self.args)
+            if not self.behavior.get("alive_after_target", False):
+                self._alive = False
+                self.exitcode = 0
+        else:
+            self._alive = bool(self.behavior.get("alive_after_start", True))
+
+    def is_alive(self):
+        return self._alive
+
+    def terminate(self):
+        self.terminated = True
+        if not self.behavior.get("requires_kill", False):
+            self._alive = False
+            self.exitcode = -15
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+        self.exitcode = -9
+
+    def join(self, timeout=None):
+        self.join_calls.append(timeout)
+        if self.terminated and self.behavior.get("requires_kill", False) and self.killed:
+            self._alive = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeContext:
+    def __init__(self, behaviors=None):
+        self.behaviors = list(behaviors or [])
+        self.processes = []
+
+    def Pipe(self, duplex=False):
+        shared_state = {"payload": None, "ready": False}
+        return _FakePipeEndpoint(shared_state), _FakePipeEndpoint(shared_state)
+
+    def Process(self, target, args, daemon):
+        behavior = self.behaviors.pop(0) if self.behaviors else {}
+        process = _FakeProcess(target, args, daemon, behavior)
+        self.processes.append(process)
+        return process
 
 
 class PipelineTests(unittest.TestCase):
@@ -1200,68 +1285,222 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("for field", combined)
         self.assertNotIn("is too long", combined)
 
-    def test_run_parallel_analysis_times_out_and_terminates_workers(self):
-        class FakeQueue:
-            def close(self):
-                pass
+    def test_run_parallel_analysis_returns_real_results_before_deadline(self):
+        fake_context = _FakeContext()
+        sentinels = []
 
-            def join_thread(self):
-                pass
+        def fake_safe_analyze(fn, path, missing_warning):
+            return {"score": 0.9, "details": {"status": "ok", "analyzer": fn.__name__}}
 
-        class FakeProcess:
-            def __init__(self, target, args, daemon):
-                self.target = target
-                self.args = args
-                self.daemon = daemon
-                self.sentinel = object()
-                self.started = False
-                self.terminated = False
-                self.join_calls = []
-                self.closed = False
-
-            def start(self):
-                self.started = True
-
-            def is_alive(self):
-                return True
-
-            def terminate(self):
-                self.terminated = True
-
-            def join(self, timeout=None):
-                self.join_calls.append(timeout)
-
-            def close(self):
-                self.closed = True
-
-        class FakeContext:
-            def __init__(self):
-                self.processes = []
-
-            def Queue(self, maxsize=1):
-                return FakeQueue()
-
-            def Process(self, target, args, daemon):
-                process = FakeProcess(target, args, daemon)
-                self.processes.append(process)
-                return process
-
-        fake_context = FakeContext()
         with unittest.mock.patch.object(main.multiprocessing, "get_context", return_value=fake_context):
-            with unittest.mock.patch.object(main, "multiprocessing_wait", return_value=set()):
-                results, timed_out = main._run_parallel_analysis(
-                    "scan-1",
-                    main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"),
-                )
+            with unittest.mock.patch.object(main, "_safe_analyze", side_effect=fake_safe_analyze):
+                with unittest.mock.patch.object(main, "multiprocessing_wait", side_effect=lambda handles, timeout=None: set(handles) if not sentinels else set()):
+                    results, worker_states = main._run_parallel_analysis(
+                        "scan-1",
+                        main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"),
+                    )
 
-        self.assertEqual(set(timed_out), {"video", "audio", "image"})
-        self.assertEqual(results["audio"]["details"]["audio_warnings"], ["audio_timeout"])
-        self.assertEqual(results["video"]["details"]["visual_warnings"], ["video_timeout"])
-        self.assertEqual(results["image"]["details"]["image_warnings"], ["image_timeout"])
-        for process in fake_context.processes:
-            self.assertTrue(process.started)
-            self.assertTrue(process.terminated)
-            self.assertIn(1.0, process.join_calls)
+        self.assertEqual(results["video"]["details"]["analyzer"], "analyze_video")
+        self.assertEqual(results["audio"]["details"]["analyzer"], "analyze_audio")
+        self.assertEqual(results["image"]["details"]["analyzer"], "analyze_face")
+        self.assertTrue(all(not state["timed_out"] for state in worker_states.values()))
+        self.assertTrue(all(not state["alive"] for state in worker_states.values()))
+        self.assertTrue(all(not state["terminated"] for state in worker_states.values()))
+        self.assertTrue(all(not state["killed"] for state in worker_states.values()))
+
+    def test_finalize_analysis_worker_reads_completed_pipe_payload(self):
+        shared_state = {
+            "payload": {
+                "ok": True,
+                "result": {"score": 0.94, "details": {"status": "ok"}},
+                "metrics": {"child_boot_ms": 11, "analyzer_execution_ms": 7},
+            },
+            "ready": True,
+        }
+        conn = _FakePipeEndpoint(shared_state)
+        process = _FakeProcess(lambda *args: None, (), False, {"invoke_target": False, "alive_after_start": False})
+
+        result, state = main._finalize_analysis_worker(
+            scan_id="scan-1",
+            analyzer_name="video",
+            process=process,
+            result_conn=conn,
+            started_at=time.perf_counter() - 0.01,
+            parent_process_start_ms=3,
+            timeout_seconds=main.MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
+            timed_out=False,
+        )
+
+        self.assertEqual(result["score"], 0.94)
+        self.assertEqual(state["child_boot_ms"], 11)
+        self.assertFalse(state["timed_out"])
+        self.assertFalse(state["alive"])
+
+    def test_finalize_analysis_process_kills_still_alive_worker(self):
+        process = _FakeProcess(lambda *args: None, (), False, {"invoke_target": False, "alive_after_start": True, "requires_kill": True})
+
+        state = main._finalize_analysis_process(process)
+
+        self.assertTrue(state["terminated"])
+        self.assertTrue(state["killed"])
+        self.assertFalse(state["alive"])
+        self.assertEqual(process.join_calls, [1.0, 1.0])
+
+    def test_finalize_analysis_worker_terminates_timed_out_worker(self):
+        conn = _FakePipeEndpoint({"payload": None, "ready": False})
+        process = _FakeProcess(lambda *args: None, (), False, {"invoke_target": False, "alive_after_start": True})
+
+        result, state = main._finalize_analysis_worker(
+            scan_id="scan-1",
+            analyzer_name="image",
+            process=process,
+            result_conn=conn,
+            started_at=time.perf_counter() - 0.01,
+            parent_process_start_ms=4,
+            timeout_seconds=main.MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
+            timed_out=True,
+        )
+
+        self.assertTrue(state["terminated"])
+        self.assertFalse(state["alive"])
+        self.assertFalse(state["killed"])
+        self.assertIn("image_timeout", result["details"]["image_warnings"])
+
+    def test_timeout_placeholder_is_not_valid_fatigue_evidence(self):
+        placeholder = main._analysis_timeout_placeholder("video")
+
+        self.assertFalse(main._result_has_valid_evidence(placeholder))
+        self.assertIn("video_timeout", placeholder["details"]["visual_warnings"])
+
+    def test_partial_modality_timeout_preserves_success_path(self):
+        with ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_resolve_scan_context",
+                    return_value={
+                        "status": main.SCAN_STATUS_MEDIA_READY,
+                        "scan_media": {"id": "media-1"},
+                        "resolved_media": {},
+                        "task_metrics": None,
+                        "expected_phrase": None,
+                        "user": None,
+                        "member": None,
+                        "business_profile": None,
+                        "department": None,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_media", return_value=main.Media(image="image.jpg", audio="audio.wav", video="video.mp4")))
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_task", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main, "_identifier_payload", return_value={"user_id": None, "member_id": None, "business_profile_id": None, "department_id": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_baseline_rows_for_member", return_value=[]))
+            stack.enter_context(unittest.mock.patch.object(main, "baseline_status_payload", return_value={"baseline_status": "inactive", "baseline_confidence": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_expected_phrase", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "local_model_required", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_resolve_media_input", side_effect=lambda path, *args, **kwargs: (path, False)))
+            stack.enter_context(unittest.mock.patch.object(main, "_should_convert_audio", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_run_parallel_analysis",
+                    return_value=(
+                        {
+                            "video": {"score": 0.8, "details": {"status": "ok", "visual_quality_score": 0.8, "visual_warnings": []}},
+                            "audio": {"score": 0.8, "details": {"status": "ok", "audio_quality_score": 0.8, "audio_warnings": [], "timings_ms": {}}},
+                            "image": {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": []}},
+                        },
+                        {
+                            "video": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
+                            "audio": {"timed_out": True, "alive": False, "terminated": True, "killed": False, "process_exitcode": -15},
+                            "image": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
+                        },
+                    ),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "validate_scan_inputs",
+                    return_value={
+                        "quality_scores": {"phrase_match": 0.9, "audio": 0.8, "video": 0.8, "image": 0.8},
+                        "warnings": [],
+                        "critical_errors": [],
+                        "failure_reason": None,
+                    },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "assess_quality",
+                    return_value={
+                        "warnings": [],
+                        "media_quality": {
+                            "video": {"usable": True, "present": True},
+                            "audio": {"usable": False, "present": False},
+                            "image": {"usable": True, "present": True},
+                        },
+                        "usable_modalities": 2,
+                        "failure_reason": None,
+                        "status": "passed",
+                        "weak": False,
+                        "retake_required": False,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_required_modality_gate", return_value=(None, ["video", "audio", "image"])))
+            stack.enter_context(unittest.mock.patch.object(main, "_face_eye_evidence_unreliable", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_result_has_valid_evidence", return_value=True))
+            stack.enter_context(unittest.mock.patch.object(main, "features_from_signals", return_value=({}, {})))
+            stack.enter_context(unittest.mock.patch.object(main, "vector_from_features", return_value=[0.0] * 21))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "predict", return_value={"score": 0.5}))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "compute_result",
+                    return_value={
+                        "readiness_score": 80,
+                        "confidence": 0.8,
+                        "risk_level": "stable",
+                        "suggested_action": "continue_normal_activity",
+                        "explanation": "ok",
+                        "retake_required": False,
+                        "baseline_used": False,
+                        "fusion_details": {"baseline_flags": {}},
+                        "modality_scores": {},
+                        "face_metrics": {"baseline_drifts": {}},
+                        "voice_metrics": {"baseline_drifts": {}},
+                        "reaction_metrics": {"baseline_drifts": {}},
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "baseline_ready_for_personalized_scoring", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "evaluate_baseline_eligibility",
+                    return_value={
+                        "eligible": False,
+                        "capture_quality_score": 0.0,
+                        "measurement_reliability_score": 0.0,
+                        "task_completion_status": "not_required",
+                        "hard_gates_triggered": [],
+                        "reasons": [],
+                    },
+                )
+            )
+            write_success = MagicMock(return_value={"scan_result": "updated:scan-1", "wellness_scan": "updated"})
+            stack.enter_context(unittest.mock.patch.object(main, "_write_success", write_success))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_step", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_perf", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_validation_decision", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_validation_lifecycle", side_effect=lambda *args, **kwargs: None))
+
+            result = main._process_scan_sync("scan-1")
+
+        self.assertEqual(result["status"], main.SCAN_STATUS_COMPLETED)
+        write_success.assert_called_once()
 
     def test_process_scan_sync_timeout_path_finalizes_failed_scan(self):
         with ExitStack() as stack:
@@ -1271,7 +1510,7 @@ class PipelineTests(unittest.TestCase):
                     "_resolve_scan_context",
                     return_value={
                         "status": main.SCAN_STATUS_MEDIA_READY,
-                        "scan_media": {},
+                        "scan_media": {"id": "media-1"},
                         "resolved_media": {},
                         "task_metrics": None,
                         "expected_phrase": None,
@@ -1301,7 +1540,11 @@ class PipelineTests(unittest.TestCase):
                             "audio": main._analysis_timeout_placeholder("audio"),
                             "image": main._analysis_timeout_placeholder("image"),
                         },
-                        ["audio"],
+                        {
+                            "video": {"timed_out": True, "alive": False, "terminated": True, "killed": False, "process_exitcode": -15},
+                            "audio": {"timed_out": True, "alive": False, "terminated": True, "killed": False, "process_exitcode": -15},
+                            "image": {"timed_out": True, "alive": False, "terminated": True, "killed": False, "process_exitcode": -15},
+                        },
                     ),
                 )
             )
@@ -1336,7 +1579,7 @@ class PipelineTests(unittest.TestCase):
                     },
                 )
             )
-            stack.enter_context(unittest.mock.patch.object(main, "_required_modality_gate", return_value=(main.FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, ["audio"])))
+            stack.enter_context(unittest.mock.patch.object(main, "_required_modality_gate", return_value=(main.FAILURE_REASON_LOW_QUALITY_MEDIA, ["video", "audio", "image"])))
             mark_failed_terminal = stack.enter_context(unittest.mock.patch.object(main, "_mark_scan_failed_terminal", return_value={"wellness_scan": "failed_updated"}))
             stack.enter_context(unittest.mock.patch.object(main, "_log_step", side_effect=lambda *args, **kwargs: None))
             stack.enter_context(unittest.mock.patch.object(main, "_log_perf", side_effect=lambda *args, **kwargs: None))
@@ -1348,7 +1591,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(result["status"], main.SCAN_STATUS_FAILED)
         self.assertNotEqual(result["status"], main.SCAN_STATUS_PROCESSING)
-        self.assertEqual(result["failure_reason"], main.FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT)
+        self.assertEqual(result["failure_reason"], "validation_timeout")
         mark_failed_terminal.assert_called_once()
 
     def test_process_scan_sync_success_path_returns_completed(self):
@@ -1359,7 +1602,7 @@ class PipelineTests(unittest.TestCase):
                     "_resolve_scan_context",
                     return_value={
                         "status": main.SCAN_STATUS_MEDIA_READY,
-                        "scan_media": {},
+                        "scan_media": {"id": "media-1"},
                         "resolved_media": {},
                         "task_metrics": None,
                         "expected_phrase": None,
@@ -1389,7 +1632,11 @@ class PipelineTests(unittest.TestCase):
                             "audio": {"score": 0.8, "details": {"status": "ok", "audio_quality_score": 0.8, "audio_warnings": [], "timings_ms": {}}},
                             "image": {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": []}},
                         },
-                        [],
+                        {
+                            "video": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
+                            "audio": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
+                            "image": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
+                        },
                     ),
                 )
             )
@@ -1494,7 +1741,7 @@ class PipelineTests(unittest.TestCase):
                     "_resolve_scan_context",
                     return_value={
                         "status": main.SCAN_STATUS_MEDIA_READY,
-                        "scan_media": {},
+                        "scan_media": {"id": "media-1"},
                         "resolved_media": {},
                         "task_metrics": None,
                         "expected_phrase": None,
@@ -1524,7 +1771,11 @@ class PipelineTests(unittest.TestCase):
                             "audio": {"score": 0.8, "details": {"status": "ok", "audio_quality_score": 0.8, "audio_warnings": [], "timings_ms": {}}},
                             "image": {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": []}},
                         },
-                        [],
+                        {
+                            "video": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
+                            "audio": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
+                            "image": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
+                        },
                     ),
                 )
             )
