@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 import requests
 from requests import HTTPError, RequestException
 
+import analysis_worker
 from baseline import (
     baseline_ready_for_personalized_scoring,
     baseline_signal_payload,
@@ -724,10 +725,16 @@ def _log_validation_decision(
     *,
     valid_modalities: list[str],
     timed_out_modalities: list[str],
+    analyzer_error_modalities: list[str] | None = None,
     terminal_reason: str,
 ) -> None:
     logger.info("[VALIDATION_DECISION] valid_modalities scan_id=%s value=%s", scan_id, valid_modalities)
     logger.info("[VALIDATION_DECISION] timed_out_modalities scan_id=%s value=%s", scan_id, timed_out_modalities)
+    logger.info(
+        "[VALIDATION_DECISION] analyzer_error_modalities scan_id=%s value=%s",
+        scan_id,
+        analyzer_error_modalities or [],
+    )
     logger.info("[VALIDATION_DECISION] terminal_reason scan_id=%s value=%s", scan_id, terminal_reason)
 
 
@@ -816,6 +823,22 @@ def _analysis_worker_placeholder(analyzer_name: str) -> dict:
     return _analysis_timeout_placeholder(analyzer_name)
 
 
+def _analysis_error_placeholder(analyzer_name: str) -> dict:
+    warning_key = {
+        "video": "visual_warnings",
+        "audio": "audio_warnings",
+        "image": "image_warnings",
+    }.get(analyzer_name, "warnings")
+    status = "error"
+    return {
+        "score": None,
+        "details": {
+            "status": status,
+            warning_key: [f"{analyzer_name}_analysis_error"],
+        },
+    }
+
+
 def _finalize_analysis_process(process: multiprocessing.Process, *, timeout_seconds: float = 1.0) -> dict[str, Any]:
     state = {
         "terminated": False,
@@ -850,19 +873,34 @@ def _finalize_analysis_worker(
     parent_process_start_ms: int | None,
     timeout_seconds: float | None,
     timed_out: bool,
+    result_ready: bool = False,
 ) -> tuple[dict, dict[str, Any]]:
     metric_name = f"{analyzer_name}_validation_ms"
     elapsed_ms = _elapsed_ms(started_at)
     state: dict[str, Any] = {
+        "state": "starting",
+        "child_started": True,
+        "result_ready": False,
+        "result_received": False,
+        "analyzer_error": False,
+        "process_exited": False,
         "timed_out": timed_out,
         "alive": process.is_alive(),
         "terminated": False,
         "killed": False,
         "process_exitcode": process.exitcode,
+        "final_alive": process.is_alive(),
+        "finalized": False,
         "parent_process_start_ms": parent_process_start_ms,
-        "child_boot_ms": None,
+        "process_start_begin_ms": None,
+        "process_start_return_ms": None,
+        "child_entry_ms": None,
+        "analyzer_import_ms": None,
         "analyzer_execution_ms": None,
-        "result_publish_ms": None,
+        "result_send_ms": None,
+        "result_receive_ms": None,
+        "process_exit_ms": None,
+        "child_boot_ms": None,
         "total_worker_ms": None,
     }
 
@@ -887,13 +925,22 @@ def _finalize_analysis_worker(
             terminated=state["terminated"],
             killed=state["killed"],
             alive=state["alive"],
+            result_received=False,
+            analyzer_error=False,
         )
+        state["process_exited"] = not state["alive"]
+        state["final_alive"] = state["alive"]
+        state["process_exit_ms"] = elapsed_ms
+        state["finalized"] = True
         _log_perf(scan_id, metric_name, elapsed_ms)
         return _analysis_worker_placeholder(analyzer_name), state
 
     payload = None
     try:
-        if result_conn.poll(0.5):
+        if result_ready:
+            if result_conn.poll(0):
+                payload = result_conn.recv()
+        elif result_conn.poll(0.5):
             payload = result_conn.recv()
     except EOFError:
         payload = None
@@ -903,6 +950,57 @@ def _finalize_analysis_worker(
         except Exception:
             pass
         state.update(_finalize_analysis_process(process))
+        state["process_exited"] = not state["alive"]
+        state["final_alive"] = state["alive"]
+        state["process_exit_ms"] = elapsed_ms
+        state["finalized"] = True
+
+    result_received = False
+    analyzer_error = False
+    if isinstance(payload, dict) and payload.get("ok"):
+        result = payload.get("result")
+        if isinstance(result, dict):
+            result_received = True
+            metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+            state["result_ready"] = True
+            state["result_received"] = True
+            state["child_entry_ms"] = metrics.get("child_entry_ms")
+            state["analyzer_import_ms"] = metrics.get("analyzer_import_ms")
+            state["analyzer_execution_ms"] = metrics.get("analyzer_execution_ms")
+            state["result_send_ms"] = metrics.get("result_send_ms") or metrics.get("result_publish_ms")
+            state["total_worker_ms"] = metrics.get("total_worker_ms")
+            state["process_exitcode"] = state["process_exitcode"]
+            _log_step(
+                scan_id,
+                "analysis_worker_finalized",
+                analyzer=analyzer_name,
+                timed_out=False,
+                process_exitcode=state["process_exitcode"],
+                terminated=state["terminated"],
+                killed=state["killed"],
+                alive=state["alive"],
+                result_received=True,
+                analyzer_error=False,
+            )
+            _log_perf(scan_id, metric_name, elapsed_ms)
+            _log_perf(scan_id, f"{analyzer_name}_child_entry_ms", state["child_entry_ms"])
+            _log_perf(scan_id, f"{analyzer_name}_analyzer_import_ms", state["analyzer_import_ms"])
+            _log_perf(scan_id, f"{analyzer_name}_analyzer_execution_ms", state["analyzer_execution_ms"])
+            _log_perf(scan_id, f"{analyzer_name}_result_send_ms", state["result_send_ms"])
+            _log_perf(scan_id, f"{analyzer_name}_result_receive_ms", elapsed_ms)
+            _log_perf(scan_id, f"{analyzer_name}_process_exit_ms", state["process_exit_ms"])
+            return result, state
+        analyzer_error = True
+    elif isinstance(payload, dict) and payload.get("error_type"):
+        analyzer_error = True
+        logger.warning(
+            "analysis_worker_error scan_id=%s analyzer=%s error_type=%s",
+            scan_id,
+            analyzer_name,
+            payload.get("error_type"),
+        )
+    elif payload is None:
+        analyzer_error = True
 
     _log_step(
         scan_id,
@@ -913,24 +1011,22 @@ def _finalize_analysis_worker(
         terminated=state["terminated"],
         killed=state["killed"],
         alive=state["alive"],
+        result_received=result_received,
+        analyzer_error=analyzer_error,
     )
     _log_perf(scan_id, metric_name, elapsed_ms)
-    if isinstance(payload, dict) and payload.get("ok"):
-        result = payload.get("result")
-        if isinstance(result, dict):
-            metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
-            state["child_boot_ms"] = metrics.get("child_boot_ms")
-            state["analyzer_execution_ms"] = metrics.get("analyzer_execution_ms")
-            state["result_publish_ms"] = metrics.get("result_publish_ms")
-            state["total_worker_ms"] = metrics.get("total_worker_ms")
-            return result, state
-    if isinstance(payload, dict) and payload.get("error_type"):
-        logger.warning(
-            "analysis_worker_error scan_id=%s analyzer=%s error_type=%s",
-            scan_id,
-            analyzer_name,
-            payload.get("error_type"),
-        )
+    _log_perf(scan_id, f"{analyzer_name}_child_entry_ms", state["child_entry_ms"])
+    _log_perf(scan_id, f"{analyzer_name}_analyzer_import_ms", state["analyzer_import_ms"])
+    _log_perf(scan_id, f"{analyzer_name}_analyzer_execution_ms", state["analyzer_execution_ms"])
+    _log_perf(scan_id, f"{analyzer_name}_result_send_ms", state["result_send_ms"])
+    _log_perf(scan_id, f"{analyzer_name}_result_receive_ms", elapsed_ms if result_received else None)
+    _log_perf(scan_id, f"{analyzer_name}_process_exit_ms", state["process_exit_ms"])
+    if analyzer_error:
+        state["analyzer_error"] = True
+        state["result_received"] = bool(payload)
+        state["result_ready"] = bool(payload)
+        result_received = bool(payload)
+        return _analysis_error_placeholder(analyzer_name), state
     return _analysis_worker_placeholder(analyzer_name), state
 
 
@@ -948,66 +1044,78 @@ def _run_parallel_analysis(
     results: dict[str, dict] = {}
     worker_states: dict[str, dict[str, Any]] = {}
 
-    previous_child_mode = os.getenv(_ANALYZER_CHILD_ENV)
-    os.environ[_ANALYZER_CHILD_ENV] = "1"
-    try:
-        for analyzer_name, (path, missing_warning) in analyzer_specs.items():
-            parent_started_at = time.perf_counter()
-            parent_conn, child_conn = ctx.Pipe(duplex=False)
-            process = ctx.Process(
-                target=_analysis_worker_entry,
-                args=(child_conn, analyzer_name, path, missing_warning, scan_id, parent_started_at),
-                daemon=True,
-            )
-            process.start()
-            try:
-                child_conn.close()
-            except Exception:
-                pass
-            parent_process_start_ms = _elapsed_ms(parent_started_at)
-            _log_perf(scan_id, f"{analyzer_name}_parent_process_start_ms", parent_process_start_ms)
-            processes[analyzer_name] = {
-                "process": process,
-                "conn": parent_conn,
-                "started_at": parent_started_at,
-                "parent_process_start_ms": parent_process_start_ms,
-            }
-    finally:
-        if previous_child_mode is None:
-            os.environ.pop(_ANALYZER_CHILD_ENV, None)
-        else:
-            os.environ[_ANALYZER_CHILD_ENV] = previous_child_mode
+    validation_started_at = time.perf_counter()
+    for analyzer_name, (path, missing_warning) in analyzer_specs.items():
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        process_start_begin_ms = _elapsed_ms(validation_started_at)
+        _log_perf(scan_id, f"{analyzer_name}_process_start_begin_ms", process_start_begin_ms)
+        process = ctx.Process(
+            target=analysis_worker.run_analysis_worker,
+            args=(child_conn, analyzer_name, path, missing_warning, scan_id, validation_started_at),
+            daemon=True,
+        )
+        process.start()
+        process_start_return_ms = _elapsed_ms(validation_started_at)
+        _log_perf(scan_id, f"{analyzer_name}_process_start_return_ms", process_start_return_ms)
+        try:
+            child_conn.close()
+        except Exception:
+            pass
+        processes[analyzer_name] = {
+            "process": process,
+            "conn": parent_conn,
+            "started_at": validation_started_at,
+            "process_start_begin_ms": process_start_begin_ms,
+            "process_start_return_ms": process_start_return_ms,
+        }
 
     deadline = time.perf_counter() + MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS
     remaining_names = set(processes.keys())
-    sentinel_to_name = {processes[name]["process"].sentinel: name for name in processes}
 
     while remaining_names:
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
             break
-        wait_handles = [processes[name]["process"].sentinel for name in remaining_names]
+        wait_handles: list[Any] = []
+        handle_map: dict[Any, tuple[str, str]] = {}
+        for analyzer_name in remaining_names:
+            process_state = processes[analyzer_name]
+            conn = process_state["conn"]
+            process = process_state["process"]
+            wait_handles.append(conn)
+            wait_handles.append(process.sentinel)
+            handle_map[conn] = (analyzer_name, "conn")
+            handle_map[process.sentinel] = (analyzer_name, "sentinel")
         ready = multiprocessing_wait(wait_handles, timeout=remaining)
         if not ready:
             break
+        ready_names: set[str] = set()
         for handle in ready:
-            analyzer_name = sentinel_to_name.get(handle)
-            if analyzer_name is None or analyzer_name not in remaining_names:
+            mapping = handle_map.get(handle)
+            if mapping is None:
+                continue
+            analyzer_name, handle_kind = mapping
+            if analyzer_name not in remaining_names:
                 continue
             process_state = processes[analyzer_name]
+            result_ready = handle_kind == "conn"
+            if not result_ready and process_state["conn"].poll(0):
+                result_ready = True
             result, worker_state = _finalize_analysis_worker(
                 scan_id=scan_id,
                 analyzer_name=analyzer_name,
                 process=process_state["process"],
                 result_conn=process_state["conn"],
                 started_at=process_state["started_at"],
-                parent_process_start_ms=process_state["parent_process_start_ms"],
+                parent_process_start_ms=process_state["process_start_return_ms"],
                 timeout_seconds=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
                 timed_out=False,
+                result_ready=result_ready,
             )
             results[analyzer_name] = result
             worker_states[analyzer_name] = worker_state
-            remaining_names.discard(analyzer_name)
+            ready_names.add(analyzer_name)
+        remaining_names.difference_update(ready_names)
 
     for analyzer_name in list(remaining_names):
         process_state = processes[analyzer_name]
@@ -1017,7 +1125,7 @@ def _run_parallel_analysis(
             process=process_state["process"],
             result_conn=process_state["conn"],
             started_at=process_state["started_at"],
-            parent_process_start_ms=process_state["parent_process_start_ms"],
+            parent_process_start_ms=process_state["process_start_return_ms"],
             timeout_seconds=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
             timed_out=True,
         )
@@ -2665,13 +2773,18 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
 
         valid_modalities = [
             modality
-            for modality in ["video", "audio", "image"]
-            if (quality_result.get("media_quality") or {}).get(modality, {}).get("usable")
+            for modality, result in analysis_results.items()
+            if _result_has_valid_evidence(result)
+        ]
+        analyzer_error_modalities = [
+            modality
+            for modality, state in worker_states.items()
+            if state.get("analyzer_error")
         ]
         running_modalities = [
             modality
             for modality, state in worker_states.items()
-            if state.get("alive")
+            if state.get("final_alive")
         ]
         all_workers_terminal = not running_modalities
         all_modalities_timed_out = bool(worker_states) and len(timed_out_modalities) == len(worker_states)
@@ -2680,6 +2793,9 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             terminal_failure_reason = "validation_timeout"
             terminal_reason = "validation_timeout"
             _required_modalities = ["video", "audio", "image"]
+        elif analyzer_error_modalities and len(analyzer_error_modalities) == len(worker_states) and not valid_modalities:
+            terminal_failure_reason = FAILURE_REASON_ANALYSIS_EXCEPTION
+            terminal_reason = "analysis_worker_error"
         else:
             terminal_failure_reason, _required_modalities = _required_modality_gate(
                 quality_result,
@@ -2702,6 +2818,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             scan_id,
             valid_modalities=valid_modalities,
             timed_out_modalities=timed_out_modalities,
+            analyzer_error_modalities=analyzer_error_modalities,
             terminal_reason=terminal_reason,
         )
         _log_validation_lifecycle(scan_id, all_workers_terminal=all_workers_terminal, running_modalities=running_modalities)
