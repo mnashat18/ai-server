@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 import requests
 from requests import HTTPError, RequestException
 
-import analysis_worker
+from analysis_runtime import AnalysisRuntimeStartupError, get_runtime as get_analyzer_runtime
 from baseline import (
     baseline_ready_for_personalized_scoring,
     baseline_signal_payload,
@@ -258,9 +258,24 @@ class ScanResultResponse(BaseModel):
     reaction_metrics: dict | None = None
     explanation: str
     suggested_action: str
-    ai_model_version: str
-    diagnostics: dict | None = None
-    writeback_status: dict | None = None
+
+
+@app.on_event("startup")
+def _startup_analyzer_runtime() -> None:
+    runtime = get_analyzer_runtime()
+    try:
+        runtime.start()
+    except AnalysisRuntimeStartupError:
+        logger.error("analyzer_runtime_start_failed error_type=AnalysisRuntimeStartupError")
+        raise
+
+
+@app.on_event("shutdown")
+def _shutdown_analyzer_runtime() -> None:
+    try:
+        get_analyzer_runtime().shutdown()
+    except Exception as exc:
+        logger.error("analyzer_runtime_shutdown_failed error_type=%s", type(exc).__name__)
 
 
 class BaselineStatusResponse(BaseModel):
@@ -1034,109 +1049,16 @@ def _run_parallel_analysis(
     scan_id: str,
     media: Media,
 ) -> tuple[dict, dict[str, dict[str, Any]]]:
-    ctx = multiprocessing.get_context("spawn")
-    analyzer_specs = {
-        "video": (media.video, "video_missing"),
-        "audio": (media.audio, "audio_missing"),
-        "image": (media.image, "image_missing"),
-    }
-    processes: dict[str, dict[str, Any]] = {}
-    results: dict[str, dict] = {}
-    worker_states: dict[str, dict[str, Any]] = {}
-
-    validation_started_at = time.perf_counter()
-    for analyzer_name, (path, missing_warning) in analyzer_specs.items():
-        parent_conn, child_conn = ctx.Pipe(duplex=False)
-        process_start_begin_ms = _elapsed_ms(validation_started_at)
-        _log_perf(scan_id, f"{analyzer_name}_process_start_begin_ms", process_start_begin_ms)
-        process = ctx.Process(
-            target=analysis_worker.run_analysis_worker,
-            args=(child_conn, analyzer_name, path, missing_warning, scan_id, validation_started_at),
-            daemon=True,
-        )
-        process.start()
-        process_start_return_ms = _elapsed_ms(validation_started_at)
-        _log_perf(scan_id, f"{analyzer_name}_process_start_return_ms", process_start_return_ms)
-        try:
-            child_conn.close()
-        except Exception:
-            pass
-        processes[analyzer_name] = {
-            "process": process,
-            "conn": parent_conn,
-            "started_at": validation_started_at,
-            "process_start_begin_ms": process_start_begin_ms,
-            "process_start_return_ms": process_start_return_ms,
-        }
-
-    deadline = time.perf_counter() + MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS
-    remaining_names = set(processes.keys())
-
-    while remaining_names:
-        remaining = deadline - time.perf_counter()
-        if remaining <= 0:
-            break
-        wait_handles: list[Any] = []
-        handle_map: dict[Any, tuple[str, str]] = {}
-        for analyzer_name in remaining_names:
-            process_state = processes[analyzer_name]
-            conn = process_state["conn"]
-            process = process_state["process"]
-            wait_handles.append(conn)
-            wait_handles.append(process.sentinel)
-            handle_map[conn] = (analyzer_name, "conn")
-            handle_map[process.sentinel] = (analyzer_name, "sentinel")
-        ready = multiprocessing_wait(wait_handles, timeout=remaining)
-        if not ready:
-            break
-        ready_names: set[str] = set()
-        for handle in ready:
-            mapping = handle_map.get(handle)
-            if mapping is None:
-                continue
-            analyzer_name, handle_kind = mapping
-            if analyzer_name not in remaining_names:
-                continue
-            process_state = processes[analyzer_name]
-            result_ready = handle_kind == "conn"
-            if not result_ready and process_state["conn"].poll(0):
-                result_ready = True
-            result, worker_state = _finalize_analysis_worker(
-                scan_id=scan_id,
-                analyzer_name=analyzer_name,
-                process=process_state["process"],
-                result_conn=process_state["conn"],
-                started_at=process_state["started_at"],
-                parent_process_start_ms=process_state["process_start_return_ms"],
-                timeout_seconds=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
-                timed_out=False,
-                result_ready=result_ready,
-            )
-            results[analyzer_name] = result
-            worker_states[analyzer_name] = worker_state
-            ready_names.add(analyzer_name)
-        remaining_names.difference_update(ready_names)
-
-    for analyzer_name in list(remaining_names):
-        process_state = processes[analyzer_name]
-        result, worker_state = _finalize_analysis_worker(
-            scan_id=scan_id,
-            analyzer_name=analyzer_name,
-            process=process_state["process"],
-            result_conn=process_state["conn"],
-            started_at=process_state["started_at"],
-            parent_process_start_ms=process_state["process_start_return_ms"],
-            timeout_seconds=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
-            timed_out=True,
-        )
-        results[analyzer_name] = result
-        worker_states[analyzer_name] = worker_state
-        remaining_names.discard(analyzer_name)
-
+    runtime = get_analyzer_runtime()
+    analysis_results, worker_states = runtime.run_scan(
+        scan_id,
+        media,
+        deadline_seconds=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
+    )
     return {
-        "video": results.get("video") or _analysis_worker_placeholder("video"),
-        "audio": results.get("audio") or _analysis_worker_placeholder("audio"),
-        "image": results.get("image") or _analysis_worker_placeholder("image"),
+        "video": analysis_results.get("video") or _analysis_worker_placeholder("video"),
+        "audio": analysis_results.get("audio") or _analysis_worker_placeholder("audio"),
+        "image": analysis_results.get("image") or _analysis_worker_placeholder("image"),
     }, worker_states
 
 
@@ -1404,6 +1326,7 @@ def _ensure_scan_media_ready(scan_id: str) -> None:
 
 def _model_health() -> dict[str, Any]:
     model_path = ml_runtime.model_path
+    runtime = get_analyzer_runtime()
     return {
         "status": "ok",
         "model_version": MODEL_VERSION,
@@ -1421,6 +1344,7 @@ def _model_health() -> dict[str, Any]:
             "require_phrase_match": VALIDATION_POLICY.require_phrase_match,
             "phrase_match_threshold": VALIDATION_POLICY.phrase_match_threshold,
         },
+        "analyzer_runtime": runtime.health(),
     }
 
 
@@ -2525,9 +2449,7 @@ def _required_modality_gate(
             continue
         required_modalities.append(modality)
         if modality in timed_out_modalities:
-            if modality == "audio":
-                return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, required_modalities
-            return FAILURE_REASON_LOW_QUALITY_MEDIA, required_modalities
+            continue
         modality_quality = media_quality.get(modality) or {}
         if modality == "audio" and "audio_decode_timeout" in set(modality_quality.get("warnings") or []):
             return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, required_modalities
@@ -3113,6 +3035,9 @@ def process_scan_background(scan_id: str) -> None:
 
 @app.get("/health")
 def health():
+    runtime = get_analyzer_runtime()
+    if not runtime.is_ready():
+        raise HTTPException(status_code=503, detail="analyzer_runtime_not_ready")
     return _model_health()
 
 
