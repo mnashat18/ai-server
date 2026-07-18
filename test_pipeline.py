@@ -1,5 +1,6 @@
 import unittest
 import json
+from contextlib import ExitStack
 from unittest.mock import MagicMock
 
 from baseline import (
@@ -1198,6 +1199,463 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("ai_model_version", combined)
         self.assertNotIn("for field", combined)
         self.assertNotIn("is too long", combined)
+
+    def test_run_parallel_analysis_times_out_and_terminates_workers(self):
+        class FakeQueue:
+            def close(self):
+                pass
+
+            def join_thread(self):
+                pass
+
+        class FakeProcess:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+                self.sentinel = object()
+                self.started = False
+                self.terminated = False
+                self.join_calls = []
+                self.closed = False
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return True
+
+            def terminate(self):
+                self.terminated = True
+
+            def join(self, timeout=None):
+                self.join_calls.append(timeout)
+
+            def close(self):
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self):
+                self.processes = []
+
+            def Queue(self, maxsize=1):
+                return FakeQueue()
+
+            def Process(self, target, args, daemon):
+                process = FakeProcess(target, args, daemon)
+                self.processes.append(process)
+                return process
+
+        fake_context = FakeContext()
+        with unittest.mock.patch.object(main.multiprocessing, "get_context", return_value=fake_context):
+            with unittest.mock.patch.object(main, "multiprocessing_wait", return_value=set()):
+                results, timed_out = main._run_parallel_analysis(
+                    "scan-1",
+                    main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"),
+                )
+
+        self.assertEqual(set(timed_out), {"video", "audio", "image"})
+        self.assertEqual(results["audio"]["details"]["audio_warnings"], ["audio_timeout"])
+        self.assertEqual(results["video"]["details"]["visual_warnings"], ["video_timeout"])
+        self.assertEqual(results["image"]["details"]["image_warnings"], ["image_timeout"])
+        for process in fake_context.processes:
+            self.assertTrue(process.started)
+            self.assertTrue(process.terminated)
+            self.assertIn(1.0, process.join_calls)
+
+    def test_process_scan_sync_timeout_path_finalizes_failed_scan(self):
+        with ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_resolve_scan_context",
+                    return_value={
+                        "status": main.SCAN_STATUS_MEDIA_READY,
+                        "scan_media": {},
+                        "resolved_media": {},
+                        "task_metrics": None,
+                        "expected_phrase": None,
+                        "user": None,
+                        "member": None,
+                        "business_profile": None,
+                        "department": None,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_media", return_value=main.Media(image="image.jpg", audio="audio.wav", video="video.mp4")))
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_task", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main, "_identifier_payload", return_value={"user_id": None, "member_id": None, "business_profile_id": None, "department_id": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_baseline_rows_for_member", return_value=[]))
+            stack.enter_context(unittest.mock.patch.object(main, "baseline_status_payload", return_value={"baseline_status": "inactive", "baseline_confidence": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_expected_phrase", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "local_model_required", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_resolve_media_input", side_effect=lambda path, *args, **kwargs: (path, False)))
+            stack.enter_context(unittest.mock.patch.object(main, "_should_convert_audio", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_run_parallel_analysis",
+                    return_value=(
+                        {
+                            "video": main._analysis_timeout_placeholder("video"),
+                            "audio": main._analysis_timeout_placeholder("audio"),
+                            "image": main._analysis_timeout_placeholder("image"),
+                        },
+                        ["audio"],
+                    ),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "validate_scan_inputs",
+                    return_value={
+                        "quality_scores": {"phrase_match": None, "audio": 0.0, "video": 0.0, "image": 0.0},
+                        "warnings": [],
+                        "critical_errors": [],
+                        "failure_reason": None,
+                    },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "assess_quality",
+                    return_value={
+                        "warnings": ["audio_timeout"],
+                        "media_quality": {
+                            "video": {"usable": True, "present": True},
+                            "audio": {"usable": False, "present": False, "warnings": ["audio_timeout"]},
+                            "image": {"usable": True, "present": True},
+                        },
+                        "usable_modalities": 2,
+                        "failure_reason": None,
+                        "status": "passed",
+                        "weak": False,
+                        "retake_required": False,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_required_modality_gate", return_value=(main.FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, ["audio"])))
+            mark_failed_terminal = stack.enter_context(unittest.mock.patch.object(main, "_mark_scan_failed_terminal", return_value={"wellness_scan": "failed_updated"}))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_step", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_perf", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_validation_decision", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_validation_lifecycle", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_write_success", side_effect=AssertionError("write_success should not run on timeout failure")))
+
+            result = main._process_scan_sync("scan-1")
+
+        self.assertEqual(result["status"], main.SCAN_STATUS_FAILED)
+        self.assertNotEqual(result["status"], main.SCAN_STATUS_PROCESSING)
+        self.assertEqual(result["failure_reason"], main.FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT)
+        mark_failed_terminal.assert_called_once()
+
+    def test_process_scan_sync_success_path_returns_completed(self):
+        with ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_resolve_scan_context",
+                    return_value={
+                        "status": main.SCAN_STATUS_MEDIA_READY,
+                        "scan_media": {},
+                        "resolved_media": {},
+                        "task_metrics": None,
+                        "expected_phrase": None,
+                        "user": None,
+                        "member": None,
+                        "business_profile": None,
+                        "department": None,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_media", return_value=main.Media(image="image.jpg", audio="audio.wav", video="video.mp4")))
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_task", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main, "_identifier_payload", return_value={"user_id": None, "member_id": None, "business_profile_id": None, "department_id": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_baseline_rows_for_member", return_value=[]))
+            stack.enter_context(unittest.mock.patch.object(main, "baseline_status_payload", return_value={"baseline_status": "inactive", "baseline_confidence": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_expected_phrase", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "local_model_required", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_resolve_media_input", side_effect=lambda path, *args, **kwargs: (path, False)))
+            stack.enter_context(unittest.mock.patch.object(main, "_should_convert_audio", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_run_parallel_analysis",
+                    return_value=(
+                        {
+                            "video": {"score": 0.8, "details": {"status": "ok", "visual_quality_score": 0.8, "visual_warnings": []}},
+                            "audio": {"score": 0.8, "details": {"status": "ok", "audio_quality_score": 0.8, "audio_warnings": [], "timings_ms": {}}},
+                            "image": {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": []}},
+                        },
+                        [],
+                    ),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "validate_scan_inputs",
+                    return_value={
+                        "quality_scores": {"phrase_match": 0.9, "audio": 0.8, "video": 0.8, "image": 0.8},
+                        "warnings": [],
+                        "critical_errors": [],
+                        "failure_reason": None,
+                    },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "assess_quality",
+                    return_value={
+                        "warnings": [],
+                        "media_quality": {
+                            "video": {"usable": True, "present": True},
+                            "audio": {"usable": True, "present": True},
+                            "image": {"usable": True, "present": True},
+                        },
+                        "usable_modalities": 3,
+                        "failure_reason": None,
+                        "status": "passed",
+                        "weak": False,
+                        "retake_required": False,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_required_modality_gate", return_value=(None, ["video", "audio", "image"])))
+            stack.enter_context(unittest.mock.patch.object(main, "_face_eye_evidence_unreliable", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_result_has_valid_evidence", return_value=True))
+            stack.enter_context(unittest.mock.patch.object(main, "features_from_signals", return_value=({}, {})))
+            stack.enter_context(unittest.mock.patch.object(main, "vector_from_features", return_value=[0.0] * 21))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "predict", return_value={"score": 0.5}))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "compute_result",
+                    return_value={
+                        "readiness_score": 80,
+                        "confidence": 0.8,
+                        "risk_level": "stable",
+                        "suggested_action": "continue_normal_activity",
+                        "explanation": "ok",
+                        "retake_required": False,
+                        "baseline_used": False,
+                        "fusion_details": {"baseline_flags": {}},
+                        "modality_scores": {},
+                        "face_metrics": {"baseline_drifts": {}},
+                        "voice_metrics": {"baseline_drifts": {}},
+                        "reaction_metrics": {"baseline_drifts": {}},
+                    },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "baseline_ready_for_personalized_scoring",
+                    return_value=False,
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "evaluate_baseline_eligibility",
+                    return_value={
+                        "eligible": False,
+                        "capture_quality_score": 0.0,
+                        "measurement_reliability_score": 0.0,
+                        "task_completion_status": "not_required",
+                        "hard_gates_triggered": [],
+                        "reasons": [],
+                    },
+                )
+            )
+            write_success = MagicMock(return_value={"scan_result": "updated:scan-1", "wellness_scan": "updated"})
+            stack.enter_context(unittest.mock.patch.object(main, "_write_success", write_success))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_step", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_perf", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_validation_decision", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_validation_lifecycle", side_effect=lambda *args, **kwargs: None))
+            upsert_baseline = stack.enter_context(unittest.mock.patch.object(main.directus, "upsert_employee_baseline", MagicMock()))
+
+            result = main._process_scan_sync("scan-1")
+
+        self.assertEqual(result["status"], main.SCAN_STATUS_COMPLETED)
+        self.assertNotEqual(result["status"], main.SCAN_STATUS_PROCESSING)
+        write_success.assert_called_once()
+        upsert_baseline.assert_not_called()
+
+    def test_process_scan_sync_writeback_failure_without_recovery_attempts_terminal_failed_update(self):
+        with ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_resolve_scan_context",
+                    return_value={
+                        "status": main.SCAN_STATUS_MEDIA_READY,
+                        "scan_media": {},
+                        "resolved_media": {},
+                        "task_metrics": None,
+                        "expected_phrase": None,
+                        "user": None,
+                        "member": None,
+                        "business_profile": None,
+                        "department": None,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_media", return_value=main.Media(image="image.jpg", audio="audio.wav", video="video.mp4")))
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_task", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main, "_identifier_payload", return_value={"user_id": None, "member_id": None, "business_profile_id": None, "department_id": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_baseline_rows_for_member", return_value=[]))
+            stack.enter_context(unittest.mock.patch.object(main, "baseline_status_payload", return_value={"baseline_status": "inactive", "baseline_confidence": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_expected_phrase", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "local_model_required", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_resolve_media_input", side_effect=lambda path, *args, **kwargs: (path, False)))
+            stack.enter_context(unittest.mock.patch.object(main, "_should_convert_audio", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_run_parallel_analysis",
+                    return_value=(
+                        {
+                            "video": {"score": 0.8, "details": {"status": "ok", "visual_quality_score": 0.8, "visual_warnings": []}},
+                            "audio": {"score": 0.8, "details": {"status": "ok", "audio_quality_score": 0.8, "audio_warnings": [], "timings_ms": {}}},
+                            "image": {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": []}},
+                        },
+                        [],
+                    ),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "validate_scan_inputs",
+                    return_value={
+                        "quality_scores": {"phrase_match": 0.9, "audio": 0.8, "video": 0.8, "image": 0.8},
+                        "warnings": [],
+                        "critical_errors": [],
+                        "failure_reason": None,
+                    },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "assess_quality",
+                    return_value={
+                        "warnings": [],
+                        "media_quality": {
+                            "video": {"usable": True, "present": True},
+                            "audio": {"usable": True, "present": True},
+                            "image": {"usable": True, "present": True},
+                        },
+                        "usable_modalities": 3,
+                        "failure_reason": None,
+                        "status": "passed",
+                        "weak": False,
+                        "retake_required": False,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_required_modality_gate", return_value=(None, ["video", "audio", "image"])))
+            stack.enter_context(unittest.mock.patch.object(main, "_face_eye_evidence_unreliable", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_result_has_valid_evidence", return_value=True))
+            stack.enter_context(unittest.mock.patch.object(main, "features_from_signals", return_value=({}, {})))
+            stack.enter_context(unittest.mock.patch.object(main, "vector_from_features", return_value=[0.0] * 21))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "predict", return_value={"score": 0.5}))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "compute_result",
+                    return_value={
+                        "readiness_score": 80,
+                        "confidence": 0.8,
+                        "risk_level": "stable",
+                        "suggested_action": "continue_normal_activity",
+                        "explanation": "ok",
+                        "retake_required": False,
+                        "baseline_used": False,
+                        "fusion_details": {"baseline_flags": {}},
+                        "modality_scores": {},
+                        "face_metrics": {"baseline_drifts": {}},
+                        "voice_metrics": {"baseline_drifts": {}},
+                        "reaction_metrics": {"baseline_drifts": {}},
+                    },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "baseline_ready_for_personalized_scoring",
+                    return_value=False,
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "evaluate_baseline_eligibility",
+                    return_value={
+                        "eligible": False,
+                        "capture_quality_score": 0.0,
+                        "measurement_reliability_score": 0.0,
+                        "task_completion_status": "not_required",
+                        "hard_gates_triggered": [],
+                        "reasons": [],
+                    },
+                )
+            )
+            write_failure = main.ProcessingError(main.FAILURE_REASON_WRITEBACK_FAILED, "RuntimeError")
+            write_success = MagicMock(side_effect=write_failure)
+            stack.enter_context(unittest.mock.patch.object(main, "_write_success", write_success))
+            mark_failed_terminal = MagicMock(return_value={"wellness_scan": "failed_updated"})
+            stack.enter_context(unittest.mock.patch.object(main, "_mark_scan_failed_terminal", mark_failed_terminal))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_step", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_perf", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_validation_decision", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_validation_lifecycle", side_effect=lambda *args, **kwargs: None))
+            upsert_baseline = stack.enter_context(unittest.mock.patch.object(main.directus, "upsert_employee_baseline", MagicMock()))
+
+            result = main._process_scan_sync("scan-1")
+
+        self.assertEqual(result["status"], main.SCAN_STATUS_FAILED)
+        self.assertNotEqual(result["status"], main.SCAN_STATUS_PROCESSING)
+        self.assertEqual(result["writeback_status"]["wellness_scan"], "failed_updated")
+        self.assertEqual(result["writeback_status"]["recovery"], "unavailable")
+        write_success.assert_called_once()
+        mark_failed_terminal.assert_called_once()
+        upsert_baseline.assert_not_called()
+
+    def test_recover_completed_scan_if_result_exists_finalizes_completed_without_duplicate_result_write(self):
+        main.directus.get_scan_result_by_scan_id = MagicMock(return_value={"id": "scan-result-1"})
+        main.directus.update_wellness_scan = MagicMock(return_value={"id": "scan-1"})
+        main.directus.upsert_scan_result = MagicMock()
+
+        recovery = main._recover_completed_scan_if_result_exists("scan-1")
+
+        self.assertTrue(recovery)
+        main.directus.get_scan_result_by_scan_id.assert_called_once_with("scan-1")
+        main.directus.update_wellness_scan.assert_called_once()
+        main.directus.upsert_scan_result.assert_not_called()
+
+    def test_mark_scan_failed_terminal_logs_unconfirmed_failure(self):
+        with unittest.mock.patch.object(main, "_mark_scan_failed", return_value={"wellness_scan": "failed:RuntimeError"}):
+            with self.assertLogs("ai-server", level="ERROR") as logs:
+                status = main._mark_scan_failed_terminal("scan-1", "writeback_failed", "sanitized message")
+
+        self.assertEqual(status["wellness_scan"], "failed:RuntimeError")
+        self.assertIn("terminal_failure_writeback_unconfirmed", "\n".join(logs.output))
+
+    def test_mark_scan_failed_sanitizes_exception_details(self):
+        with unittest.mock.patch.object(main.directus, "update_wellness_scan", side_effect=RuntimeError("token=secret")):
+            with self.assertLogs("ai-server", level="ERROR") as logs:
+                status = main._mark_scan_failed("scan-1", "writeback_failed", "sanitized message")
+
+        self.assertEqual(status["wellness_scan"], "failed:RuntimeError")
+        combined = "\n".join(logs.output)
+        self.assertIn("error_type=RuntimeError", combined)
+        self.assertNotIn("token=secret", combined)
 
 
 

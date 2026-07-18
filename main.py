@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import sys
+from multiprocessing.connection import wait as multiprocessing_wait
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
@@ -740,6 +741,175 @@ def _shutdown_executor(executor: concurrent.futures.ThreadPoolExecutor | None, *
     if executor is None:
         return
     executor.shutdown(wait=wait, cancel_futures=True)
+
+
+def _analysis_worker_entry(
+    result_queue: Any,
+    analyzer_name: str,
+    path: str | None,
+    missing_warning: str,
+) -> None:
+    try:
+        if analyzer_name == "video":
+            from video import analyze_video
+
+            result = _safe_analyze(analyze_video, path, missing_warning)
+        elif analyzer_name == "audio":
+            from audio import analyze_audio
+
+            result = _safe_analyze(analyze_audio, path, missing_warning)
+        elif analyzer_name == "image":
+            from vision import analyze_face
+
+            result = _safe_analyze(analyze_face, path, missing_warning)
+        else:
+            result = {"score": None, "details": {"status": "invalid"}}
+        result_queue.put({"ok": True, "result": result})
+    except Exception as exc:
+        try:
+            result_queue.put({"ok": False, "error": type(exc).__name__})
+        except Exception:
+            pass
+
+
+def _analysis_worker_placeholder(analyzer_name: str) -> dict:
+    return _analysis_timeout_placeholder(analyzer_name)
+
+
+def _finalize_analysis_worker(
+    *,
+    scan_id: str,
+    analyzer_name: str,
+    process: multiprocessing.Process,
+    result_queue: Any,
+    started_at: float,
+    timeout_seconds: float | None,
+    timed_out: bool,
+) -> dict:
+    metric_name = f"{analyzer_name}_validation_ms"
+    elapsed_ms = _elapsed_ms(started_at)
+
+    if timed_out:
+        logger.warning(
+            "%s_analysis_worker_timeout scan_id=%s timeout_seconds=%s",
+            analyzer_name,
+            scan_id,
+            timeout_seconds,
+        )
+        if process.is_alive():
+            process.terminate()
+        process.join(1.0)
+        try:
+            result_queue.close()
+            result_queue.join_thread()
+        except Exception:
+            pass
+        _log_perf(scan_id, metric_name, elapsed_ms)
+        return _analysis_worker_placeholder(analyzer_name)
+
+    payload = None
+    try:
+        payload = result_queue.get(timeout=0.5)
+    except queue_module.Empty:
+        payload = None
+    finally:
+        try:
+            result_queue.close()
+            result_queue.join_thread()
+        except Exception:
+            pass
+        process.join(0.0)
+        try:
+            process.close()
+        except Exception:
+            pass
+
+    _log_perf(scan_id, metric_name, elapsed_ms)
+    if isinstance(payload, dict) and payload.get("ok"):
+        result = payload.get("result")
+        if isinstance(result, dict):
+            return result
+    if isinstance(payload, dict) and payload.get("error"):
+        logger.warning(
+            "analysis_worker_error scan_id=%s analyzer=%s error_type=%s",
+            scan_id,
+            analyzer_name,
+            payload.get("error"),
+        )
+    return _analysis_worker_placeholder(analyzer_name)
+
+
+def _run_parallel_analysis(
+    scan_id: str,
+    media: Media,
+) -> tuple[dict, list[str]]:
+    ctx = multiprocessing.get_context("spawn")
+    analyzer_specs = {
+        "video": (media.video, "video_missing"),
+        "audio": (media.audio, "audio_missing"),
+        "image": (media.image, "image_missing"),
+    }
+    processes: dict[str, tuple[multiprocessing.Process, Any, float]] = {}
+    results: dict[str, dict] = {}
+
+    for analyzer_name, (path, missing_warning) in analyzer_specs.items():
+        result_queue = ctx.Queue(maxsize=1)
+        process = ctx.Process(
+            target=_analysis_worker_entry,
+            args=(result_queue, analyzer_name, path, missing_warning),
+            daemon=True,
+        )
+        process.start()
+        processes[analyzer_name] = (process, result_queue, time.perf_counter())
+
+    deadline = time.perf_counter() + MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS
+    remaining_names = set(processes.keys())
+    sentinel_to_name = {process.sentinel: name for name, (process, _queue, _started) in processes.items()}
+    timed_out_modalities: list[str] = []
+
+    while remaining_names:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            break
+        wait_handles = [processes[name][0].sentinel for name in remaining_names]
+        ready = multiprocessing_wait(wait_handles, timeout=remaining)
+        if not ready:
+            break
+        for handle in ready:
+            analyzer_name = sentinel_to_name.get(handle)
+            if analyzer_name is None or analyzer_name not in remaining_names:
+                continue
+            process, result_queue, started_at = processes[analyzer_name]
+            results[analyzer_name] = _finalize_analysis_worker(
+                scan_id=scan_id,
+                analyzer_name=analyzer_name,
+                process=process,
+                result_queue=result_queue,
+                started_at=started_at,
+                timeout_seconds=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
+                timed_out=False,
+            )
+            remaining_names.discard(analyzer_name)
+
+    for analyzer_name in list(remaining_names):
+        process, result_queue, started_at = processes[analyzer_name]
+        timed_out_modalities.append(analyzer_name)
+        results[analyzer_name] = _finalize_analysis_worker(
+            scan_id=scan_id,
+            analyzer_name=analyzer_name,
+            process=process,
+            result_queue=result_queue,
+            started_at=started_at,
+            timeout_seconds=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
+            timed_out=True,
+        )
+        remaining_names.discard(analyzer_name)
+
+    return {
+        "video": results.get("video") or _analysis_worker_placeholder("video"),
+        "audio": results.get("audio") or _analysis_worker_placeholder("audio"),
+        "image": results.get("image") or _analysis_worker_placeholder("image"),
+    }, timed_out_modalities
 
 
 def _has_meaningful_evidence(value: Any) -> bool:
@@ -1628,8 +1798,20 @@ def _mark_scan_failed(scan_id: str, reason: str, message: str | None = None) -> 
         _log_step(scan_id, "directus_writeback_done", writeback_status={"wellness_scan": "failed_updated"})
         return {"wellness_scan": "failed_updated"}
     except Exception as exc:
-        logger.exception("scan_id=%s step=directus_mark_failed_error error=%s", scan_id, exc)
-        return {"wellness_scan": f"failed:{exc}"}
+        logger.error("scan_id=%s step=directus_mark_failed_error error_type=%s", scan_id, type(exc).__name__)
+        return {"wellness_scan": f"failed:{type(exc).__name__}"}
+
+
+def _mark_scan_failed_terminal(scan_id: str, reason: str, message: str | None = None) -> dict[str, str]:
+    writeback_status = _mark_scan_failed(scan_id, reason, message)
+    if writeback_status.get("wellness_scan") != "failed_updated":
+        logger.error(
+            "scan_id=%s terminal_failure_writeback_unconfirmed reason=%s writeback_status=%s",
+            scan_id,
+            reason,
+            writeback_status,
+        )
+    return writeback_status
 
 
 def _quality_failure_response(scan_id: str, quality_result: dict, diagnostics: dict, writeback_status: dict) -> dict:
@@ -1978,8 +2160,8 @@ def _write_success(
         )
         status["scan_result"] = f"{write_mode}:{_relation_id(scan_result.get('id')) or 'ok'}"
     except Exception as exc:
-        logger.exception("scan_result_write_failed scan_id=%s error=%s", scan_id, exc)
-        raise ProcessingError(FAILURE_REASON_WRITEBACK_FAILED, str(exc)) from exc
+        logger.error("scan_result_write_failed scan_id=%s error_type=%s", scan_id, type(exc).__name__)
+        raise ProcessingError(FAILURE_REASON_WRITEBACK_FAILED, type(exc).__name__) from exc
 
     try:
         completed_payload = _completed_scan_update_payload()
@@ -1992,8 +2174,8 @@ def _write_success(
         )
         status["wellness_scan"] = "updated"
     except Exception as exc:
-        logger.exception("wellness_scan_update_failed scan_id=%s error=%s", scan_id, exc)
-        raise ProcessingError(FAILURE_REASON_WRITEBACK_FAILED, str(exc)) from exc
+        logger.error("wellness_scan_update_failed scan_id=%s error_type=%s", scan_id, type(exc).__name__)
+        raise ProcessingError(FAILURE_REASON_WRITEBACK_FAILED, type(exc).__name__) from exc
 
     member_id = identifiers.get("member_id")
     if member_id:
@@ -2156,7 +2338,12 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"])
         _log_step(scan_id, "directus_writeback_start")
         writeback_started = time.perf_counter()
-        _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+        terminal_writeback_status = _mark_scan_failed_terminal(
+            scan_id,
+            validation_result["failure_reason"],
+            validation_result["failure_message"],
+        )
+        validation_result["writeback_status"] = terminal_writeback_status
         _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
         _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
         return {"status": SCAN_STATUS_FAILED, **validation_result}
@@ -2178,7 +2365,6 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
 
     temp_files: list[str] = []
     download_executor: concurrent.futures.ThreadPoolExecutor | None = None
-    analysis_executor: concurrent.futures.ThreadPoolExecutor | None = None
     transcript: str | None = None
     phrase_score: float | None = None
     phrase_status = "not_required"
@@ -2246,81 +2432,17 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         _log_step(scan_id, "video_validation_start")
         media_validation_started = time.perf_counter()
         stage_started = media_validation_started
-        analysis_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="media-analysis")
-        analysis_futures = {
-            "video": analysis_executor.submit(
-                _timed_safe_analyze,
-                scan_id,
-                "video_validation_ms",
-                _analyze_video_file,
-                resolved_media.video,
-                "video_missing",
-            ),
-            "image": analysis_executor.submit(
-                _timed_safe_analyze,
-                scan_id,
-                "image_validation_ms",
-                _analyze_face_image,
-                resolved_media.image,
-                "image_missing",
-            )
-            if resolved_media.image
-            else None,
-            "audio": analysis_executor.submit(
-                _timed_safe_analyze,
-                scan_id,
-                "audio_validation_ms",
-                _analyze_audio_file,
-                resolved_media.audio,
-                "audio_missing",
-            ),
-        }
-        done, not_done = concurrent.futures.wait(
-            [future for future in analysis_futures.values() if future is not None],
-            timeout=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
-            return_when=concurrent.futures.ALL_COMPLETED,
+        analysis_results, timed_out_modalities = _run_parallel_analysis(
+            scan_id,
+            resolved_media,
         )
-        if not_done:
-            wall_elapsed_ms = _elapsed_ms(media_validation_started)
-            logger.warning(
-                "media_analysis_timeout scan_id=%s timeout_seconds=%s pending=%s",
-                scan_id,
-                MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
-                len(not_done),
-            )
-            analysis_paths = {
-                "video": resolved_media.video,
-                "image": resolved_media.image,
-                "audio": resolved_media.audio,
-            }
-            for name, future in analysis_futures.items():
-                if future is not None and future in not_done:
-                    _log_perf(scan_id, f"{name}_validation_ms", wall_elapsed_ms)
-                    _defer_temp_file_cleanup(
-                        future,
-                        analysis_paths.get(name),
-                        temp_files,
-                    )
-        try:
-            video_result = analysis_futures["video"].result() if analysis_futures["video"] in done else _analysis_timeout_placeholder("video")
-        except Exception as exc:
-            logger.warning("video_analysis_failed scan_id=%s error=%s", scan_id, exc)
-            video_result = _analysis_timeout_placeholder("video")
+        video_result = analysis_results["video"]
         _log_step(scan_id, "video_validation_done", quality_score=((video_result.get("details") or {}).get("visual_quality_score")))
 
         _log_step(scan_id, "face_validation_start")
         stage_started = time.perf_counter()
         video_details = (video_result.get("details") or {})
-        if analysis_futures.get("image") and analysis_futures["image"] in done:
-            try:
-                image_result = analysis_futures["image"].result()
-            except Exception as exc:
-                logger.warning("image_analysis_failed scan_id=%s error=%s", scan_id, exc)
-                image_result = _analysis_timeout_placeholder("image")
-        elif analysis_futures.get("image"):
-            image_result = _analysis_timeout_placeholder("image")
-        else:
-            image_result = None
+        image_result = analysis_results.get("image")
         _log_step(
             scan_id,
             "face_validation_done",
@@ -2330,13 +2452,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
 
         _log_step(scan_id, "audio_validation_start")
         stage_started = time.perf_counter()
-        audio_future = analysis_futures["audio"]
-        audio_future_done = audio_future in done if audio_future is not None else False
-        try:
-            audio_result = audio_future.result() if audio_future_done else _analysis_timeout_placeholder("audio")
-        except Exception as exc:
-            logger.warning("audio_analysis_failed scan_id=%s error=%s", scan_id, exc)
-            audio_result = _analysis_timeout_placeholder("audio")
+        audio_result = analysis_results["audio"]
         audio_timings = ((audio_result.get("details") or {}).get("timings_ms") or {}) if isinstance(audio_result, dict) else {}
         _log_perf(scan_id, "audio_decode_ms", audio_timings.get("audio_decode_ms"))
         _log_perf(scan_id, "audio_quality_ms", audio_timings.get("audio_quality_ms"))
@@ -2350,23 +2466,14 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         )
         if audio_remaining_ms:
             logger.info("[PERF] audio_validation_overhead_ms scan_id=%s value=%s", scan_id, audio_remaining_ms)
-        if audio_future_done:
-            _log_step(scan_id, "audio_validation_done", quality_score=((audio_result.get("details") or {}).get("audio_quality_score")))
-        else:
+        if "audio" in timed_out_modalities:
             _log_step(scan_id, "audio_validation_timeout", quality_score=((audio_result.get("details") or {}).get("audio_quality_score")))
+        else:
+            _log_step(scan_id, "audio_validation_done", quality_score=((audio_result.get("details") or {}).get("audio_quality_score")))
         _log_perf(scan_id, "media_validation_wall_ms", _elapsed_ms(media_validation_started))
-        _shutdown_executor(
-            analysis_executor,
-            wait=not bool(not_done),
-        )
-        analysis_executor = None
-
         _log_step(scan_id, "phrase_validation_start")
         stage_started = time.perf_counter()
-        audio_analysis_timed_out = (
-            analysis_futures.get("audio") is not None
-            and analysis_futures["audio"] in not_done
-        )
+        audio_analysis_timed_out = "audio" in timed_out_modalities
         if expected_phrase and audio_analysis_timed_out:
             phrase_status = "audio_timeout"
         elif expected_phrase and resolved_media.audio:
@@ -2432,11 +2539,6 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             for modality in ["video", "audio", "image"]
             if (quality_result.get("media_quality") or {}).get(modality, {}).get("usable")
         ]
-        timed_out_modalities = [
-            modality
-            for modality, future in analysis_futures.items()
-            if future is not None and future in not_done
-        ]
         running_modalities = list(timed_out_modalities)
         all_workers_terminal = not running_modalities
         terminal_failure_reason, _required_modalities = _required_modality_gate(
@@ -2470,9 +2572,8 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=phrase_validation["quality_scores"])
             _log_step(scan_id, "directus_writeback_start")
             writeback_started = time.perf_counter()
-            _shutdown_executor(analysis_executor, wait=True)
-            analysis_executor = None
-            _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            terminal_writeback_status = _mark_scan_failed_terminal(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            validation_result["writeback_status"] = terminal_writeback_status
             _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
             _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
             return {"status": SCAN_STATUS_FAILED, **validation_result}
@@ -2483,9 +2584,8 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=phrase_validation["quality_scores"])
             _log_step(scan_id, "directus_writeback_start")
             writeback_started = time.perf_counter()
-            _shutdown_executor(analysis_executor, wait=True)
-            analysis_executor = None
-            _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            terminal_writeback_status = _mark_scan_failed_terminal(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            validation_result["writeback_status"] = terminal_writeback_status
             _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
             _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
             return {"status": SCAN_STATUS_FAILED, **validation_result}
@@ -2586,9 +2686,8 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=phrase_validation["quality_scores"])
             _log_step(scan_id, "directus_writeback_start")
             writeback_started = time.perf_counter()
-            _shutdown_executor(analysis_executor, wait=True)
-            analysis_executor = None
-            _mark_scan_failed(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            terminal_writeback_status = _mark_scan_failed_terminal(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            validation_result["writeback_status"] = terminal_writeback_status
             _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
             _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
             return {"status": SCAN_STATUS_FAILED, **validation_result}
@@ -2701,27 +2800,22 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
                         "wellness_scan": "recovered",
                     },
                 }
+            terminal_writeback_status = _mark_scan_failed_terminal(
+                scan_id,
+                validation_result["failure_reason"],
+                validation_result["failure_message"],
+            )
+            validation_result["writeback_status"] = terminal_writeback_status
             if recovery is None:
-                _log_perf(
-                    scan_id,
-                    "directus_writeback_ms",
-                    _elapsed_ms(writeback_started),
-                )
-                _log_perf(
-                    scan_id,
-                    "total_process_ms",
-                    _elapsed_ms(total_started),
-                )
-                return {
-                    "status": SCAN_STATUS_PROCESSING,
-                    **validation_result,
-                }
+                validation_result["writeback_status"]["recovery"] = "unavailable"
 
-        _mark_scan_failed(
-            scan_id,
-            validation_result["failure_reason"],
-            validation_result["failure_message"],
-        )
+        else:
+            terminal_writeback_status = _mark_scan_failed_terminal(
+                scan_id,
+                validation_result["failure_reason"],
+                validation_result["failure_message"],
+            )
+            validation_result["writeback_status"] = terminal_writeback_status
         _log_perf(
             scan_id,
             "directus_writeback_ms",
@@ -2732,8 +2826,6 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     finally:
         if download_executor is not None:
             download_executor.shutdown(wait=False, cancel_futures=True)
-        if analysis_executor is not None:
-            analysis_executor.shutdown(wait=False, cancel_futures=True)
         for path in temp_files:
             remove_temp_file(path)
 
@@ -2752,13 +2844,9 @@ def process_scan_background(scan_id: str) -> None:
             failure_reason=result.get("failure_reason"),
         )
     except Exception as exc:
-        logger.exception(
-            "background_process_error scan_id=%s error_type=%s",
-            scan_id,
-            type(exc).__name__,
-        )
+        logger.error("background_process_error scan_id=%s error_type=%s", scan_id, type(exc).__name__)
         _log_step(scan_id, "directus_writeback_start")
-        _mark_scan_failed(
+        _mark_scan_failed_terminal(
             scan_id,
             FAILURE_REASON_ANALYSIS_EXCEPTION,
             failure_message(FAILURE_REASON_ANALYSIS_EXCEPTION),
