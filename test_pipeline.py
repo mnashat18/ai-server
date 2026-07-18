@@ -124,6 +124,148 @@ class _FakeContext:
         return process
 
 
+class _ProbeRLock:
+    def __init__(self):
+        self._lock = __import__("threading").RLock()
+        self._owner = None
+        self._depth = 0
+        self._guard = __import__("threading").Lock()
+
+    def acquire(self, blocking=True, timeout=-1):
+        if timeout is None:
+            acquired = self._lock.acquire(blocking)
+        elif timeout < 0:
+            acquired = self._lock.acquire(blocking)
+        else:
+            acquired = self._lock.acquire(blocking, timeout)
+        if acquired:
+            with self._guard:
+                self._owner = __import__("threading").get_ident()
+                self._depth += 1
+        return acquired
+
+    def release(self):
+        with self._guard:
+            self._depth -= 1
+            if self._depth <= 0:
+                self._owner = None
+                self._depth = 0
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+
+    def locked_any(self):
+        with self._guard:
+            return self._depth > 0
+
+    def locked_by_current(self):
+        with self._guard:
+            return self._owner == __import__("threading").get_ident() and self._depth > 0
+
+
+class _DelayedReadyEndpoint:
+    def __init__(self, ready_event, generation, violations, probe):
+        self.ready_event = ready_event
+        self.generation = generation
+        self.violations = violations
+        self.probe = probe
+        self.closed = False
+
+    def send(self, payload):
+        return None
+
+    def poll(self, timeout=None):
+        if self.probe.locked_by_current():
+            self.violations.append("poll_locked")
+        return self.ready_event.is_set() and not self.closed
+
+    def recv(self):
+        if self.probe.locked_by_current():
+            self.violations.append("recv_locked")
+        generation = self.generation() if callable(self.generation) else self.generation
+        return {
+            "type": "ready",
+            "ok": True,
+            "worker_generation": generation,
+            "metrics": {
+                "child_entry_ms": 1,
+                "analyzer_import_ms": 15000,
+                "total_worker_ms": 15000,
+            },
+        }
+
+    def close(self):
+        self.closed = True
+
+
+class _LockCheckingProcess:
+    def __init__(self, violations, probe):
+        self.violations = violations
+        self.probe = probe
+        self.started = False
+        self.terminated = False
+        self.killed = False
+        self.closed = False
+        self.exitcode = None
+        self._alive = False
+        self.sentinel = self
+
+    def start(self):
+        if self.probe.locked_by_current():
+            self.violations.append("start_locked")
+        self.started = True
+        self._alive = True
+
+    def is_alive(self):
+        return self._alive
+
+    def terminate(self):
+        if self.probe.locked_by_current():
+            self.violations.append("terminate_locked")
+        self.terminated = True
+        self._alive = False
+        self.exitcode = -15
+
+    def kill(self):
+        if self.probe.locked_by_current():
+            self.violations.append("kill_locked")
+        self.killed = True
+        self._alive = False
+        self.exitcode = -9
+
+    def join(self, timeout=None):
+        if self.probe.locked_by_current():
+            self.violations.append("join_locked")
+
+    def close(self):
+        self.closed = True
+
+
+class _DelayedReadyContext:
+    def __init__(self, ready_event, violations, probe):
+        self.ready_event = ready_event
+        self.violations = violations
+        self.probe = probe
+        self.processes = []
+        self.generation = None
+
+    def Pipe(self, duplex=False):
+        parent = _DelayedReadyEndpoint(self.ready_event, lambda: self.generation, self.violations, self.probe)
+        child = _DelayedReadyEndpoint(self.ready_event, lambda: self.generation, self.violations, self.probe)
+        return parent, child
+
+    def Process(self, target, args, daemon):
+        self.generation = args[2]
+        process = _LockCheckingProcess(self.violations, self.probe)
+        self.processes.append(process)
+        return process
+
+
 class _FakeRuntime:
     def __init__(self, run_scan_result=None, ready=True):
         self.run_scan_result = run_scan_result or (
@@ -188,6 +330,8 @@ class _SubmitOnlySupervisor:
         return self._future
 
     def finalize_timed_out_job(self, job_id):
+        if not self._future.done():
+            self._future.set_result(self._completion)
         return self._completion
 
     def forget_job(self, job_id):
@@ -2434,10 +2578,9 @@ class PipelineTests(unittest.TestCase):
                 self.assertTrue(fake_context.processes[0].started)
                 supervisor.shutdown()
 
-    def test_worker_supervisor_timeout_restarts_generation(self):
+    def test_worker_supervisor_timeout_schedules_async_generation_restart(self):
         fake_context = _FakeContext(behaviors=[
-            {"alive_after_target": True, "requires_kill": True},
-            {"alive_after_target": True},
+            {"alive_after_start": True, "alive_after_target": True, "requires_kill": True},
         ])
 
         def ready_worker(result_conn, analyzer_name, generation):
@@ -2463,6 +2606,17 @@ class PipelineTests(unittest.TestCase):
                 supervisor = analysis_runtime.WorkerSupervisor("image", worker_entry=ready_worker)
                 supervisor.start()
                 supervisor._parent_conn._on_send = lambda payload, state: _FakePipeEndpoint.NO_RESPONSE if isinstance(payload, dict) and payload.get("type") == "job" else payload
+                restart_release = __import__("threading").Event()
+
+                def simulated_restart(expected_generation, scheduled_at):
+                    restart_release.wait(timeout=0.2)
+                    with supervisor._lock:
+                        supervisor._generation = expected_generation + 1
+                        supervisor._restart_in_progress = False
+                        supervisor._restart_ready = True
+                        supervisor._restart_error_type = None
+
+                supervisor._restart_worker_async = simulated_restart
 
                 job = analysis_runtime._WorkerJob(
                     job_id="job-timeout",
@@ -2480,9 +2634,257 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(completion["state"]["terminated"])
         self.assertTrue(completion["state"]["killed"])
         self.assertTrue(completion["state"]["worker_restarted"])
+        self.assertTrue(completion["state"]["worker_restart_scheduled"])
+        self.assertTrue(completion["state"]["worker_restart_in_progress"])
+        restart_release.set()
+        deadline = time.perf_counter() + 1.0
+        while time.perf_counter() < deadline and supervisor._generation < 2:
+            time.sleep(0.01)
         self.assertEqual(supervisor._generation, 2)
-        self.assertEqual(len(fake_context.processes), 2)
+        self.assertEqual(len(fake_context.processes), 1)
         supervisor.shutdown()
+
+    def test_active_timeout_does_not_wait_for_replacement_ready(self):
+        shared_state = {}
+        fake_parent_conn = _FakePipeEndpoint(
+            shared_state,
+            on_send=lambda payload, state: _FakePipeEndpoint.NO_RESPONSE,
+        )
+        fake_process = _FakeProcess(
+            target=None,
+            args=(),
+            daemon=True,
+            behavior={"alive_after_start": True, "requires_kill": True},
+        )
+        supervisor = analysis_runtime.WorkerSupervisor("audio", recovery_timeout_seconds=0.01)
+        supervisor._started = True
+        supervisor._stopped = False
+        supervisor._ready = True
+        supervisor._generation = 4
+        supervisor._process = fake_process
+        supervisor._parent_conn = fake_parent_conn
+        supervisor._child_conn = object()
+        supervisor._jobs_by_id = {}
+        supervisor._completed_jobs = analysis_runtime.OrderedDict()
+        supervisor._expired_jobs = analysis_runtime.OrderedDict()
+
+        restart_started = []
+        restart_release = __import__("threading").Event()
+
+        def delayed_restart(expected_generation, scheduled_at):
+            restart_started.append((expected_generation, scheduled_at))
+            restart_release.wait(timeout=0.3)
+            with supervisor._lock:
+                supervisor._restart_in_progress = False
+                supervisor._restart_ready = True
+                supervisor._generation = expected_generation + 1
+
+        supervisor._restart_worker_async = delayed_restart
+        job = analysis_runtime._WorkerJob(
+            job_id="job-timeout",
+            scan_id="scan-timeout",
+            path="audio.wav",
+            deadline_at=time.perf_counter() + 0.01,
+            submitted_at=time.perf_counter() - 0.05,
+            future=analysis_runtime.Future(),
+        )
+
+        with unittest.mock.patch.object(
+            analysis_runtime,
+            "_wait_handles",
+            side_effect=lambda handles, timeout=None: [],
+        ):
+            started = time.perf_counter()
+            completion = supervisor._dispatch_job(job)
+            elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 0.15)
+        self.assertTrue(completion["state"]["timed_out"])
+        self.assertFalse(completion["state"]["analyzer_error"])
+        self.assertFalse(completion["state"]["final_alive"])
+        self.assertTrue(completion["state"]["terminated"])
+        self.assertTrue(completion["state"]["killed"])
+        self.assertTrue(completion["state"]["worker_restart_scheduled"])
+        self.assertTrue(completion["state"]["worker_restart_in_progress"])
+        self.assertFalse(completion["state"]["worker_restart_ready"])
+        self.assertEqual(restart_started[0][0], 4)
+        restart_release.set()
+        supervisor.shutdown()
+
+    def test_replacement_ready_wait_does_not_block_jobs_health_or_shutdown(self):
+        ready_event = __import__("threading").Event()
+        violations = []
+        probe = _ProbeRLock()
+        fake_context = _DelayedReadyContext(ready_event, violations, probe)
+        supervisor = analysis_runtime.WorkerSupervisor(
+            "audio",
+            startup_timeout_seconds=0.5,
+            recovery_timeout_seconds=0.02,
+            poll_interval_seconds=0.005,
+            context_factory=lambda: fake_context,
+        )
+        supervisor._lock = probe
+        supervisor._started = True
+        supervisor._generation = 7
+
+        def fake_wait(handles, timeout=None):
+            deadline = time.perf_counter() + min(float(timeout or 0.01), 0.02)
+            while time.perf_counter() < deadline:
+                ready = []
+                for handle in handles:
+                    if hasattr(handle, "poll") and handle.poll():
+                        ready.append(handle)
+                    elif isinstance(handle, _LockCheckingProcess) and not handle.is_alive():
+                        ready.append(handle)
+                if ready:
+                    return ready
+                time.sleep(0.001)
+            return []
+
+        with unittest.mock.patch.object(analysis_runtime, "_wait_handles", side_effect=fake_wait):
+            with supervisor._lock:
+                self.assertTrue(supervisor._schedule_restart_locked(7))
+                restart_thread = supervisor._restart_thread
+                self.assertFalse(supervisor._schedule_restart_locked(7))
+            supervisor._start_restart_thread(restart_thread)
+            deadline = time.perf_counter() + 0.2
+            while time.perf_counter() < deadline and not fake_context.processes:
+                time.sleep(0.005)
+            self.assertTrue(fake_context.processes)
+
+            job = analysis_runtime._WorkerJob(
+                job_id="job-during-restart",
+                scan_id="scan-during-restart",
+                path="audio.wav",
+                deadline_at=time.perf_counter() + 0.03,
+                submitted_at=time.perf_counter(),
+                future=analysis_runtime.Future(),
+            )
+            started = time.perf_counter()
+            completion = supervisor._dispatch_job(job)
+            job_elapsed = time.perf_counter() - started
+
+            queued = analysis_runtime._WorkerJob(
+                job_id="queued-expired",
+                scan_id="scan-queued",
+                path="audio.wav",
+                deadline_at=time.perf_counter() - 0.01,
+                submitted_at=time.perf_counter(),
+                future=analysis_runtime.Future(),
+            )
+            supervisor._jobs_by_id[queued.job_id] = queued
+            finalize_started = time.perf_counter()
+            queued_completion = supervisor.finalize_timed_out_job(queued.job_id)
+            finalize_elapsed = time.perf_counter() - finalize_started
+
+            health_started = time.perf_counter()
+            health = supervisor.health()
+            health_elapsed = time.perf_counter() - health_started
+
+            shutdown_started = time.perf_counter()
+            supervisor.shutdown()
+            shutdown_elapsed = time.perf_counter() - shutdown_started
+
+        self.assertLess(job_elapsed, 0.12)
+        self.assertTrue(completion["state"]["timed_out"])
+        self.assertFalse(completion["state"]["analyzer_error"])
+        self.assertLess(finalize_elapsed, 0.08)
+        self.assertTrue(queued_completion["state"]["timed_out"])
+        self.assertLess(health_elapsed, 0.05)
+        self.assertFalse(health["ready"])
+        self.assertLess(shutdown_elapsed, 0.2)
+        self.assertFalse(restart_thread.is_alive())
+        self.assertFalse(fake_context.processes[0].is_alive())
+        self.assertTrue(fake_context.processes[0].terminated)
+        self.assertTrue(fake_context.processes[0].closed)
+        self.assertIsNone(supervisor._process)
+        self.assertEqual(supervisor._generation, 7)
+        self.assertEqual(violations, [])
+
+    def test_replacement_candidate_publish_is_atomic_and_stale_token_is_rejected(self):
+        def fake_wait(handles, timeout=None):
+            ready = []
+            for handle in handles:
+                if hasattr(handle, "poll") and handle.poll():
+                    ready.append(handle)
+                elif isinstance(handle, _LockCheckingProcess) and not handle.is_alive():
+                    ready.append(handle)
+            if ready:
+                return ready
+            time.sleep(min(float(timeout or 0.01), 0.01))
+            return []
+
+        ready_event = __import__("threading").Event()
+        violations = []
+        probe = _ProbeRLock()
+        fake_context = _DelayedReadyContext(ready_event, violations, probe)
+        supervisor = analysis_runtime.WorkerSupervisor(
+            "audio",
+            startup_timeout_seconds=0.5,
+            recovery_timeout_seconds=0.02,
+            poll_interval_seconds=0.005,
+            context_factory=lambda: fake_context,
+        )
+        supervisor._lock = probe
+        supervisor._started = True
+        supervisor._generation = 2
+
+        with unittest.mock.patch.object(analysis_runtime, "_wait_handles", side_effect=fake_wait):
+            with supervisor._lock:
+                self.assertTrue(supervisor._schedule_restart_locked(2))
+                restart_thread = supervisor._restart_thread
+            supervisor._start_restart_thread(restart_thread)
+            deadline = time.perf_counter() + 0.2
+            while time.perf_counter() < deadline and not fake_context.processes:
+                time.sleep(0.005)
+            ready_event.set()
+            restart_thread.join(timeout=1.0)
+
+        self.assertFalse(restart_thread.is_alive())
+        self.assertTrue(supervisor.health()["ready"])
+        self.assertEqual(supervisor._generation, 3)
+        self.assertIs(supervisor._process, fake_context.processes[0])
+        self.assertIsNone(supervisor._restart_candidate_process)
+        self.assertEqual(violations, [])
+        supervisor.shutdown()
+
+        stale_ready = __import__("threading").Event()
+        stale_violations = []
+        stale_probe = _ProbeRLock()
+        stale_context = _DelayedReadyContext(stale_ready, stale_violations, stale_probe)
+        stale_supervisor = analysis_runtime.WorkerSupervisor(
+            "audio",
+            startup_timeout_seconds=0.5,
+            recovery_timeout_seconds=0.02,
+            poll_interval_seconds=0.005,
+            context_factory=lambda: stale_context,
+        )
+        stale_supervisor._lock = stale_probe
+        stale_supervisor._started = True
+        stale_supervisor._generation = 5
+
+        with unittest.mock.patch.object(analysis_runtime, "_wait_handles", side_effect=fake_wait):
+            with stale_supervisor._lock:
+                self.assertTrue(stale_supervisor._schedule_restart_locked(5))
+                stale_thread = stale_supervisor._restart_thread
+            stale_supervisor._start_restart_thread(stale_thread)
+            deadline = time.perf_counter() + 0.2
+            while time.perf_counter() < deadline and not stale_context.processes:
+                time.sleep(0.005)
+            with stale_supervisor._lock:
+                stale_supervisor._restart_token += 1
+                stale_supervisor._active_restart_token = stale_supervisor._restart_token
+            stale_ready.set()
+            stale_thread.join(timeout=1.0)
+
+        self.assertFalse(stale_thread.is_alive())
+        self.assertFalse(stale_supervisor.health()["ready"])
+        self.assertEqual(stale_supervisor._generation, 5)
+        self.assertIsNone(stale_supervisor._process)
+        self.assertFalse(stale_context.processes[0].is_alive())
+        self.assertTrue(stale_context.processes[0].terminated)
+        self.assertEqual(stale_violations, [])
+        stale_supervisor.shutdown()
 
     def test_persistent_runtime_spawn_smoke_reuses_same_worker(self):
         runtime = analysis_runtime.WarmAnalyzerRuntime(worker_entry_map={

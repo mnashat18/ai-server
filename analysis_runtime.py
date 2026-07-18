@@ -253,6 +253,16 @@ class WorkerSupervisor:
         self._completed_job_limit = 2048
         self._expired_job_limit = 2048
         self._job_retention_seconds = 300.0
+        self._restart_thread: threading.Thread | None = None
+        self._restart_generation: int | None = None
+        self._restart_started_at: float | None = None
+        self._restart_in_progress = False
+        self._restart_ready = False
+        self._restart_error_type: str | None = None
+        self._restart_token = 0
+        self._active_restart_token: int | None = None
+        self._restart_candidate_process = None
+        self._restart_candidate_parent_conn = None
 
     def _prune_job_registries_locked(self) -> None:
         while len(self._completed_jobs) > self._completed_job_limit:
@@ -279,10 +289,9 @@ class WorkerSupervisor:
             "alive": alive,
         }
 
-    def _spawn_worker_locked(self) -> dict[str, Any]:
+    def _spawn_worker_candidate(self, generation: int, *, restart_token: int | None = None) -> tuple[Any, Any, Any, dict[str, Any]]:
         ctx = self._context_factory()
         parent_conn, child_conn = ctx.Pipe(duplex=True)
-        generation = self._generation + 1
         process_started_at = time.perf_counter()
         process = ctx.Process(
             target=self._worker_entry,
@@ -291,10 +300,22 @@ class WorkerSupervisor:
         )
         process.start()
         process_start_return_ms = _elapsed_ms(process_started_at)
+        ready_wait_started_at = time.perf_counter()
         try:
             child_conn.close()
         except Exception:
             pass
+        if restart_token is not None:
+            with self._lock:
+                if self._stop_event.is_set() or self._active_restart_token != restart_token:
+                    process_state = None
+                else:
+                    self._restart_candidate_process = process
+                    self._restart_candidate_parent_conn = parent_conn
+                    process_state = True
+            if process_state is None:
+                self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
+                raise AnalysisRuntimeStartupError(f"{self.analyzer_name}_worker_start_stale")
 
         ready_deadline = time.perf_counter() + self._startup_timeout_seconds
         ready_payload: dict[str, Any] | None = None
@@ -327,22 +348,36 @@ class WorkerSupervisor:
             )
             raise AnalysisRuntimeStartupError(f"{self.analyzer_name}_worker_start_failed")
 
+        ready_metrics = ready_payload.get("metrics") if isinstance(ready_payload.get("metrics"), dict) else {}
+        spawn_metrics = {
+            "process_start_return_ms": process_start_return_ms,
+            "analyzer_import_ms": ready_metrics.get("analyzer_import_ms"),
+            "child_entry_ms": ready_metrics.get("child_entry_ms"),
+            "total_worker_ms": ready_metrics.get("total_worker_ms"),
+            "ready_wait_ms": _elapsed_ms(ready_wait_started_at),
+        }
+        return process, parent_conn, child_conn, spawn_metrics
+
+    def _publish_spawned_worker_locked(self, generation: int, process: Any, parent_conn: Any, child_conn: Any, spawn_metrics: dict[str, Any]) -> None:
         self._generation = generation
         self._process = process
         self._parent_conn = parent_conn
         self._child_conn = child_conn
         self._ready = True
+        self._last_spawn_metrics = spawn_metrics
 
-        ready_metrics = ready_payload.get("metrics") if isinstance(ready_payload.get("metrics"), dict) else {}
-        self._last_spawn_metrics = {
-            "process_start_return_ms": process_start_return_ms,
-            "analyzer_import_ms": ready_metrics.get("analyzer_import_ms"),
-            "child_entry_ms": ready_metrics.get("child_entry_ms"),
-            "total_worker_ms": ready_metrics.get("total_worker_ms"),
-        }
+    def _spawn_worker_locked(self) -> dict[str, Any]:
+        generation = self._generation + 1
+        process, parent_conn, child_conn, spawn_metrics = self._spawn_worker_candidate(generation)
+        self._publish_spawned_worker_locked(generation, process, parent_conn, child_conn, spawn_metrics)
         return self._last_spawn_metrics
 
     def _cleanup_process_locked(self, process: Any, parent_conn: Any, *, timeout_seconds: float) -> dict[str, Any]:
+        cleanup_started_at = time.perf_counter()
+        terminate_ms = 0
+        join_ms = 0
+        kill_ms = 0
+        final_join_ms = 0
         state = {
             "terminated": False,
             "killed": False,
@@ -352,21 +387,34 @@ class WorkerSupervisor:
         }
         try:
             if getattr(process, "is_alive", lambda: False)():
+                terminate_started_at = time.perf_counter()
                 process.terminate()
+                terminate_ms = _elapsed_ms(terminate_started_at)
                 state["terminated"] = True
+                join_started_at = time.perf_counter()
                 process.join(timeout_seconds)
+                join_ms = _elapsed_ms(join_started_at)
         except Exception:
             pass
         try:
             if getattr(process, "is_alive", lambda: False)():
+                kill_started_at = time.perf_counter()
                 process.kill()
+                kill_ms = _elapsed_ms(kill_started_at)
                 state["killed"] = True
+                final_join_started_at = time.perf_counter()
                 process.join(timeout_seconds)
+                final_join_ms = _elapsed_ms(final_join_started_at)
         except Exception:
             pass
         state["alive"] = bool(getattr(process, "is_alive", lambda: False)())
         state["process_exited"] = not state["alive"]
         state["process_exitcode"] = getattr(process, "exitcode", None)
+        state["old_worker_cleanup_ms"] = _elapsed_ms(cleanup_started_at)
+        state["old_worker_terminate_ms"] = terminate_ms
+        state["old_worker_join_ms"] = join_ms
+        state["old_worker_kill_ms"] = kill_ms
+        state["old_worker_final_join_ms"] = final_join_ms
         try:
             parent_conn.close()
         except Exception:
@@ -389,6 +437,137 @@ class WorkerSupervisor:
             return {"terminated": False, "killed": False, "process_exitcode": None, "alive": False, "process_exited": True}
         return self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
 
+    def _restart_worker_async(self, expected_generation: int, scheduled_at: float) -> None:
+        schedule_ms = _elapsed_ms(scheduled_at)
+        restart_token: int | None
+        with self._lock:
+            restart_token = self._active_restart_token
+            if (
+                self._stop_event.is_set()
+                or restart_token is None
+                or self._restart_generation != expected_generation
+                or self._generation != expected_generation
+                or self._process is not None
+            ):
+                self._restart_in_progress = False
+                self._restart_ready = self._ready
+                return
+        candidate_process = None
+        candidate_parent_conn = None
+        try:
+            next_generation = expected_generation + 1
+            candidate_process, candidate_parent_conn, candidate_child_conn, spawn_metrics = self._spawn_worker_candidate(
+                next_generation,
+                restart_token=restart_token,
+            )
+            publish_candidate = False
+            with self._lock:
+                if (
+                    not self._stop_event.is_set()
+                    and self._active_restart_token == restart_token
+                    and self._restart_generation == expected_generation
+                    and self._generation == expected_generation
+                    and self._process is None
+                ):
+                    self._publish_spawned_worker_locked(
+                        next_generation,
+                        candidate_process,
+                        candidate_parent_conn,
+                        candidate_child_conn,
+                        spawn_metrics,
+                    )
+                    self._restart_candidate_process = None
+                    self._restart_candidate_parent_conn = None
+                    publish_candidate = True
+                    self._restart_ready = True
+                    self._restart_error_type = None
+                    restart_generation = self._generation
+                else:
+                    self._restart_candidate_process = None
+                    self._restart_candidate_parent_conn = None
+                    self._restart_ready = self._ready
+                    restart_generation = self._generation
+            if not publish_candidate:
+                self._cleanup_process_locked(candidate_process, candidate_parent_conn, timeout_seconds=self._recovery_timeout_seconds)
+                candidate_process = None
+                candidate_parent_conn = None
+                return
+            _log_perf("runtime", f"{self.analyzer_name}_replacement_worker_schedule_ms", schedule_ms)
+            _log_perf("runtime", f"{self.analyzer_name}_replacement_worker_spawn_ms", spawn_metrics.get("process_start_return_ms"))
+            _log_perf("runtime", f"{self.analyzer_name}_replacement_worker_import_ms", spawn_metrics.get("analyzer_import_ms"))
+            _log_perf("runtime", f"{self.analyzer_name}_replacement_worker_ready_wait_ms", spawn_metrics.get("ready_wait_ms"))
+            _log_perf("runtime", f"{self.analyzer_name}_worker_restart_generation", restart_generation)
+        except Exception as exc:
+            with self._lock:
+                if self._active_restart_token == restart_token:
+                    self._restart_ready = False
+                    self._restart_error_type = type(exc).__name__
+            logger.error(
+                "analysis_worker_async_restart_failed analyzer=%s worker_generation=%s error_type=%s",
+                self.analyzer_name,
+                expected_generation + 1,
+                type(exc).__name__,
+            )
+        finally:
+            with self._lock:
+                if self._active_restart_token == restart_token:
+                    self._active_restart_token = None
+                    self._restart_in_progress = False
+                if self._restart_candidate_process is candidate_process:
+                    self._restart_candidate_process = None
+                    self._restart_candidate_parent_conn = None
+
+    def _schedule_restart_locked(self, expected_generation: int) -> bool:
+        if self._stop_event.is_set():
+            return False
+        if self._restart_in_progress and self._restart_generation == expected_generation:
+            return False
+        if self._process is not None:
+            return False
+        scheduled_at = time.perf_counter()
+        self._restart_token += 1
+        self._restart_generation = expected_generation
+        self._active_restart_token = self._restart_token
+        self._restart_started_at = scheduled_at
+        self._restart_in_progress = True
+        self._restart_ready = False
+        self._restart_error_type = None
+        self._ready = False
+        self._restart_thread = threading.Thread(
+            target=self._restart_worker_async,
+            args=(expected_generation, scheduled_at),
+            name=f"{self.analyzer_name}-analysis-restart",
+            daemon=True,
+        )
+        return True
+
+    def _start_restart_thread(self, thread: threading.Thread | None) -> None:
+        if thread is None:
+            return
+        try:
+            thread.start()
+        except RuntimeError:
+            pass
+
+    def _wait_for_ready_until_deadline(self, deadline_at: float) -> bool:
+        while time.perf_counter() < deadline_at:
+            restart_thread = None
+            remaining = max(0.0, deadline_at - time.perf_counter())
+            acquired = self._lock.acquire(timeout=min(self._poll_interval_seconds, remaining))
+            if not acquired:
+                continue
+            try:
+                if self._ready and self._process is not None and self._parent_conn is not None:
+                    return True
+                if not self._restart_in_progress and self._process is None:
+                    if self._schedule_restart_locked(self._generation):
+                        restart_thread = self._restart_thread
+            finally:
+                self._lock.release()
+            self._start_restart_thread(restart_thread)
+            time.sleep(min(self._poll_interval_seconds, max(0.0, deadline_at - time.perf_counter())))
+        return False
+
     def _finalize_job_locked(
         self,
         job: _WorkerJob,
@@ -403,8 +582,12 @@ class WorkerSupervisor:
         dispatch_ms: int = 0,
         response_ms: int = 0,
         cleanup_worker: bool = True,
+        restart_worker: bool = True,
         clear_active: bool = True,
     ) -> dict[str, Any]:
+        process_to_cleanup = None
+        parent_conn_to_cleanup = None
+        restart_thread = None
         with self._lock:
             cached = self._completed_jobs.get(job.job_id)
             if cached is not None:
@@ -421,28 +604,35 @@ class WorkerSupervisor:
             parent_conn = self._parent_conn
 
             if cleanup_worker and process is not None and parent_conn is not None:
-                process_state = self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
+                old_generation = self._generation
+                process_to_cleanup = process
+                parent_conn_to_cleanup = parent_conn
                 worker_restarted = True
                 self._process = None
                 self._parent_conn = None
                 self._child_conn = None
                 self._ready = False
-                if not self._stop_event.is_set():
-                    try:
-                        self._spawn_worker_locked()
-                        worker_restarted = True
-                    except Exception as exc:
-                        logger.error(
-                            "analysis_worker_restart_failed analyzer=%s error_type=%s",
-                            self.analyzer_name,
-                            type(exc).__name__,
-                        )
             elif not process_state:
                 process_state = self._snapshot_process_locked()
 
             if clear_active and self._active_job_id == job.job_id:
                 self._active_job_id = None
                 self._active_worker_generation = None
+
+        if process_to_cleanup is not None and parent_conn_to_cleanup is not None:
+            process_state = self._cleanup_process_locked(
+                process_to_cleanup,
+                parent_conn_to_cleanup,
+                timeout_seconds=self._recovery_timeout_seconds,
+            )
+
+        with self._lock:
+            cached = self._completed_jobs.get(job.job_id)
+            if cached is not None:
+                return cached
+            if process_to_cleanup is not None and restart_worker:
+                if self._schedule_restart_locked(old_generation):
+                    restart_thread = self._restart_thread
 
             state = self._build_state(
                 job=job,
@@ -475,6 +665,11 @@ class WorkerSupervisor:
             _log_perf(job.scan_id, f"{self.analyzer_name}_timed_out", state["timed_out"])
             _log_perf(job.scan_id, f"{self.analyzer_name}_analyzer_error", state["analyzer_error"])
             _log_perf(job.scan_id, f"{self.analyzer_name}_worker_restarted", state["worker_restarted"])
+            _log_perf(job.scan_id, f"{self.analyzer_name}_old_worker_cleanup_ms", state.get("old_worker_cleanup_ms"))
+            _log_perf(job.scan_id, f"{self.analyzer_name}_old_worker_terminate_ms", state.get("old_worker_terminate_ms"))
+            _log_perf(job.scan_id, f"{self.analyzer_name}_old_worker_join_ms", state.get("old_worker_join_ms"))
+            _log_perf(job.scan_id, f"{self.analyzer_name}_old_worker_kill_ms", state.get("old_worker_kill_ms"))
+            _log_perf(job.scan_id, f"{self.analyzer_name}_old_worker_final_join_ms", state.get("old_worker_final_join_ms"))
             self._completed_jobs[job.job_id] = completion
             self._completed_jobs.move_to_end(job.job_id)
             self._prune_job_registries_locked()
@@ -482,9 +677,12 @@ class WorkerSupervisor:
             if clear_active and self._active_job_id == job.job_id:
                 self._active_job_id = None
                 self._active_worker_generation = None
-            return completion
+        self._start_restart_thread(restart_thread)
+        return completion
 
     def start(self) -> dict[str, Any]:
+        process_to_reset = None
+        parent_conn_to_reset = None
         with self._lock:
             if self._started and self._ready:
                 return {
@@ -495,12 +693,33 @@ class WorkerSupervisor:
                 self._dispatcher.start()
                 self._dispatcher_started = True
             if self._process is not None or self._parent_conn is not None:
-                self._reset_worker_locked()
+                process_to_reset = self._process
+                parent_conn_to_reset = self._parent_conn
+                self._process = None
+                self._parent_conn = None
+                self._child_conn = None
+                self._ready = False
 
         startup_started_at = time.perf_counter()
+        if process_to_reset is not None and parent_conn_to_reset is not None:
+            self._cleanup_process_locked(process_to_reset, parent_conn_to_reset, timeout_seconds=self._recovery_timeout_seconds)
+        generation = None
+        process = parent_conn = child_conn = None
+        spawn_metrics: dict[str, Any] = {}
         with self._lock:
-            spawn_metrics = self._spawn_worker_locked()
+            generation = self._generation + 1
+        process, parent_conn, child_conn, spawn_metrics = self._spawn_worker_candidate(generation)
+        with self._lock:
+            if self._stop_event.is_set():
+                cleanup_process = process
+                cleanup_parent_conn = parent_conn
+            else:
+                cleanup_process = None
+                cleanup_parent_conn = None
+                self._publish_spawned_worker_locked(generation, process, parent_conn, child_conn, spawn_metrics)
             self._started = True
+        if cleanup_process is not None and cleanup_parent_conn is not None:
+            self._cleanup_process_locked(cleanup_process, cleanup_parent_conn, timeout_seconds=self._recovery_timeout_seconds)
         logger.info("[PERF] analyzer_runtime_start_ms scan_id=runtime value=%s", _elapsed_ms(startup_started_at))
         _log_perf("runtime", f"{self.analyzer_name}_worker_spawn_ms", spawn_metrics.get("process_start_return_ms"))
         _log_perf("runtime", f"{self.analyzer_name}_worker_import_ms", spawn_metrics.get("analyzer_import_ms"))
@@ -567,8 +786,23 @@ class WorkerSupervisor:
             "worker_response_ms": response_ms,
             "modality_total_ms": _elapsed_ms(job.submitted_at),
             "worker_restarted": worker_restarted,
+            "old_worker_cleanup_ms": process_state.get("old_worker_cleanup_ms"),
+            "old_worker_terminate_ms": process_state.get("old_worker_terminate_ms"),
+            "old_worker_join_ms": process_state.get("old_worker_join_ms"),
+            "old_worker_kill_ms": process_state.get("old_worker_kill_ms"),
+            "old_worker_final_join_ms": process_state.get("old_worker_final_join_ms"),
         }
+        state.update(self._restart_state_snapshot())
         return state
+
+    def _restart_state_snapshot(self) -> dict[str, Any]:
+        return {
+            "worker_restart_scheduled": self._restart_started_at is not None,
+            "worker_restart_in_progress": self._restart_in_progress,
+            "worker_restart_ready": self._restart_ready,
+            "worker_restart_generation": self._restart_generation,
+            "worker_restart_error_type": self._restart_error_type,
+        }
 
     def _dispatch_job(self, job: _WorkerJob) -> dict[str, Any]:
         queue_wait_ms = _elapsed_ms(job.submitted_at)
@@ -584,6 +818,23 @@ class WorkerSupervisor:
                 queue_wait_ms=queue_wait_ms,
                 dispatch_ms=0,
                 response_ms=0,
+                cleanup_worker=False,
+            )
+
+        if not self._wait_for_ready_until_deadline(job.deadline_at):
+            return self._finalize_job_locked(
+                job,
+                timed_out=True,
+                analyzer_error=False,
+                result_received=False,
+                process_state=self._snapshot_process_locked(),
+                worker_restarted=False,
+                child_metrics={},
+                queue_wait_ms=queue_wait_ms,
+                dispatch_ms=0,
+                response_ms=0,
+                cleanup_worker=False,
+                clear_active=False,
             )
 
         with self._lock:
@@ -748,16 +999,26 @@ class WorkerSupervisor:
             try:
                 job = self._queue.get(timeout=self._poll_interval_seconds)
             except queue.Empty:
+                process_to_reset = None
+                parent_conn_to_reset = None
+                restart_thread = None
                 with self._lock:
                     if self._started and self._process is not None and not self._process.is_alive() and not self._stop_event.is_set():
-                        try:
-                            self._reset_worker_locked()
-                        except Exception:
-                            pass
-                        try:
-                            self._spawn_worker_locked()
-                        except Exception:
-                            pass
+                        process_to_reset = self._process
+                        parent_conn_to_reset = self._parent_conn
+                        old_generation = self._generation
+                        self._process = None
+                        self._parent_conn = None
+                        self._child_conn = None
+                        self._ready = False
+                        if self._schedule_restart_locked(old_generation):
+                            restart_thread = self._restart_thread
+                if process_to_reset is not None and parent_conn_to_reset is not None:
+                    try:
+                        self._cleanup_process_locked(process_to_reset, parent_conn_to_reset, timeout_seconds=self._recovery_timeout_seconds)
+                    except Exception:
+                        pass
+                self._start_restart_thread(restart_thread)
                 continue
             if job is _SHUTDOWN_JOB:
                 break
@@ -812,6 +1073,7 @@ class WorkerSupervisor:
         return future
 
     def finalize_timed_out_job(self, job_id: str) -> dict[str, Any]:
+        finalize_args: dict[str, Any] | None = None
         with self._lock:
             cached = self._completed_jobs.get(job_id)
             if cached is not None:
@@ -852,35 +1114,35 @@ class WorkerSupervisor:
             is_active_job = job_id == self._active_job_id and job.worker_generation == self._active_worker_generation
             if not is_active_job:
                 process_state = self._snapshot_process_locked()
-                completion = self._finalize_job_locked(
-                    job,
-                    timed_out=True,
-                    analyzer_error=False,
-                    result_received=False,
-                    process_state=process_state,
-                    worker_restarted=False,
-                    child_metrics={},
-                    queue_wait_ms=_elapsed_ms(job.submitted_at),
-                    dispatch_ms=0,
-                    response_ms=0,
-                    cleanup_worker=False,
-                    clear_active=False,
-                )
-                return completion
-            return self._finalize_job_locked(
-                job,
-                timed_out=True,
-                analyzer_error=False,
-                result_received=False,
-                process_state={"process_exited": False, "alive": True, "terminated": False, "killed": False, "process_exitcode": None},
-                worker_restarted=False,
-                child_metrics={},
-                queue_wait_ms=_elapsed_ms(job.submitted_at),
-                dispatch_ms=0,
-                response_ms=0,
-                cleanup_worker=True,
-                clear_active=True,
-            )
+                finalize_args = {
+                    "job": job,
+                    "process_state": process_state,
+                    "cleanup_worker": False,
+                    "clear_active": False,
+                }
+            else:
+                finalize_args = {
+                    "job": job,
+                    "process_state": {"process_exited": False, "alive": True, "terminated": False, "killed": False, "process_exitcode": None},
+                    "cleanup_worker": True,
+                    "clear_active": True,
+                }
+        assert finalize_args is not None
+        return self._finalize_job_locked(
+            finalize_args["job"],
+            timed_out=True,
+            analyzer_error=False,
+            result_received=False,
+            process_state=finalize_args["process_state"],
+            worker_restarted=False,
+            child_metrics={},
+            queue_wait_ms=_elapsed_ms(finalize_args["job"].submitted_at),
+            dispatch_ms=0,
+            response_ms=0,
+            cleanup_worker=finalize_args["cleanup_worker"],
+            restart_worker=True,
+            clear_active=finalize_args["clear_active"],
+        )
 
     def forget_job(self, job_id: str) -> None:
         with self._lock:
@@ -901,6 +1163,10 @@ class WorkerSupervisor:
             "worker_generation": generation,
             "process_alive": bool(process.is_alive()) if process is not None else False,
             "process_exitcode": getattr(process, "exitcode", None) if process is not None else None,
+            "restart_in_progress": self._restart_in_progress,
+            "restart_ready": self._restart_ready,
+            "restart_generation": self._restart_generation,
+            "restart_error_type": self._restart_error_type,
         }
 
     def shutdown(self) -> None:
@@ -912,12 +1178,25 @@ class WorkerSupervisor:
         if self._dispatcher_started:
             self._dispatcher.join(timeout=self._recovery_timeout_seconds)
         with self._lock:
+            self._restart_token += 1
+            self._active_restart_token = None
+            candidate_process = self._restart_candidate_process
+            candidate_parent_conn = self._restart_candidate_parent_conn
+            self._restart_candidate_process = None
+            self._restart_candidate_parent_conn = None
+            restart_thread = self._restart_thread
             process = self._process
             parent_conn = self._parent_conn
             self._process = None
             self._parent_conn = None
             self._child_conn = None
             self._ready = False
+            self._restart_in_progress = False
+            self._restart_ready = False
+        if candidate_process is not None and candidate_parent_conn is not None:
+            self._cleanup_process_locked(candidate_process, candidate_parent_conn, timeout_seconds=self._recovery_timeout_seconds)
+        if restart_thread is not None and restart_thread.is_alive():
+            restart_thread.join(timeout=self._recovery_timeout_seconds)
         if process is not None and parent_conn is not None:
             try:
                 if process.is_alive():
@@ -951,6 +1230,11 @@ class WorkerSupervisor:
             self._expired_jobs.clear()
             self._active_job_id = None
             self._active_worker_generation = None
+            self._restart_thread = None
+            self._restart_in_progress = False
+            self._active_restart_token = None
+            self._restart_candidate_process = None
+            self._restart_candidate_parent_conn = None
 
 
 class WarmAnalyzerRuntime:
@@ -1017,11 +1301,13 @@ class WarmAnalyzerRuntime:
         }
 
     def run_scan(self, scan_id: str, media: Any, *, deadline_seconds: float) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        runtime_started_at = time.perf_counter()
         if not self._started:
             self.start()
 
         deadline_at = time.perf_counter() + deadline_seconds
         jobs: dict[str, Future] = {}
+        submission_started_at = time.perf_counter()
         for analyzer_name, supervisor, path in [
             ("video", self._supervisors["video"], getattr(media, "video", None)),
             ("audio", self._supervisors["audio"], getattr(media, "audio", None)),
@@ -1068,10 +1354,12 @@ class WarmAnalyzerRuntime:
                     }
                 )
                 jobs[analyzer_name] = future
+        _log_perf(scan_id, "analyzer_submission_ms", _elapsed_ms(submission_started_at))
 
         results: dict[str, dict[str, Any]] = {}
         worker_states: dict[str, dict[str, Any]] = {}
         pending = {future: analyzer_name for analyzer_name, future in jobs.items()}
+        deadline_wait_started_at = time.perf_counter()
         while pending:
             remaining = deadline_at - time.perf_counter()
             if remaining <= 0:
@@ -1116,18 +1404,21 @@ class WarmAnalyzerRuntime:
                 job_id = getattr(future, "_analysis_job_id", None)
                 if isinstance(job_id, str):
                     self._supervisors[analyzer_name].forget_job(job_id)
+        _log_perf(scan_id, "media_deadline_wait_ms", _elapsed_ms(deadline_wait_started_at))
         if pending:
+            timeout_finalization_started_at = time.perf_counter()
             with ThreadPoolExecutor(max_workers=len(pending)) as timeout_executor:
                 finalizers: dict[Future, tuple[Future, str, str]] = {}
                 for future, analyzer_name in pending.items():
                     job_id = getattr(future, "_analysis_job_id", None)
                     if not isinstance(job_id, str):
                         job_id = uuid.uuid4().hex
+                    modality_finalization_started_at = time.perf_counter()
                     finalizers[
                         timeout_executor.submit(self._supervisors[analyzer_name].finalize_timed_out_job, job_id)
-                    ] = (future, analyzer_name, job_id)
+                    ] = (future, analyzer_name, job_id, modality_finalization_started_at)
                 for finalizer in concurrent.futures.as_completed(finalizers):
-                    pending_future, analyzer_name, job_id = finalizers[finalizer]
+                    pending_future, analyzer_name, job_id, modality_finalization_started_at = finalizers[finalizer]
                     try:
                         completion = finalizer.result()
                     except Exception:
@@ -1158,12 +1449,16 @@ class WarmAnalyzerRuntime:
                         }
                     results[analyzer_name] = completion["result"]
                     worker_states[analyzer_name] = completion["state"]
+                    finalization_ms = _elapsed_ms(modality_finalization_started_at)
+                    _log_perf(scan_id, f"{analyzer_name}_timeout_finalization_ms", finalization_ms)
                     self._supervisors[analyzer_name].forget_job(job_id)
                     if pending_future.done():
                         try:
                             pending_future.result()
                         except Exception:
                             pass
+            _log_perf(scan_id, "timeout_finalization_ms", _elapsed_ms(timeout_finalization_started_at))
+        _log_perf(scan_id, "analyzer_runtime_total_ms", _elapsed_ms(runtime_started_at))
         return results, worker_states
 
     def is_ready(self) -> bool:

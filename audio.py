@@ -316,16 +316,20 @@ def _mfcc_summary_like(y: np.ndarray, sr: int, *, hop_length: int, n_fft: int) -
         raise RuntimeError("mfcc_feature_failed") from exc
 
 
-def _mfcc_summary_like_from_power(power: np.ndarray, sr: int, *, n_fft: int) -> list[float | None]:
+def _mfcc_summary_like_from_power(power: np.ndarray, sr: int, *, n_fft: int, scan_id: str | None = None) -> list[float | None]:
     if librosa is None:
         raise RuntimeError("mfcc_feature_failed")
     try:
         power_matrix = np.asarray(power, dtype=np.float64)
         if power_matrix.ndim != 2:
             raise RuntimeError("mfcc_feature_failed")
+        mel_started = time.perf_counter()
         mel_power = librosa.feature.melspectrogram(S=power_matrix, sr=sr, n_mels=128)
         mel_db = librosa.power_to_db(mel_power, ref=np.max)
+        _log_audio_perf(scan_id, "audio_mel_ms", mel_started)
+        mfcc_started = time.perf_counter()
         mfcc_matrix = librosa.feature.mfcc(S=mel_db, n_mfcc=5)
+        _log_audio_perf(scan_id, "audio_mfcc_ms", mfcc_started)
         arr = np.asarray(mfcc_matrix, dtype=np.float64)
         if arr.ndim != 2 or arr.shape[0] != 5 or arr.size == 0:
             raise RuntimeError("mfcc_feature_failed")
@@ -592,8 +596,10 @@ def _feature_pipeline(y: np.ndarray, sr: int, *, scan_id: str | None = None) -> 
     frame_length = min(2048, max(512, int(sr * 0.032)))
     hop_length = max(256, int(frame_length / 4))
 
-    step_started = time.perf_counter()
+    frame_started = time.perf_counter()
     frames = _frame_matrix(y, frame_length, hop_length)
+    _log_audio_perf(scan_id, "audio_frame_build_ms", frame_started)
+    step_started = time.perf_counter()
     rms = np.sqrt(np.mean(frames * frames, axis=-1, dtype=np.float64))
     rms = np.ascontiguousarray(np.asarray(rms, dtype=np.float32).reshape(-1))
     if not np.isfinite(rms).all():
@@ -630,7 +636,7 @@ def _feature_pipeline(y: np.ndarray, sr: int, *, scan_id: str | None = None) -> 
     flatness_ms = _elapsed_ms(flatness_started)
 
     mfcc_started = time.perf_counter()
-    mfcc_summary = _mfcc_summary_like_from_power(power, sr, n_fft=frame_length)
+    mfcc_summary = _mfcc_summary_like_from_power(power, sr, n_fft=frame_length, scan_id=scan_id)
     mfcc_ms = _elapsed_ms(mfcc_started)
     spectral_ms = _elapsed_ms(step_started)
     _log_audio_perf(scan_id, "audio_spectral_ms", step_started)
@@ -866,6 +872,7 @@ def analyze_audio(audio_path: str, *, scan_id: str | None = None) -> dict:
     validation_started = time.perf_counter()
     path_state, normalized_path = _prepare_audio_source(audio_path)
     _log_audio_perf(scan_id, "audio_path_validation_ms", validation_started, status=path_state)
+    _log_audio_perf(scan_id, "audio_source_prepare_ms", validation_started, status=path_state)
     if path_state == "missing":
         _log_audio_perf(scan_id, "audio_total_ms", total_started, status="missing")
         return _failure_result("missing", "audio_missing")

@@ -14,6 +14,18 @@ def _elapsed_ms(started_at: float) -> int:
     return int(round((time.perf_counter() - started_at) * 1000))
 
 
+def _log_worker_perf(scan_id: str | None, analyzer_name: str, metric: str, started_at: float, *, status: str = "ok") -> None:
+    value = _elapsed_ms(started_at)
+    logger.info(
+        "[WORKER_PERF] analyzer=%s metric=%s scan_id=%s value=%s status=%s",
+        analyzer_name,
+        metric,
+        scan_id,
+        value,
+        status,
+    )
+
+
 def _warning_key(analyzer_name: str) -> str:
     return {
         "video": "visual_warnings",
@@ -170,6 +182,7 @@ def worker_main(result_conn: Any, analyzer_name: str, worker_generation: int) ->
 
     try:
         while True:
+            receive_started_at = time.perf_counter()
             try:
                 message = result_conn.recv()
             except EOFError:
@@ -195,6 +208,7 @@ def worker_main(result_conn: Any, analyzer_name: str, worker_generation: int) ->
             job_id = message.get("job_id")
             scan_id = message.get("scan_id")
             path = message.get("path")
+            _log_worker_perf(scan_id, analyzer_name, f"{analyzer_name}_worker_receive_ms", receive_started_at)
             response_started_at = time.perf_counter()
             if not path:
                 payload = {
@@ -237,13 +251,12 @@ def worker_main(result_conn: Any, analyzer_name: str, worker_generation: int) ->
                     )
 
             try:
+                payload.setdefault("metrics", {})["response_send_ms"] = _elapsed_ms(response_started_at)
+                payload["metrics"]["total_worker_ms"] = _elapsed_ms(job_started_at)
                 result_conn.send(payload)
+                _log_worker_perf(scan_id, analyzer_name, f"{analyzer_name}_result_publish_ms", response_started_at)
             except Exception:
                 break
-            finally:
-                metrics = payload.setdefault("metrics", {})
-                metrics["response_send_ms"] = _elapsed_ms(response_started_at)
-                metrics["total_worker_ms"] = _elapsed_ms(job_started_at)
     finally:
         try:
             result_conn.close()
