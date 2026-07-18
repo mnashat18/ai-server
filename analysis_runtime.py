@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import concurrent.futures
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait as futures_wait
+from collections import OrderedDict
 from dataclasses import dataclass
 import multiprocessing
 import queue
@@ -202,6 +204,7 @@ class _WorkerJob:
     deadline_at: float
     submitted_at: float
     future: Future
+    worker_generation: int | None = None
 
 
 _SHUTDOWN_JOB = object()
@@ -213,7 +216,7 @@ class WorkerSupervisor:
         analyzer_name: str,
         *,
         queue_capacity: int = 4,
-        startup_timeout_seconds: float = 6.5,
+        startup_timeout_seconds: float = 15.0,
         recovery_timeout_seconds: float = 1.5,
         poll_interval_seconds: float = 0.05,
         context_factory: Callable[[], Any] | None = None,
@@ -242,6 +245,39 @@ class WorkerSupervisor:
         self._ready = False
         self._ready_metrics: dict[str, Any] = {}
         self._last_spawn_metrics: dict[str, Any] = {}
+        self._jobs_by_id: dict[str, _WorkerJob] = {}
+        self._completed_jobs: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._expired_jobs: OrderedDict[str, float] = OrderedDict()
+        self._active_job_id: str | None = None
+        self._active_worker_generation: int | None = None
+        self._completed_job_limit = 2048
+        self._expired_job_limit = 2048
+        self._job_retention_seconds = 300.0
+
+    def _prune_job_registries_locked(self) -> None:
+        while len(self._completed_jobs) > self._completed_job_limit:
+            self._completed_jobs.popitem(last=False)
+        while len(self._expired_jobs) > self._expired_job_limit:
+            self._expired_jobs.popitem(last=False)
+
+    def _snapshot_process_locked(self) -> dict[str, Any]:
+        process = self._process
+        if process is None:
+            return {
+                "terminated": False,
+                "killed": False,
+                "process_exitcode": None,
+                "process_exited": True,
+                "alive": False,
+            }
+        alive = bool(process.is_alive())
+        return {
+            "terminated": False,
+            "killed": False,
+            "process_exitcode": getattr(process, "exitcode", None),
+            "process_exited": not alive,
+            "alive": alive,
+        }
 
     def _spawn_worker_locked(self) -> dict[str, Any]:
         ctx = self._context_factory()
@@ -280,7 +316,15 @@ class WorkerSupervisor:
             and ready_payload.get("ok") is True
             and ready_payload.get("worker_generation") == generation
         ):
-            self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
+            process_state = self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
+            logger.error(
+                "analysis_worker_start_failed analyzer=%s worker_generation=%s error_type=%s process_exitcode=%s elapsed_startup_ms=%s",
+                self.analyzer_name,
+                generation,
+                "startup_timeout" if ready_payload is None else str(ready_payload.get("error_type") or "invalid_ready_payload"),
+                process_state.get("process_exitcode"),
+                _elapsed_ms(process_started_at),
+            )
             raise AnalysisRuntimeStartupError(f"{self.analyzer_name}_worker_start_failed")
 
         self._generation = generation
@@ -344,6 +388,101 @@ class WorkerSupervisor:
         if process is None or parent_conn is None:
             return {"terminated": False, "killed": False, "process_exitcode": None, "alive": False, "process_exited": True}
         return self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
+
+    def _finalize_job_locked(
+        self,
+        job: _WorkerJob,
+        *,
+        timed_out: bool,
+        analyzer_error: bool,
+        result_received: bool,
+        process_state: dict[str, Any] | None = None,
+        worker_restarted: bool = False,
+        child_metrics: dict[str, Any] | None = None,
+        queue_wait_ms: int = 0,
+        dispatch_ms: int = 0,
+        response_ms: int = 0,
+        cleanup_worker: bool = True,
+        clear_active: bool = True,
+    ) -> dict[str, Any]:
+        with self._lock:
+            cached = self._completed_jobs.get(job.job_id)
+            if cached is not None:
+                return cached
+
+            process_state = process_state or {}
+            child_metrics = child_metrics or {}
+            if timed_out:
+                self._expired_jobs[job.job_id] = time.perf_counter()
+                self._expired_jobs.move_to_end(job.job_id)
+                self._prune_job_registries_locked()
+
+            process = self._process
+            parent_conn = self._parent_conn
+
+            if cleanup_worker and process is not None and parent_conn is not None:
+                process_state = self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
+                worker_restarted = True
+                self._process = None
+                self._parent_conn = None
+                self._child_conn = None
+                self._ready = False
+                if not self._stop_event.is_set():
+                    try:
+                        self._spawn_worker_locked()
+                        worker_restarted = True
+                    except Exception as exc:
+                        logger.error(
+                            "analysis_worker_restart_failed analyzer=%s error_type=%s",
+                            self.analyzer_name,
+                            type(exc).__name__,
+                        )
+            elif not process_state:
+                process_state = self._snapshot_process_locked()
+
+            if clear_active and self._active_job_id == job.job_id:
+                self._active_job_id = None
+                self._active_worker_generation = None
+
+            state = self._build_state(
+                job=job,
+                timed_out=timed_out,
+                analyzer_error=analyzer_error,
+                result_received=result_received,
+                process_state=process_state,
+                worker_restarted=worker_restarted,
+                child_metrics=child_metrics,
+                queue_wait_ms=queue_wait_ms,
+                dispatch_ms=dispatch_ms,
+                response_ms=response_ms,
+            )
+            completion = {
+                "result": _timeout_placeholder(self.analyzer_name) if timed_out else _error_placeholder(self.analyzer_name),
+                "state": state,
+            }
+            if not job.future.done():
+                job.future.set_result(completion)
+            self._completed_jobs[job.job_id] = completion
+            self._jobs_by_id.pop(job.job_id, None)
+            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_queue_wait_ms", queue_wait_ms)
+            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_dispatch_ms", dispatch_ms)
+            _log_perf(job.scan_id, f"{self.analyzer_name}_analyzer_execution_ms", child_metrics.get("analyzer_execution_ms"))
+            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_response_ms", response_ms)
+            _log_perf(job.scan_id, f"{self.analyzer_name}_modality_total_ms", state["modality_total_ms"])
+            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_generation", state["worker_generation"])
+            _log_perf(job.scan_id, f"{self.analyzer_name}_result_received", state["result_received"])
+            _log_perf(job.scan_id, f"{self.analyzer_name}_process_exitcode", state["process_exitcode"])
+            _log_perf(job.scan_id, f"{self.analyzer_name}_timed_out", state["timed_out"])
+            _log_perf(job.scan_id, f"{self.analyzer_name}_analyzer_error", state["analyzer_error"])
+            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_restarted", state["worker_restarted"])
+            self._completed_jobs[job.job_id] = completion
+            self._completed_jobs.move_to_end(job.job_id)
+            self._prune_job_registries_locked()
+            self._jobs_by_id.pop(job.job_id, None)
+            if clear_active and self._active_job_id == job.job_id:
+                self._active_job_id = None
+                self._active_worker_generation = None
+            return completion
 
     def start(self) -> dict[str, Any]:
         with self._lock:
@@ -409,6 +548,7 @@ class WorkerSupervisor:
             "killed": bool(process_state.get("killed", False)),
             "process_exitcode": process_state.get("process_exitcode"),
             "final_alive": False,
+            "worker_process_alive": bool(process_state.get("alive", True)),
             "finalized": finalized,
             "worker_generation": self._generation,
             "parent_process_start_ms": None,
@@ -433,8 +573,8 @@ class WorkerSupervisor:
     def _dispatch_job(self, job: _WorkerJob) -> dict[str, Any]:
         queue_wait_ms = _elapsed_ms(job.submitted_at)
         if time.perf_counter() >= job.deadline_at:
-            state = self._build_state(
-                job=job,
+            return self._finalize_job_locked(
+                job,
                 timed_out=True,
                 analyzer_error=False,
                 result_received=False,
@@ -445,20 +585,6 @@ class WorkerSupervisor:
                 dispatch_ms=0,
                 response_ms=0,
             )
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_queue_wait_ms", queue_wait_ms)
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_dispatch_ms", 0)
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_response_ms", 0)
-            _log_perf(job.scan_id, f"{self.analyzer_name}_modality_total_ms", state["modality_total_ms"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_generation", state["worker_generation"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_result_received", state["result_received"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_process_exitcode", state["process_exitcode"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_timed_out", state["timed_out"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_analyzer_error", state["analyzer_error"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_restarted", state["worker_restarted"])
-            return {
-                "result": _timeout_placeholder(self.analyzer_name),
-                "state": state,
-            }
 
         with self._lock:
             process = self._process
@@ -467,8 +593,8 @@ class WorkerSupervisor:
 
         if process is None or parent_conn is None:
             process_state = self._reset_worker_locked()
-            state = self._build_state(
-                job=job,
+            return self._finalize_job_locked(
+                job,
                 timed_out=False,
                 analyzer_error=True,
                 result_received=False,
@@ -479,20 +605,22 @@ class WorkerSupervisor:
                 dispatch_ms=0,
                 response_ms=0,
             )
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_queue_wait_ms", queue_wait_ms)
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_dispatch_ms", 0)
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_response_ms", 0)
-            _log_perf(job.scan_id, f"{self.analyzer_name}_modality_total_ms", state["modality_total_ms"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_generation", state["worker_generation"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_result_received", state["result_received"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_process_exitcode", state["process_exitcode"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_timed_out", state["timed_out"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_analyzer_error", state["analyzer_error"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_restarted", state["worker_restarted"])
-            return {
-                "result": _error_placeholder(self.analyzer_name),
-                "state": state,
-            }
+
+        with self._lock:
+            if job.future.done() or (job.job_id in self._expired_jobs and job.job_id != self._active_job_id):
+                cached = self._completed_jobs.get(job.job_id)
+                if cached is not None:
+                    return cached
+                if job.future.done():
+                    try:
+                        completion = job.future.result()
+                        if isinstance(completion, dict):
+                            return completion
+                    except Exception:
+                        pass
+            self._active_job_id = job.job_id
+            self._active_worker_generation = generation
+            job.worker_generation = generation
 
         dispatch_started_at = time.perf_counter()
         try:
@@ -508,8 +636,8 @@ class WorkerSupervisor:
             )
         except Exception:
             process_state = self._reset_worker_locked()
-            state = self._build_state(
-                job=job,
+            return self._finalize_job_locked(
+                job,
                 timed_out=False,
                 analyzer_error=True,
                 result_received=False,
@@ -520,20 +648,6 @@ class WorkerSupervisor:
                 dispatch_ms=_elapsed_ms(dispatch_started_at),
                 response_ms=0,
             )
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_queue_wait_ms", queue_wait_ms)
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_dispatch_ms", _elapsed_ms(dispatch_started_at))
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_response_ms", 0)
-            _log_perf(job.scan_id, f"{self.analyzer_name}_modality_total_ms", state["modality_total_ms"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_generation", state["worker_generation"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_result_received", state["result_received"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_process_exitcode", state["process_exitcode"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_timed_out", state["timed_out"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_analyzer_error", state["analyzer_error"])
-            _log_perf(job.scan_id, f"{self.analyzer_name}_worker_restarted", state["worker_restarted"])
-            return {
-                "result": _error_placeholder(self.analyzer_name),
-                "state": state,
-            }
 
         dispatch_ms = _elapsed_ms(dispatch_started_at)
         response_started_at = time.perf_counter()
@@ -564,11 +678,15 @@ class WorkerSupervisor:
                 break
             if process.sentinel in ready_handles and not process.is_alive():
                 break
+            if job.job_id in self._expired_jobs:
+                timed_out = True
+                break
 
         response_ms = _elapsed_ms(response_started_at)
         if payload is not None and isinstance(payload, dict) and payload.get("type") == "result":
             if payload.get("worker_generation") != generation or payload.get("job_id") != job.job_id:
-                analyzer_error = True
+                if not timed_out and job.job_id not in self._expired_jobs:
+                    analyzer_error = True
                 payload = None
             elif payload.get("ok") is True and isinstance(payload.get("result"), dict):
                 child_metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
@@ -598,55 +716,22 @@ class WorkerSupervisor:
                 _log_perf(job.scan_id, f"{self.analyzer_name}_timed_out", state["timed_out"])
                 _log_perf(job.scan_id, f"{self.analyzer_name}_analyzer_error", state["analyzer_error"])
                 _log_perf(job.scan_id, f"{self.analyzer_name}_worker_restarted", state["worker_restarted"])
+                with self._lock:
+                    if self._active_job_id == job.job_id:
+                        self._active_job_id = None
+                        self._active_worker_generation = None
                 return {
                     "result": payload["result"],
                     "state": state,
                 }
             else:
-                analyzer_error = True
-        else:
+                if not timed_out and job.job_id not in self._expired_jobs:
+                    analyzer_error = True
+        elif not timed_out and job.job_id not in self._expired_jobs:
             analyzer_error = True
 
-        if not timed_out:
-            process_state = self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
-            if not process_state.get("alive"):
-                worker_restarted = True
-            with self._lock:
-                self._process = None
-                self._parent_conn = None
-                self._child_conn = None
-                self._ready = False
-            if not self._stop_event.is_set():
-                try:
-                    self._spawn_worker_locked()
-                    worker_restarted = True
-                except Exception as exc:
-                    logger.error(
-                        "analysis_worker_restart_failed analyzer=%s error_type=%s",
-                        self.analyzer_name,
-                        type(exc).__name__,
-                    )
-
-        if timed_out:
-            process_state = self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
-            worker_restarted = True
-            with self._lock:
-                self._process = None
-                self._parent_conn = None
-                self._child_conn = None
-                self._ready = False
-            if not self._stop_event.is_set():
-                try:
-                    self._spawn_worker_locked()
-                except Exception as exc:
-                    logger.error(
-                        "analysis_worker_restart_failed analyzer=%s error_type=%s",
-                        self.analyzer_name,
-                        type(exc).__name__,
-                    )
-
-        state = self._build_state(
-            job=job,
+        return self._finalize_job_locked(
+            job,
             timed_out=timed_out,
             analyzer_error=analyzer_error,
             result_received=False,
@@ -657,26 +742,6 @@ class WorkerSupervisor:
             dispatch_ms=dispatch_ms,
             response_ms=response_ms,
         )
-        _log_perf(job.scan_id, f"{self.analyzer_name}_worker_queue_wait_ms", queue_wait_ms)
-        _log_perf(job.scan_id, f"{self.analyzer_name}_worker_dispatch_ms", dispatch_ms)
-        _log_perf(job.scan_id, f"{self.analyzer_name}_analyzer_execution_ms", child_metrics.get("analyzer_execution_ms"))
-        _log_perf(job.scan_id, f"{self.analyzer_name}_worker_response_ms", response_ms)
-        _log_perf(job.scan_id, f"{self.analyzer_name}_modality_total_ms", state["modality_total_ms"])
-        _log_perf(job.scan_id, f"{self.analyzer_name}_worker_generation", state["worker_generation"])
-        _log_perf(job.scan_id, f"{self.analyzer_name}_result_received", state["result_received"])
-        _log_perf(job.scan_id, f"{self.analyzer_name}_process_exitcode", state["process_exitcode"])
-        _log_perf(job.scan_id, f"{self.analyzer_name}_timed_out", state["timed_out"])
-        _log_perf(job.scan_id, f"{self.analyzer_name}_analyzer_error", state["analyzer_error"])
-        _log_perf(job.scan_id, f"{self.analyzer_name}_worker_restarted", state["worker_restarted"])
-        if timed_out:
-            return {
-                "result": _timeout_placeholder(self.analyzer_name),
-                "state": state,
-            }
-        return {
-            "result": _error_placeholder(self.analyzer_name),
-            "state": state,
-        }
 
     def _dispatch_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -733,11 +798,98 @@ class WorkerSupervisor:
             submitted_at=time.perf_counter(),
             future=future,
         )
+        setattr(future, "_analysis_job_id", job.job_id)
+        setattr(future, "_analysis_analyzer_name", self.analyzer_name)
+        with self._lock:
+            self._prune_job_registries_locked()
+            self._jobs_by_id[job.job_id] = job
         try:
             self._queue.put_nowait(job)
         except queue.Full as exc:
+            with self._lock:
+                self._jobs_by_id.pop(job.job_id, None)
             raise AnalysisRuntimeBusyError(f"{self.analyzer_name}_queue_full") from exc
         return future
+
+    def finalize_timed_out_job(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            cached = self._completed_jobs.get(job_id)
+            if cached is not None:
+                return cached
+            job = self._jobs_by_id.get(job_id)
+            if job is None:
+                cached_state = self._completed_jobs.get(job_id)
+                if cached_state is not None:
+                    return cached_state
+                return {
+                    "result": _timeout_placeholder(self.analyzer_name),
+                    "state": {
+                        "state": "finalized",
+                        "child_started": True,
+                        "result_ready": False,
+                        "result_received": False,
+                        "analyzer_error": False,
+                        "process_exited": False,
+                        "timed_out": True,
+                        "alive": False,
+                        "terminated": False,
+                        "killed": False,
+                        "process_exitcode": None,
+                        "final_alive": False,
+                        "worker_process_alive": False,
+                        "finalized": True,
+                        "worker_generation": self._generation,
+                        "worker_queue_wait_ms": 0,
+                        "worker_dispatch_ms": 0,
+                        "worker_response_ms": 0,
+                        "modality_total_ms": 0,
+                        "worker_restarted": False,
+                    },
+                }
+            self._expired_jobs[job_id] = time.perf_counter()
+            self._expired_jobs.move_to_end(job_id)
+            self._prune_job_registries_locked()
+            is_active_job = job_id == self._active_job_id and job.worker_generation == self._active_worker_generation
+            if not is_active_job:
+                process_state = self._snapshot_process_locked()
+                completion = self._finalize_job_locked(
+                    job,
+                    timed_out=True,
+                    analyzer_error=False,
+                    result_received=False,
+                    process_state=process_state,
+                    worker_restarted=False,
+                    child_metrics={},
+                    queue_wait_ms=_elapsed_ms(job.submitted_at),
+                    dispatch_ms=0,
+                    response_ms=0,
+                    cleanup_worker=False,
+                    clear_active=False,
+                )
+                return completion
+            return self._finalize_job_locked(
+                job,
+                timed_out=True,
+                analyzer_error=False,
+                result_received=False,
+                process_state={"process_exited": False, "alive": True, "terminated": False, "killed": False, "process_exitcode": None},
+                worker_restarted=False,
+                child_metrics={},
+                queue_wait_ms=_elapsed_ms(job.submitted_at),
+                dispatch_ms=0,
+                response_ms=0,
+                cleanup_worker=True,
+                clear_active=True,
+            )
+
+    def forget_job(self, job_id: str) -> None:
+        with self._lock:
+            self._completed_jobs.pop(job_id, None)
+            self._expired_jobs.pop(job_id, None)
+            self._jobs_by_id.pop(job_id, None)
+            if self._active_job_id == job_id:
+                self._active_job_id = None
+                self._active_worker_generation = None
 
     def health(self) -> dict[str, Any]:
         with self._lock:
@@ -793,6 +945,12 @@ class WorkerSupervisor:
                 process.close()
             except Exception:
                 pass
+        with self._lock:
+            self._jobs_by_id.clear()
+            self._completed_jobs.clear()
+            self._expired_jobs.clear()
+            self._active_job_id = None
+            self._active_worker_generation = None
 
 
 class WarmAnalyzerRuntime:
@@ -889,6 +1047,7 @@ class WarmAnalyzerRuntime:
                             "killed": False,
                             "process_exitcode": None,
                             "final_alive": False,
+                            "worker_process_alive": False,
                             "finalized": True,
                             "worker_generation": self._supervisors[analyzer_name]._generation,
                             "worker_queue_wait_ms": 0,
@@ -912,62 +1071,99 @@ class WarmAnalyzerRuntime:
 
         results: dict[str, dict[str, Any]] = {}
         worker_states: dict[str, dict[str, Any]] = {}
-        for analyzer_name, future in jobs.items():
-            remaining = max(0.0, deadline_at - time.perf_counter())
-            try:
-                completion = future.result(timeout=remaining)
-            except FuturesTimeoutError:
-                completion = {
-                    "result": _timeout_placeholder(analyzer_name),
-                    "state": {
-                        "state": "finalized",
-                        "child_started": True,
-                        "result_ready": False,
-                        "result_received": False,
-                        "analyzer_error": False,
-                        "process_exited": False,
-                        "timed_out": True,
-                        "alive": False,
-                        "terminated": False,
-                        "killed": False,
-                        "process_exitcode": None,
-                        "final_alive": False,
-                        "finalized": True,
-                        "worker_generation": self._supervisors[analyzer_name]._generation,
-                        "worker_queue_wait_ms": 0,
-                        "worker_dispatch_ms": 0,
-                        "worker_response_ms": 0,
-                        "modality_total_ms": 0,
-                        "worker_restarted": False,
-                    },
-                }
-            except Exception:
-                completion = {
-                    "result": _timeout_placeholder(analyzer_name),
-                    "state": {
-                        "state": "finalized",
-                        "child_started": True,
-                        "result_ready": False,
-                        "result_received": False,
-                        "analyzer_error": True,
-                        "process_exited": False,
-                        "timed_out": True,
-                        "alive": False,
-                        "terminated": False,
-                        "killed": False,
-                        "process_exitcode": None,
-                        "final_alive": False,
-                        "finalized": True,
-                        "worker_generation": self._supervisors[analyzer_name]._generation,
-                        "worker_queue_wait_ms": 0,
-                        "worker_dispatch_ms": 0,
-                        "worker_response_ms": 0,
-                        "modality_total_ms": 0,
-                        "worker_restarted": False,
-                    },
-                }
-            results[analyzer_name] = completion["result"]
-            worker_states[analyzer_name] = completion["state"]
+        pending = {future: analyzer_name for analyzer_name, future in jobs.items()}
+        while pending:
+            remaining = deadline_at - time.perf_counter()
+            if remaining <= 0:
+                break
+            done, _ = futures_wait(list(pending.keys()), timeout=remaining, return_when=concurrent.futures.FIRST_COMPLETED)
+            if not done:
+                break
+            for future in done:
+                analyzer_name = pending.pop(future, None)
+                if analyzer_name is None:
+                    continue
+                try:
+                    completion = future.result()
+                except Exception:
+                    completion = {
+                        "result": _error_placeholder(analyzer_name),
+                        "state": {
+                            "state": "finalized",
+                            "child_started": True,
+                            "result_ready": False,
+                            "result_received": False,
+                            "analyzer_error": True,
+                            "process_exited": False,
+                            "timed_out": False,
+                            "alive": False,
+                            "terminated": False,
+                            "killed": False,
+                            "process_exitcode": None,
+                            "final_alive": False,
+                            "worker_process_alive": False,
+                            "finalized": True,
+                            "worker_generation": self._supervisors[analyzer_name]._generation,
+                            "worker_queue_wait_ms": 0,
+                            "worker_dispatch_ms": 0,
+                            "worker_response_ms": 0,
+                            "modality_total_ms": 0,
+                            "worker_restarted": False,
+                        },
+                    }
+                results[analyzer_name] = completion["result"]
+                worker_states[analyzer_name] = completion["state"]
+                job_id = getattr(future, "_analysis_job_id", None)
+                if isinstance(job_id, str):
+                    self._supervisors[analyzer_name].forget_job(job_id)
+        if pending:
+            with ThreadPoolExecutor(max_workers=len(pending)) as timeout_executor:
+                finalizers: dict[Future, tuple[Future, str, str]] = {}
+                for future, analyzer_name in pending.items():
+                    job_id = getattr(future, "_analysis_job_id", None)
+                    if not isinstance(job_id, str):
+                        job_id = uuid.uuid4().hex
+                    finalizers[
+                        timeout_executor.submit(self._supervisors[analyzer_name].finalize_timed_out_job, job_id)
+                    ] = (future, analyzer_name, job_id)
+                for finalizer in concurrent.futures.as_completed(finalizers):
+                    pending_future, analyzer_name, job_id = finalizers[finalizer]
+                    try:
+                        completion = finalizer.result()
+                    except Exception:
+                        completion = {
+                            "result": _error_placeholder(analyzer_name),
+                            "state": {
+                                "state": "finalized",
+                                "child_started": True,
+                                "result_ready": False,
+                                "result_received": False,
+                                "analyzer_error": True,
+                                "process_exited": False,
+                                "timed_out": False,
+                                "alive": False,
+                                "terminated": False,
+                                "killed": False,
+                                "process_exitcode": None,
+                                "final_alive": False,
+                                "worker_process_alive": False,
+                                "finalized": True,
+                                "worker_generation": self._supervisors[analyzer_name]._generation,
+                                "worker_queue_wait_ms": 0,
+                                "worker_dispatch_ms": 0,
+                                "worker_response_ms": 0,
+                                "modality_total_ms": 0,
+                                "worker_restarted": False,
+                            },
+                        }
+                    results[analyzer_name] = completion["result"]
+                    worker_states[analyzer_name] = completion["state"]
+                    self._supervisors[analyzer_name].forget_job(job_id)
+                    if pending_future.done():
+                        try:
+                            pending_future.result()
+                        except Exception:
+                            pass
         return results, worker_states
 
     def is_ready(self) -> bool:

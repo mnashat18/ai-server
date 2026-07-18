@@ -82,6 +82,11 @@ def _elapsed_ms(started_at: float) -> int:
     return int(round((time.perf_counter() - started_at) * 1000))
 
 
+def _log_audio_perf(scan_id: str | None, metric: str, started_at: float, *, status: str = "ok") -> None:
+    value = 0 if status == "skipped" else _elapsed_ms(started_at)
+    logger.info("[AUDIO_PERF] metric=%s scan_id=%s value=%s status=%s", metric, scan_id, value, status)
+
+
 def _is_string_like(value) -> bool:
     return isinstance(value, str)
 
@@ -144,6 +149,24 @@ def _ensure_1d_float32(values) -> np.ndarray:
     if arr.dtype != np.float32:
         arr = np.ascontiguousarray(arr.astype(np.float32, copy=False))
     return arr
+
+
+def _frame_matrix(samples: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
+    if isinstance(frame_length, bool) or not isinstance(frame_length, int) or frame_length <= 0:
+        raise ValueError("frame_length_must_be_positive")
+    if isinstance(hop_length, bool) or not isinstance(hop_length, int) or hop_length <= 0:
+        raise ValueError("hop_length_must_be_positive")
+    prepared = _ensure_1d_float32(samples)
+    if prepared.size == 0:
+        raise ValueError("audio_signal_empty")
+    pad = frame_length // 2
+    padded = np.pad(prepared, (pad, pad), mode="constant")
+    if padded.size < frame_length:
+        padded = np.pad(padded, (0, frame_length - padded.size), mode="constant")
+    frames = np.lib.stride_tricks.sliding_window_view(padded, frame_length)[::hop_length]
+    if frames.size == 0:
+        frames = padded[-frame_length:][np.newaxis, :]
+    return np.ascontiguousarray(frames)
 
 
 def _safe_mean(values) -> float | None:
@@ -293,6 +316,30 @@ def _mfcc_summary_like(y: np.ndarray, sr: int, *, hop_length: int, n_fft: int) -
         raise RuntimeError("mfcc_feature_failed") from exc
 
 
+def _mfcc_summary_like_from_power(power: np.ndarray, sr: int, *, n_fft: int) -> list[float | None]:
+    if librosa is None:
+        raise RuntimeError("mfcc_feature_failed")
+    try:
+        power_matrix = np.asarray(power, dtype=np.float64)
+        if power_matrix.ndim != 2:
+            raise RuntimeError("mfcc_feature_failed")
+        mel_power = librosa.feature.melspectrogram(S=power_matrix, sr=sr, n_mels=128)
+        mel_db = librosa.power_to_db(mel_power, ref=np.max)
+        mfcc_matrix = librosa.feature.mfcc(S=mel_db, n_mfcc=5)
+        arr = np.asarray(mfcc_matrix, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[0] != 5 or arr.size == 0:
+            raise RuntimeError("mfcc_feature_failed")
+        if not np.isfinite(arr).all():
+            raise RuntimeError("mfcc_feature_failed")
+        return [float(np.mean(row)) for row in arr]
+    except KeyboardInterrupt:
+        raise
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise RuntimeError("mfcc_feature_failed") from exc
+
+
 def _resample_if_needed(y: np.ndarray, sr: int) -> tuple[np.ndarray, int]:
     if sr == TARGET_SAMPLE_RATE:
         return np.ascontiguousarray(y.astype(np.float32, copy=False).reshape(-1)), sr
@@ -343,7 +390,8 @@ def _pcm_bytes_to_float32(raw: bytes, sample_width: int) -> np.ndarray:
     raise ValueError("unsupported_wav_sample_width")
 
 
-def _decode_wav_slice(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
+def _decode_wav_slice(audio_path: str, *, scan_id: str | None = None) -> tuple[np.ndarray, int, float, float, str, int]:
+    open_started = time.perf_counter()
     try:
         with wave.open(audio_path, "rb") as handle:
             source_sr = handle.getframerate()
@@ -363,6 +411,7 @@ def _decode_wav_slice(audio_path: str) -> tuple[np.ndarray, int, float, float, s
             source_duration_seconds = frame_count / float(source_sr)
             frames_to_read = min(frame_count, int(math.ceil(MAX_AUDIO_ANALYSIS_SEC * source_sr)))
             raw = handle.readframes(frames_to_read)
+        _log_audio_perf(scan_id, "audio_open_ms", open_started)
     except _AudioEmptyError:
         raise
     except (wave.Error, EOFError, OSError) as exc:
@@ -370,25 +419,31 @@ def _decode_wav_slice(audio_path: str) -> tuple[np.ndarray, int, float, float, s
 
     if not raw:
         raise _AudioEmptyError("empty_wav")
+    decode_started = time.perf_counter()
     decoded = _pcm_bytes_to_float32(raw, sample_width)
+    _log_audio_perf(scan_id, "audio_decode_ms", decode_started)
     expected_samples = frames_to_read * channels
     if decoded.size != expected_samples:
         raise RuntimeError("audio_decode_failed")
+    mono_started = time.perf_counter()
     if channels > 1:
         if decoded.size % channels != 0:
             raise RuntimeError("audio_decode_failed")
         decoded = decoded.reshape(-1, channels).mean(axis=1)
+    _log_audio_perf(scan_id, "audio_mono_ms", mono_started)
     decoded = np.ascontiguousarray(decoded.astype(np.float32, copy=False).reshape(-1))
     if decoded.size == 0:
         raise _AudioEmptyError("empty_wav")
     if not np.isfinite(decoded).all():
         raise RuntimeError("audio_decode_failed")
+    resample_started = time.perf_counter()
     decoded, sr = _resample_if_needed(decoded, source_sr)
+    _log_audio_perf(scan_id, "audio_resample_ms", resample_started)
     analysis_duration_seconds = decoded.size / float(sr)
     return decoded, sr, source_duration_seconds, analysis_duration_seconds, "wave", frames_to_read
 
 
-def _decode_with_ffmpeg(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
+def _decode_with_ffmpeg(audio_path: str, *, scan_id: str | None = None) -> tuple[np.ndarray, int, float, float, str, int]:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("audio_decode_failed")
@@ -416,6 +471,7 @@ def _decode_with_ffmpeg(audio_path: str) -> tuple[np.ndarray, int, float, float,
             "wav",
             converted_path,
         ]
+        conversion_started = time.perf_counter()
         try:
             subprocess.run(
                 cmd,
@@ -426,7 +482,8 @@ def _decode_with_ffmpeg(audio_path: str) -> tuple[np.ndarray, int, float, float,
             )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError("audio_decode_timeout") from exc
-        return _decode_wav_slice(converted_path)
+        _log_audio_perf(scan_id, "audio_conversion_ms", conversion_started)
+        return _decode_wav_slice(converted_path, scan_id=scan_id)
     except _AudioEmptyError:
         raise
     except TimeoutError:
@@ -442,16 +499,16 @@ def _decode_with_ffmpeg(audio_path: str) -> tuple[np.ndarray, int, float, float,
                 os.remove(converted_path)
 
 
-def _decode_audio_once(audio_path: str) -> tuple[np.ndarray, int, float, float, str, int]:
+def _decode_audio_once(audio_path: str, *, scan_id: str | None = None) -> tuple[np.ndarray, int, float, float, str, int]:
     _, ext = os.path.splitext(audio_path)
     if ext.lower() in {".wav", ".wave"}:
         try:
-            return _decode_wav_slice(audio_path)
+            return _decode_wav_slice(audio_path, scan_id=scan_id)
         except _AudioEmptyError:
             raise
         except Exception:
-            return _decode_with_ffmpeg(audio_path)
-    return _decode_with_ffmpeg(audio_path)
+            return _decode_with_ffmpeg(audio_path, scan_id=scan_id)
+    return _decode_with_ffmpeg(audio_path, scan_id=scan_id)
 
 
 def _prepare_audio_source(audio_path: str) -> tuple[str, str | None]:
@@ -529,31 +586,55 @@ def _voice_clarity_from_features(
     return float(np.clip(score, 0.0, 1.0))
 
 
-def _feature_pipeline(y: np.ndarray, sr: int) -> dict:
+def _feature_pipeline(y: np.ndarray, sr: int, *, scan_id: str | None = None) -> dict:
     if librosa is None:
         raise RuntimeError("audio_decode_failed")
     frame_length = min(2048, max(512, int(sr * 0.032)))
     hop_length = max(256, int(frame_length / 4))
 
     step_started = time.perf_counter()
-    rms = _rms_numpy(y=y, frame_length=frame_length, hop_length=hop_length)
+    frames = _frame_matrix(y, frame_length, hop_length)
+    rms = np.sqrt(np.mean(frames * frames, axis=-1, dtype=np.float64))
+    rms = np.ascontiguousarray(np.asarray(rms, dtype=np.float32).reshape(-1))
+    if not np.isfinite(rms).all():
+        raise ValueError("rms_nonfinite")
+    zcr = np.mean(np.signbit(frames[:, 1:]) != np.signbit(frames[:, :-1]), axis=-1, dtype=np.float64)
+    zcr = np.ascontiguousarray(np.asarray(zcr, dtype=np.float32).reshape(-1))
+    if not np.isfinite(zcr).all():
+        raise ValueError("zcr_nonfinite")
     rms_ms = _elapsed_ms(step_started)
+    _log_audio_perf(scan_id, "audio_energy_ms", step_started)
 
     step_started = time.perf_counter()
-    zcr = _zero_crossing_rate_numpy(y=y, frame_length=frame_length, hop_length=hop_length)
-    zcr_ms = _elapsed_ms(step_started)
+    stft_matrix = librosa.stft(
+        y=y,
+        n_fft=frame_length,
+        hop_length=hop_length,
+        win_length=frame_length,
+        window="hann",
+        center=True,
+        pad_mode="constant",
+    )
+    magnitude = np.asarray(np.abs(stft_matrix), dtype=np.float64)
+    power = magnitude * magnitude
+    centroid_started = time.perf_counter()
+    centroid_matrix = librosa.feature.spectral_centroid(S=magnitude, sr=sr)
+    centroid_arr = _require_librosa_feature_matrix("spectral_centroid", centroid_matrix)
+    centroid = float(np.mean(centroid_arr, axis=1, dtype=np.float64)[0])
+    centroid_ms = _elapsed_ms(centroid_started)
 
-    step_started = time.perf_counter()
-    centroid = _spectral_centroid(y, sr, hop_length=hop_length, n_fft=frame_length)
-    centroid_ms = _elapsed_ms(step_started)
+    flatness_started = time.perf_counter()
+    flatness_matrix = librosa.feature.spectral_flatness(S=magnitude, power=2.0)
+    flatness_arr = _require_librosa_feature_matrix("spectral_flatness", flatness_matrix)
+    flatness = float(np.mean(flatness_arr, axis=1, dtype=np.float64)[0])
+    flatness_ms = _elapsed_ms(flatness_started)
 
-    step_started = time.perf_counter()
-    flatness = _spectral_flatness(y, sr, hop_length=hop_length, n_fft=frame_length)
-    flatness_ms = _elapsed_ms(step_started)
-
-    step_started = time.perf_counter()
-    mfcc_summary = _mfcc_summary_like(y, sr, hop_length=hop_length, n_fft=frame_length)
-    mfcc_ms = _elapsed_ms(step_started)
+    mfcc_started = time.perf_counter()
+    mfcc_summary = _mfcc_summary_like_from_power(power, sr, n_fft=frame_length)
+    mfcc_ms = _elapsed_ms(mfcc_started)
+    spectral_ms = _elapsed_ms(step_started)
+    _log_audio_perf(scan_id, "audio_spectral_ms", step_started)
+    _log_audio_perf(scan_id, "audio_pitch_ms", time.perf_counter(), status="skipped")
 
     derived_started = time.perf_counter()
     peak_volume = float(np.max(np.abs(y))) if y.size else 0.0
@@ -562,8 +643,8 @@ def _feature_pipeline(y: np.ndarray, sr: int) -> dict:
     silence_ratio = float(np.mean(rms < max(MIN_RMS_ENERGY * 0.6, rms_energy * 0.35))) if rms.size else 1.0
     zcr_mean = float(np.mean(zcr)) if zcr.size else 0.0
     rms_variation = float(np.std(rms) / max(rms_energy, 1e-6)) if rms.size else 0.0
-    spectrum = np.abs(np.fft.rfft(y * np.hanning(y.size).astype(np.float32, copy=False))) if y.size else np.asarray([], dtype=np.float32)
-    dominant_concentration = float(np.max(spectrum) / max(float(np.sum(spectrum)), 1e-6)) if spectrum.size else 0.0
+    full_spectrum = np.abs(np.fft.rfft(y * np.hanning(y.size).astype(np.float32, copy=False))) if y.size else np.asarray([], dtype=np.float32)
+    dominant_concentration = float(np.max(full_spectrum) / max(float(np.sum(full_spectrum)), 1e-6)) if full_spectrum.size else 0.0
     tonal_concentration = float(np.clip(0.55 * dominant_concentration + 0.25 * (1.0 - flatness) + 0.20 * clamp01(1.0 - rms_variation / 1.5, 0.0), 0.0, 1.0))
     noise_estimate = float(np.clip(0.65 * flatness + 0.35 * zcr_mean, 0.0, 1.0))
     if rms_energy < MIN_RMS_ENERGY * 0.2 and silence_ratio > 0.95:
@@ -585,6 +666,7 @@ def _feature_pipeline(y: np.ndarray, sr: int) -> dict:
         rms_energy=rms_energy,
         noise_estimate=noise_estimate_value,
     )
+    _log_audio_perf(scan_id, "audio_quality_features_ms", derived_started)
     return {
         "frame_length": frame_length,
         "hop_length": hop_length,
@@ -605,11 +687,12 @@ def _feature_pipeline(y: np.ndarray, sr: int) -> dict:
         "zcr_mean": zcr_mean,
         "timings_ms": {
             "rms_ms": rms_ms,
-            "zcr_ms": zcr_ms,
+            "zcr_ms": rms_ms,
             "spectral_centroid_ms": centroid_ms,
             "spectral_flatness_ms": flatness_ms,
             "mfcc_ms": mfcc_ms,
             "derived_metrics_ms": derived_ms,
+            "spectral_total_ms": spectral_ms,
         },
     }
 
@@ -677,6 +760,7 @@ def _build_success_details(
     sr: int,
     source_duration_seconds: float,
     analyzed_duration_seconds: float,
+    scan_id: str | None = None,
 ) -> dict:
     prepared = _ensure_1d_float32(y)
     if prepared.size == 0:
@@ -684,7 +768,7 @@ def _build_success_details(
     if prepared.size > MAX_AUDIO_SAMPLES:
         raise RuntimeError("audio_decode_failed")
     quality_started = time.perf_counter()
-    features = _feature_pipeline(prepared, sr)
+    features = _feature_pipeline(prepared, sr, scan_id=scan_id)
 
     duration_seconds = float(prepared.size / float(sr))
     if not math.isfinite(duration_seconds) or duration_seconds < 0.0:
@@ -700,6 +784,7 @@ def _build_success_details(
         tonal_concentration=features["tonal_concentration"],
         rms_variation=features["rms_variation"],
     )
+    _log_audio_perf(scan_id, "audio_vad_ms", voice_started)
     voice_activity_ms = _elapsed_ms(voice_started)
     pitch_stability_score = None
     duration_factor = clamp01(duration_seconds / MAX_AUDIO_ANALYSIS_SEC, 0.0) or 0.0
@@ -767,27 +852,37 @@ def _build_success_details(
         },
         "audio_quality_timings_ms": features["timings_ms"],
     }
+    _log_audio_perf(scan_id, "audio_result_build_ms", quality_started)
     return details
 
 
-def analyze_audio(audio_path: str) -> dict:
+def analyze_audio(audio_path: str, *, scan_id: str | None = None) -> dict:
+    total_started = time.perf_counter()
     if _normalize_audio_path(audio_path) is None:
+        _log_audio_perf(scan_id, "audio_path_validation_ms", total_started)
+        _log_audio_perf(scan_id, "audio_total_ms", total_started, status="missing")
         return _failure_result("missing", "audio_missing")
 
+    validation_started = time.perf_counter()
     path_state, normalized_path = _prepare_audio_source(audio_path)
+    _log_audio_perf(scan_id, "audio_path_validation_ms", validation_started, status=path_state)
     if path_state == "missing":
+        _log_audio_perf(scan_id, "audio_total_ms", total_started, status="missing")
         return _failure_result("missing", "audio_missing")
     if path_state == "empty_audio":
+        _log_audio_perf(scan_id, "audio_total_ms", total_started, status="empty_audio")
         return _failure_result("empty_audio", "audio_decode_failed")
     if path_state == "load_failed":
+        _log_audio_perf(scan_id, "audio_total_ms", total_started, status="load_failed")
         return _failure_result("load_failed", "audio_decode_failed")
 
     if librosa is None:
+        _log_audio_perf(scan_id, "audio_total_ms", total_started, status="load_failed")
         return _failure_result("load_failed", "audio_decode_failed")
 
     try:
         decode_started = time.perf_counter()
-        y, sr, source_duration_seconds, analyzed_duration_seconds, decode_backend, decode_count = _decode_audio_once(normalized_path)
+        y, sr, source_duration_seconds, analyzed_duration_seconds, decode_backend, decode_count = _decode_audio_once(normalized_path, scan_id=scan_id)
         decode_ms = _elapsed_ms(decode_started)
         logger.info(
             "[AUDIO_DECODE_DETAIL] backend=%s decode_count=%s source_duration_ms=%s analysis_duration_ms=%s",
@@ -801,14 +896,19 @@ def analyze_audio(audio_path: str) -> dict:
             sr=sr,
             source_duration_seconds=source_duration_seconds,
             analyzed_duration_seconds=analyzed_duration_seconds,
+            scan_id=scan_id,
         )
         details["timings_ms"]["audio_decode_ms"] = decode_ms
+        _log_audio_perf(scan_id, "audio_total_ms", total_started)
         return {"score": details["audio_confidence"], "details": details}
     except TimeoutError:
+        _log_audio_perf(scan_id, "audio_total_ms", total_started, status="timeout")
         return _failure_result("load_failed", "audio_decode_timeout")
     except _AudioEmptyError:
+        _log_audio_perf(scan_id, "audio_total_ms", total_started, status="empty_audio")
         return _failure_result("empty_audio", "audio_decode_failed")
     except Exception:
+        _log_audio_perf(scan_id, "audio_total_ms", total_started, status="load_failed")
         return _failure_result("load_failed", "audio_decode_failed")
 
 
