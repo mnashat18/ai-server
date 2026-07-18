@@ -4,9 +4,9 @@ import multiprocessing
 import os
 import sys
 import time
-import threading
 import types
 from contextlib import ExitStack
+from concurrent.futures import InvalidStateError
 from unittest.mock import MagicMock
 
 from baseline import (
@@ -22,6 +22,7 @@ from utils import sanitize_payload
 import requests
 import analysis_worker
 import analysis_runtime
+import audio
 import scoring
 import video
 import main
@@ -158,6 +159,121 @@ class _FakeRuntime:
     def run_scan(self, scan_id, media, *, deadline_seconds):
         self.run_scan_calls.append((scan_id, media, deadline_seconds))
         return self.run_scan_result
+
+
+class _SubmitOnlySupervisor:
+    def __init__(self, future, generation=1, completion=None):
+        self._future = future
+        self._generation = generation
+        self._completion = completion or {
+            "result": {
+                "score": None,
+                "details": {"status": "load_failed", "audio_warnings": ["audio_timeout"]},
+            },
+            "state": {
+                "timed_out": True,
+                "analyzer_error": False,
+                "final_alive": False,
+                "result_received": False,
+                "worker_restarted": True,
+                "worker_generation": generation,
+                "process_exitcode": -15,
+                "terminated": True,
+                "killed": False,
+            },
+        }
+
+    def submit(self, *, scan_id, path, deadline_at):
+        setattr(self._future, "_analysis_job_id", f"{scan_id}-{id(self)}")
+        return self._future
+
+    def finalize_timed_out_job(self, job_id):
+        return self._completion
+
+    def forget_job(self, job_id):
+        return None
+
+
+class _FakeAudioLibrosa:
+    @staticmethod
+    def _stft(y, n_fft, hop_length, win_length=None, center=True, pad_mode="constant"):
+        win_length = win_length or n_fft
+        samples = audio.np.asarray(y, dtype=audio.np.float32).reshape(-1)
+        pad = n_fft // 2 if center else 0
+        padded = audio.np.pad(samples, (pad, pad), mode=pad_mode)
+        if padded.size < n_fft:
+            padded = audio.np.pad(padded, (0, n_fft - padded.size), mode=pad_mode)
+        frames = audio.np.ascontiguousarray(audio.np.lib.stride_tricks.sliding_window_view(padded, n_fft)[::hop_length])
+        if frames.size == 0:
+            frames = padded[-n_fft:][audio.np.newaxis, :]
+        window = audio.np.hanning(win_length).astype(audio.np.float32, copy=False)
+        if win_length != n_fft:
+            window = audio.np.pad(window, (0, n_fft - win_length), mode="constant")
+        return audio.np.fft.rfft(audio.np.ascontiguousarray(frames * window), axis=-1).T
+
+    class filters:
+        @staticmethod
+        def mel(*, sr, n_fft, n_mels):
+            bins = n_fft // 2 + 1
+            basis = audio.np.zeros((n_mels, bins), dtype=audio.np.float64)
+            band_edges = audio.np.linspace(0, bins - 1, n_mels + 2)
+            for row in range(n_mels):
+                left = int(round(band_edges[row]))
+                center = int(round(band_edges[row + 1]))
+                right = int(round(band_edges[row + 2]))
+                center = max(center, left + 1)
+                right = max(right, center + 1)
+                for col in range(left, min(center + 1, bins)):
+                    basis[row, col] = (col - left) / max(center - left, 1)
+                for col in range(center, min(right + 1, bins)):
+                    basis[row, col] = max(basis[row, col], (right - col) / max(right - center, 1))
+            return basis
+
+    class feature:
+        @staticmethod
+        def spectral_centroid(*, y=None, sr=None, hop_length=512, n_fft=2048, S=None):
+            if S is None:
+                S = _FakeAudioLibrosa._stft(y, n_fft=n_fft, hop_length=hop_length)
+            magnitude = audio.np.asarray(S, dtype=audio.np.float64)
+            freqs = audio.np.fft.rfftfreq(2 * (magnitude.shape[0] - 1), d=1.0 / float(sr))
+            centroid = audio.np.sum(magnitude * freqs[:, audio.np.newaxis], axis=0) / audio.np.maximum(audio.np.sum(magnitude, axis=0), 1e-10)
+            return centroid[audio.np.newaxis, :]
+
+        @staticmethod
+        def spectral_flatness(*, y=None, hop_length=512, n_fft=2048, S=None, power=2.0):
+            if S is None:
+                S = _FakeAudioLibrosa._stft(y, n_fft=n_fft, hop_length=hop_length)
+            magnitude = audio.np.asarray(S, dtype=audio.np.float64) ** power
+            flatness = audio.np.exp(audio.np.mean(audio.np.log(audio.np.maximum(magnitude, 1e-12)), axis=0)) / audio.np.maximum(audio.np.mean(magnitude, axis=0), 1e-12)
+            return flatness[audio.np.newaxis, :]
+
+        @staticmethod
+        def melspectrogram(*, y=None, sr=None, S=None, n_mels=128, n_fft=2048, hop_length=512):
+            if S is None:
+                S = audio.np.abs(_FakeAudioLibrosa._stft(y, n_fft=n_fft, hop_length=hop_length))
+            power = audio.np.asarray(S, dtype=audio.np.float64)
+            mel_basis = _FakeAudioLibrosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
+            return mel_basis @ power
+
+        @staticmethod
+        def mfcc(*, y=None, sr=None, S=None, n_mfcc=5, hop_length=512, n_fft=2048):
+            if S is None:
+                mel_power = _FakeAudioLibrosa.feature.melspectrogram(y=y, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=128)
+                S = _FakeAudioLibrosa.power_to_db(mel_power, ref=audio.np.max)
+            matrix = audio.np.asarray(S, dtype=audio.np.float64)
+            n_mels = matrix.shape[0]
+            mel_indices = audio.np.arange(n_mels, dtype=audio.np.float64) + 0.5
+            basis = audio.np.cos(audio.np.pi / n_mels * audio.np.arange(n_mfcc, dtype=audio.np.float64)[:, audio.np.newaxis] * mel_indices[audio.np.newaxis, :])
+            coeffs = audio.np.sqrt(2.0 / n_mels) * (basis @ matrix)
+            coeffs[0] /= audio.np.sqrt(2.0)
+            return coeffs
+
+    @staticmethod
+    def power_to_db(power, ref=audio.np.max):
+        matrix = audio.np.asarray(power, dtype=audio.np.float64)
+        reference = ref(matrix) if callable(ref) else ref
+        reference = max(float(reference), 1e-10)
+        return 10.0 * audio.np.log10(audio.np.maximum(matrix, 1e-10) / reference)
 
 
 class PipelineTests(unittest.TestCase):
@@ -1543,11 +1659,13 @@ class PipelineTests(unittest.TestCase):
             stack.enter_context(unittest.mock.patch.object(main, "_log_perf", side_effect=lambda *args, **kwargs: None))
             stack.enter_context(unittest.mock.patch.object(main, "_log_validation_decision", side_effect=lambda *args, **kwargs: None))
             stack.enter_context(unittest.mock.patch.object(main, "_log_validation_lifecycle", side_effect=lambda *args, **kwargs: None))
+            transcribe_optional = stack.enter_context(unittest.mock.patch.object(main, "_transcribe_audio_file_optional", MagicMock()))
 
             result = main._process_scan_sync("scan-1")
 
         self.assertEqual(result["status"], main.SCAN_STATUS_COMPLETED)
         write_success.assert_called_once()
+        transcribe_optional.assert_not_called()
 
     def test_process_scan_sync_partial_timeout_with_sufficient_evidence_completes(self):
         with ExitStack() as stack:
@@ -2358,6 +2476,7 @@ class PipelineTests(unittest.TestCase):
                 completion = supervisor._dispatch_job(job)
 
         self.assertTrue(completion["state"]["timed_out"])
+        self.assertFalse(completion["state"]["analyzer_error"])
         self.assertTrue(completion["state"]["terminated"])
         self.assertTrue(completion["state"]["killed"])
         self.assertTrue(completion["state"]["worker_restarted"])
@@ -2384,6 +2503,828 @@ class PipelineTests(unittest.TestCase):
             first[1]["video"]["worker_generation"],
             second[1]["video"]["worker_generation"],
         )
+
+    def test_run_scan_waits_for_pending_future_completion(self):
+        delayed_future = analysis_runtime.Future()
+        video_future = analysis_runtime.Future()
+        video_future.set_result(
+            {
+                "result": {"score": 0.9, "details": {"status": "ok", "analyzer": "video"}},
+                "state": {"timed_out": False, "analyzer_error": False, "final_alive": False, "result_received": True, "worker_generation": 1},
+            }
+        )
+        image_future = analysis_runtime.Future()
+        image_future.set_result(
+            {
+                "result": {"score": 0.9, "details": {"status": "ok", "analyzer": "image"}},
+                "state": {"timed_out": False, "analyzer_error": False, "final_alive": False, "result_received": True, "worker_generation": 1},
+            }
+        )
+
+        runtime = analysis_runtime.WarmAnalyzerRuntime()
+        runtime._started = True
+        runtime._stopped = False
+        runtime._supervisors = {
+            "video": _SubmitOnlySupervisor(video_future),
+            "audio": _SubmitOnlySupervisor(
+                delayed_future,
+                generation=3,
+                completion={
+                    "result": {
+                        "score": None,
+                        "details": {"status": "timeout", "audio_warnings": ["audio_timeout"]},
+                    },
+                    "state": {
+                        "timed_out": True,
+                        "analyzer_error": False,
+                        "result_received": False,
+                        "final_alive": False,
+                        "terminated": True,
+                        "killed": False,
+                        "worker_restarted": True,
+                        "process_exitcode": -15,
+                        "worker_generation": 3,
+                    },
+                },
+            ),
+            "image": _SubmitOnlySupervisor(image_future),
+        }
+
+        started_at = time.perf_counter()
+        results, worker_states = runtime.run_scan(
+            "scan-1",
+            main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"),
+            deadline_seconds=0.01,
+        )
+
+        elapsed = time.perf_counter() - started_at
+        self.assertLess(elapsed, 0.10)
+        self.assertEqual(results["audio"]["details"]["status"], "timeout")
+        self.assertTrue(worker_states["audio"]["timed_out"])
+        self.assertFalse(worker_states["audio"]["analyzer_error"])
+        self.assertTrue(worker_states["audio"]["worker_restarted"])
+        self.assertFalse(worker_states["audio"]["result_received"])
+        self.assertTrue(delayed_future.done())
+        with self.assertRaises(InvalidStateError):
+            delayed_future.set_result(
+                {
+                    "result": {"score": 0.8, "details": {"status": "ok", "analyzer": "audio"}},
+                    "state": {"timed_out": False, "analyzer_error": False, "final_alive": False, "result_received": True, "worker_generation": 1},
+                }
+            )
+
+    def test_timeout_only_affects_the_expired_queued_job_and_not_the_active_job(self):
+        shared_state = {}
+
+        def on_send(payload, state):
+            if payload.get("job_id") == "job-a":
+                return {
+                    "type": "result",
+                    "job_id": "job-a",
+                    "scan_id": "scan-a",
+                    "worker_generation": 1,
+                    "ok": True,
+                    "result": {"score": 0.91, "details": {"status": "ok", "analyzer": "audio"}},
+                    "metrics": {"analyzer_execution_ms": 2, "response_send_ms": 1, "child_entry_ms": 1, "total_worker_ms": 3},
+                }
+            return _FakePipeEndpoint.NO_RESPONSE
+
+        fake_parent_conn = _FakePipeEndpoint(shared_state, on_send=on_send)
+        fake_process = _FakeProcess(target=None, args=(), daemon=True, behavior={"alive_after_start": True})
+        supervisor = analysis_runtime.WorkerSupervisor("audio")
+        supervisor._lock = __import__("threading").RLock()
+        supervisor._started = True
+        supervisor._stopped = False
+        supervisor._ready = True
+        supervisor._generation = 1
+        supervisor._process = fake_process
+        supervisor._parent_conn = fake_parent_conn
+        supervisor._child_conn = object()
+        supervisor._active_job_id = "job-a"
+        supervisor._active_worker_generation = 1
+        supervisor._jobs_by_id = {}
+        supervisor._completed_jobs = analysis_runtime.OrderedDict()
+        supervisor._expired_jobs = analysis_runtime.OrderedDict()
+
+        job_a = analysis_runtime._WorkerJob(
+            job_id="job-a",
+            scan_id="scan-a",
+            path="audio-a.wav",
+            deadline_at=time.perf_counter() + 1.0,
+            submitted_at=time.perf_counter() - 0.05,
+            future=analysis_runtime.Future(),
+            worker_generation=1,
+        )
+        job_b = analysis_runtime._WorkerJob(
+            job_id="job-b",
+            scan_id="scan-b",
+            path="audio-b.wav",
+            deadline_at=time.perf_counter() - 0.01,
+            submitted_at=time.perf_counter() - 0.05,
+            future=analysis_runtime.Future(),
+            worker_generation=1,
+        )
+        supervisor._jobs_by_id = {"job-a": job_a, "job-b": job_b}
+
+        with unittest.mock.patch.object(analysis_runtime, "_wait_handles", side_effect=lambda handles, timeout=None: handles):
+            completion_b = supervisor.finalize_timed_out_job("job-b")
+            completion_a = supervisor._dispatch_job(job_a)
+
+        self.assertTrue(completion_b["state"]["timed_out"])
+        self.assertFalse(completion_b["state"]["analyzer_error"])
+        self.assertFalse(fake_process.terminated)
+        self.assertFalse(fake_process.killed)
+        self.assertEqual(supervisor._jobs_by_id.get("job-a"), job_a)
+        self.assertNotIn("job-b", supervisor._jobs_by_id)
+        self.assertEqual(completion_a["result"]["details"]["status"], "ok")
+        self.assertFalse(completion_a["state"]["timed_out"])
+        self.assertFalse(completion_a["state"]["analyzer_error"])
+        self.assertFalse(fake_process.terminated)
+        self.assertFalse(fake_process.killed)
+
+    def test_run_scan_finalizes_pending_workers_concurrently(self):
+        class _SlowSupervisor:
+            def __init__(self, name):
+                self.name = name
+                self._generation = 9
+                self.finalize_started = []
+                self.finalize_finished = []
+                self.forgotten = []
+
+            def submit(self, *, scan_id, path, deadline_at):
+                future = analysis_runtime.Future()
+                future._analysis_job_id = f"{scan_id}-{self.name}"
+                future._analysis_analyzer_name = self.name
+                self.future = future
+                return future
+
+            def finalize_timed_out_job(self, job_id):
+                self.finalize_started.append(time.perf_counter())
+                time.sleep(0.2)
+                self.finalize_finished.append(time.perf_counter())
+                return {
+                    "result": {
+                        "score": None,
+                        "details": {"status": "timeout", "analyzer": self.name},
+                    },
+                    "state": {
+                        "timed_out": True,
+                        "analyzer_error": False,
+                        "result_received": False,
+                        "final_alive": False,
+                        "terminated": True,
+                        "killed": False,
+                        "worker_restarted": True,
+                        "process_exitcode": -15,
+                        "worker_generation": self._generation,
+                    },
+                }
+
+            def forget_job(self, job_id):
+                self.forgotten.append(job_id)
+
+        runtime = analysis_runtime.WarmAnalyzerRuntime()
+        runtime._started = True
+        runtime._stopped = False
+        supervisors = {name: _SlowSupervisor(name) for name in ("video", "audio", "image")}
+        runtime._supervisors = supervisors
+
+        started_at = time.perf_counter()
+        results, worker_states = runtime.run_scan(
+            "scan-concurrent",
+            main.Media(image="image.jpg", audio="audio.wav", video="video.mp4"),
+            deadline_seconds=0.01,
+        )
+        elapsed = time.perf_counter() - started_at
+
+        self.assertLess(elapsed, 0.45)
+        self.assertTrue(all(result["details"]["status"] == "timeout" for result in results.values()))
+        self.assertTrue(all(state["timed_out"] for state in worker_states.values()))
+        start_times = [supervisors[name].finalize_started[0] for name in supervisors]
+        self.assertLess(max(start_times) - min(start_times), 0.1)
+        self.assertTrue(all(supervisors[name].forgotten for name in supervisors))
+
+    def test_job_registries_stay_bounded_after_many_sequential_jobs(self):
+        supervisor = analysis_runtime.WorkerSupervisor("audio")
+        supervisor._process = None
+        supervisor._parent_conn = None
+        supervisor._child_conn = None
+        supervisor._ready = False
+        supervisor._started = True
+        supervisor._stopped = False
+
+        peak_completed = 0
+        peak_expired = 0
+        with unittest.mock.patch.object(analysis_runtime, "_log_perf", lambda *args, **kwargs: None):
+            for index in range(1000):
+                job = analysis_runtime._WorkerJob(
+                    job_id=f"job-{index}",
+                    scan_id=f"scan-{index}",
+                    path="audio.wav",
+                    deadline_at=time.perf_counter() - 0.01,
+                    submitted_at=time.perf_counter(),
+                    future=analysis_runtime.Future(),
+                )
+                supervisor._jobs_by_id[job.job_id] = job
+                completion = supervisor._finalize_job_locked(
+                    job,
+                    timed_out=True,
+                    analyzer_error=False,
+                    result_received=False,
+                    process_state={"process_exited": True, "alive": False, "terminated": False, "killed": False, "process_exitcode": None},
+                    worker_restarted=False,
+                    child_metrics={},
+                    queue_wait_ms=0,
+                    dispatch_ms=0,
+                    response_ms=0,
+                    cleanup_worker=False,
+                    clear_active=False,
+                )
+                self.assertTrue(job.future.done())
+                self.assertTrue(completion["state"]["timed_out"])
+                peak_completed = max(peak_completed, len(supervisor._completed_jobs))
+                peak_expired = max(peak_expired, len(supervisor._expired_jobs))
+                supervisor.forget_job(job.job_id)
+
+        self.assertLessEqual(peak_completed, supervisor._completed_job_limit)
+        self.assertLessEqual(peak_expired, supervisor._expired_job_limit)
+        self.assertEqual(len(supervisor._completed_jobs), 0)
+        self.assertEqual(len(supervisor._expired_jobs), 0)
+        self.assertEqual(len(supervisor._jobs_by_id), 0)
+
+    def test_process_scan_sync_uses_final_alive_not_worker_process_liveness(self):
+        lifecycle = []
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_resolve_scan_context",
+                    return_value={
+                        "status": main.SCAN_STATUS_MEDIA_READY,
+                        "scan_media": {"id": "media-1"},
+                        "resolved_media": {},
+                        "task_metrics": None,
+                        "expected_phrase": None,
+                        "user": None,
+                        "member": None,
+                        "business_profile": None,
+                        "department": None,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_media", return_value=main.Media(image="image.jpg", audio="audio.wav", video="video.mp4")))
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_task", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main, "_identifier_payload", return_value={"user_id": None, "member_id": None, "business_profile_id": None, "department_id": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_baseline_rows_for_member", return_value=[]))
+            stack.enter_context(unittest.mock.patch.object(main, "baseline_status_payload", return_value={"baseline_status": "inactive", "baseline_confidence": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_expected_phrase", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "local_model_required", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_resolve_media_input", side_effect=lambda path, *args, **kwargs: (path, False)))
+            stack.enter_context(unittest.mock.patch.object(main, "_should_convert_audio", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_run_parallel_analysis",
+                    return_value=(
+                        {
+                            "video": {"score": 0.8, "details": {"status": "ok", "visual_quality_score": 0.8, "visual_warnings": []}},
+                            "audio": {"score": 0.8, "details": {"status": "ok", "audio_quality_score": 0.8, "audio_warnings": [], "timings_ms": {}}},
+                            "image": {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": []}},
+                        },
+                        {
+                            "video": {"timed_out": False, "analyzer_error": False, "final_alive": False, "worker_process_alive": True, "result_received": True, "worker_generation": 1},
+                            "audio": {"timed_out": False, "analyzer_error": False, "final_alive": False, "worker_process_alive": True, "result_received": True, "worker_generation": 1},
+                            "image": {"timed_out": False, "analyzer_error": False, "final_alive": False, "worker_process_alive": True, "result_received": True, "worker_generation": 1},
+                        },
+                    ),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "validate_scan_inputs",
+                    return_value={
+                        "quality_scores": {"phrase_match": 0.9, "audio": 0.8, "video": 0.8, "image": 0.8},
+                        "warnings": [],
+                        "critical_errors": [],
+                        "failure_reason": None,
+                    },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "assess_quality",
+                    return_value={
+                        "warnings": [],
+                        "media_quality": {
+                            "video": {"usable": True, "present": True},
+                            "audio": {"usable": True, "present": True},
+                            "image": {"usable": True, "present": True},
+                        },
+                        "usable_modalities": 3,
+                        "failure_reason": None,
+                        "status": "passed",
+                        "weak": False,
+                        "retake_required": False,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_face_eye_evidence_unreliable", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_result_has_valid_evidence", return_value=True))
+            stack.enter_context(unittest.mock.patch.object(main, "features_from_signals", return_value=({}, {})))
+            stack.enter_context(unittest.mock.patch.object(main, "vector_from_features", return_value=[0.0] * 21))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "predict", return_value={"score": 0.5}))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "compute_result",
+                    return_value={
+                        "readiness_score": 80,
+                        "confidence": 0.8,
+                        "risk_level": "stable",
+                        "suggested_action": "continue_normal_activity",
+                        "explanation": "ok",
+                        "retake_required": False,
+                        "baseline_used": False,
+                        "fusion_details": {"baseline_flags": {}},
+                        "modality_scores": {},
+                        "face_metrics": {"baseline_drifts": {}},
+                        "voice_metrics": {"baseline_drifts": {}},
+                        "reaction_metrics": {"baseline_drifts": {}},
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "baseline_ready_for_personalized_scoring", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "evaluate_baseline_eligibility",
+                    return_value={
+                        "eligible": False,
+                        "capture_quality_score": 0.0,
+                        "measurement_reliability_score": 0.0,
+                        "task_completion_status": "not_required",
+                        "hard_gates_triggered": [],
+                        "reasons": [],
+                    },
+                )
+            )
+            write_success = MagicMock(return_value={"scan_result": "updated:scan-1", "wellness_scan": "updated"})
+            stack.enter_context(unittest.mock.patch.object(main, "_write_success", write_success))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_step", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_perf", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_log_validation_decision",
+                    side_effect=lambda *args, **kwargs: lifecycle.append(("decision", kwargs)),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_log_validation_lifecycle",
+                    side_effect=lambda *args, **kwargs: lifecycle.append(("lifecycle", kwargs)),
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_transcribe_audio_file_optional", MagicMock()))
+
+            result = main._process_scan_sync("scan-1")
+
+        self.assertEqual(result["status"], main.SCAN_STATUS_COMPLETED)
+        lifecycle_entry = next(item for item in lifecycle if item[0] == "lifecycle")
+        self.assertEqual(lifecycle_entry[1]["running_modalities"], [])
+        self.assertTrue(lifecycle_entry[1]["all_workers_terminal"])
+        write_success.assert_called_once()
+
+    def test_process_scan_sync_queued_timeout_is_not_workers_not_terminal(self):
+        lifecycle = []
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_resolve_scan_context",
+                    return_value={
+                        "status": main.SCAN_STATUS_MEDIA_READY,
+                        "scan_media": {"id": "media-1"},
+                        "resolved_media": {},
+                        "task_metrics": None,
+                        "expected_phrase": None,
+                        "user": None,
+                        "member": None,
+                        "business_profile": None,
+                        "department": None,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_media", return_value=main.Media(image="image.jpg", audio="audio.wav", video="video.mp4")))
+            stack.enter_context(unittest.mock.patch.object(main, "_merge_task", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main, "_identifier_payload", return_value={"user_id": None, "member_id": None, "business_profile_id": None, "department_id": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_baseline_rows_for_member", return_value=[]))
+            stack.enter_context(unittest.mock.patch.object(main, "baseline_status_payload", return_value={"baseline_status": "inactive", "baseline_confidence": None}))
+            stack.enter_context(unittest.mock.patch.object(main, "_expected_phrase", return_value=None))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "local_model_required", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_resolve_media_input", side_effect=lambda path, *args, **kwargs: (path, False)))
+            stack.enter_context(unittest.mock.patch.object(main, "_should_convert_audio", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_run_parallel_analysis",
+                    return_value=(
+                        {
+                            "video": {"score": 0.8, "details": {"status": "ok", "visual_quality_score": 0.8, "visual_warnings": []}},
+                            "audio": main._analysis_timeout_placeholder("audio"),
+                            "image": {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": []}},
+                        },
+                        {
+                            "video": {"timed_out": False, "analyzer_error": False, "final_alive": False, "worker_process_alive": True, "result_received": True, "worker_generation": 1},
+                            "audio": {"timed_out": True, "analyzer_error": False, "final_alive": False, "worker_process_alive": True, "result_received": False, "worker_generation": 1},
+                            "image": {"timed_out": False, "analyzer_error": False, "final_alive": False, "worker_process_alive": True, "result_received": True, "worker_generation": 1},
+                        },
+                    ),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "validate_scan_inputs",
+                    return_value={
+                        "quality_scores": {"phrase_match": 0.9, "audio": 0.8, "video": 0.8, "image": 0.8},
+                        "warnings": [],
+                        "critical_errors": [],
+                        "failure_reason": None,
+                    },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "assess_quality",
+                    return_value={
+                        "warnings": [],
+                        "media_quality": {
+                            "video": {"usable": True, "present": True},
+                            "audio": {"usable": False, "present": False},
+                            "image": {"usable": True, "present": True},
+                        },
+                        "usable_modalities": 2,
+                        "failure_reason": None,
+                        "status": "passed",
+                        "weak": False,
+                        "retake_required": False,
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "_face_eye_evidence_unreliable", return_value=False))
+            stack.enter_context(unittest.mock.patch.object(main, "_result_has_valid_evidence", return_value=True))
+            stack.enter_context(unittest.mock.patch.object(main, "features_from_signals", return_value=({}, {})))
+            stack.enter_context(unittest.mock.patch.object(main, "vector_from_features", return_value=[0.0] * 21))
+            stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "predict", return_value={"score": 0.5}))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "compute_result",
+                    return_value={
+                        "readiness_score": 80,
+                        "confidence": 0.8,
+                        "risk_level": "stable",
+                        "suggested_action": "continue_normal_activity",
+                        "explanation": "ok",
+                        "retake_required": False,
+                        "baseline_used": False,
+                        "fusion_details": {"baseline_flags": {}},
+                        "modality_scores": {},
+                        "face_metrics": {"baseline_drifts": {}},
+                        "voice_metrics": {"baseline_drifts": {}},
+                        "reaction_metrics": {"baseline_drifts": {}},
+                    },
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(main, "baseline_ready_for_personalized_scoring", return_value=False))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "evaluate_baseline_eligibility",
+                    return_value={
+                        "eligible": False,
+                        "capture_quality_score": 0.0,
+                        "measurement_reliability_score": 0.0,
+                        "task_completion_status": "not_required",
+                        "hard_gates_triggered": [],
+                        "reasons": [],
+                    },
+                )
+            )
+            write_success = MagicMock(return_value={"scan_result": "updated:scan-1", "wellness_scan": "updated"})
+            stack.enter_context(unittest.mock.patch.object(main, "_write_success", write_success))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_step", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(unittest.mock.patch.object(main, "_log_perf", side_effect=lambda *args, **kwargs: None))
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_log_validation_decision",
+                    side_effect=lambda *args, **kwargs: lifecycle.append(("decision", kwargs)),
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_log_validation_lifecycle",
+                    side_effect=lambda *args, **kwargs: lifecycle.append(("lifecycle", kwargs)),
+                )
+            )
+
+            result = main._process_scan_sync("scan-1")
+
+        self.assertEqual(result["status"], main.SCAN_STATUS_COMPLETED)
+        decision_entry = next(item for item in lifecycle if item[0] == "decision")
+        lifecycle_entry = next(item for item in lifecycle if item[0] == "lifecycle")
+        self.assertNotEqual(decision_entry[1]["terminal_reason"], "workers_not_terminal")
+        self.assertEqual(lifecycle_entry[1]["running_modalities"], [])
+        self.assertTrue(lifecycle_entry[1]["all_workers_terminal"])
+        write_success.assert_called_once()
+
+    def test_audio_analyze_audio_accepts_optional_scan_id(self):
+        decode_calls = []
+        fake_result = {
+            "audio_confidence": 0.9,
+            "timings_ms": {},
+        }
+
+        with unittest.mock.patch.object(audio, "_normalize_audio_path", return_value="clip.wav"):
+            with unittest.mock.patch.object(audio, "_prepare_audio_source", return_value=("ok", "clip.wav")):
+                with unittest.mock.patch.object(audio, "librosa", object()):
+                    with unittest.mock.patch.object(
+                        audio,
+                        "_decode_audio_once",
+                        side_effect=lambda path, scan_id=None: decode_calls.append(scan_id) or (
+                            object(),
+                            16000,
+                            5.0,
+                            3.0,
+                            "wave",
+                            1,
+                        ),
+                    ):
+                        with unittest.mock.patch.object(audio, "_build_success_details", return_value=fake_result):
+                            with unittest.mock.patch.object(audio, "_log_audio_perf"):
+                                default_result = audio.analyze_audio("clip.wav")
+                                scanned_result = audio.analyze_audio("clip.wav", scan_id="scan-1")
+
+        self.assertEqual(decode_calls, [None, "scan-1"])
+        self.assertEqual(default_result["score"], 0.9)
+        self.assertEqual(scanned_result["score"], 0.9)
+
+    def test_audio_decode_happens_once_and_reuses_normalized_samples(self):
+        sentinel = object()
+        captured = {}
+        features = {
+            "rms_energy": 0.03,
+            "noise_estimate": 0.1,
+            "silence_ratio": 0.1,
+            "speech_presence_score": 0.4,
+            "clipping_ratio": 0.0,
+            "tonal_concentration": 0.2,
+            "rms_variation": 0.1,
+            "peak_volume": 0.2,
+            "voice_clarity_score": 0.7,
+            "centroid": 1000.0,
+            "flatness": 0.2,
+            "zcr_mean": 0.1,
+            "mfcc_summary": [0.0] * 5,
+            "timings_ms": {},
+        }
+
+        with unittest.mock.patch.object(audio, "_normalize_audio_path", return_value="clip.wav"):
+            with unittest.mock.patch.object(audio, "_prepare_audio_source", return_value=("ok", "clip.wav")):
+                with unittest.mock.patch.object(audio, "librosa", object()):
+                    with unittest.mock.patch.object(
+                        audio,
+                        "_decode_audio_once",
+                        return_value=(sentinel, 16000, 5.0, 3.0, "wave", 1),
+                        ) as decode_once:
+                        with unittest.mock.patch.object(audio, "_ensure_1d_float32", return_value=sentinel):
+                            def capture_features(y, sr, scan_id=None):
+                                captured["y"] = y
+                                return features
+
+                            with unittest.mock.patch.object(
+                                audio,
+                                "_feature_pipeline",
+                                side_effect=capture_features,
+                            ):
+                                with unittest.mock.patch.object(
+                                    audio,
+                                    "_speech_state_and_warnings",
+                                    return_value=([], "usable_speech", False, True),
+                                ):
+                                    with unittest.mock.patch.object(audio, "_log_audio_perf"):
+                                        audio.analyze_audio("clip.wav", scan_id="scan-1")
+
+        self.assertEqual(decode_once.call_count, 1)
+        self.assertIs(captured["y"], sentinel)
+
+    def test_audio_analyze_audio_does_not_use_nested_worker_or_queue(self):
+        with unittest.mock.patch.object(audio, "_normalize_audio_path", return_value="clip.wav"):
+            with unittest.mock.patch.object(audio, "_prepare_audio_source", return_value=("ok", "clip.wav")):
+                with unittest.mock.patch.object(audio, "librosa", object()):
+                    with unittest.mock.patch.object(
+                        audio,
+                        "_decode_audio_once",
+                        return_value=(object(), 16000, 5.0, 3.0, "wave", 1),
+                    ):
+                        with unittest.mock.patch.object(
+                            audio,
+                            "_build_success_details",
+                            return_value={"audio_confidence": 0.9, "timings_ms": {}},
+                        ):
+                            with unittest.mock.patch.object(audio, "analyze_audio_worker", side_effect=AssertionError("nested worker not allowed")):
+                                with unittest.mock.patch.object(audio, "_log_audio_perf"):
+                                    result = audio.analyze_audio("clip.wav", scan_id="scan-1")
+
+        self.assertEqual(result["score"], 0.9)
+
+    def test_audio_substep_logs_are_sanitized(self):
+        log_messages = []
+
+        def capture_log(message, *args, **kwargs):
+            log_messages.append(message % args if args else message)
+
+        with unittest.mock.patch.object(audio, "_normalize_audio_path", return_value="clip.wav"):
+            with unittest.mock.patch.object(audio, "_prepare_audio_source", return_value=("ok", "clip.wav")):
+                with unittest.mock.patch.object(audio, "librosa", object()):
+                    with unittest.mock.patch.object(
+                        audio,
+                        "_decode_audio_once",
+                        return_value=(object(), 16000, 5.0, 3.0, "wave", 1),
+                    ):
+                        with unittest.mock.patch.object(
+                            audio,
+                            "_build_success_details",
+                            return_value={"audio_confidence": 0.9, "timings_ms": {}},
+                        ):
+                            with unittest.mock.patch.object(audio.logger, "info", side_effect=capture_log):
+                                with unittest.mock.patch.object(audio, "_log_audio_perf", wraps=audio._log_audio_perf):
+                                    audio.analyze_audio("clip.wav", scan_id="scan-1")
+
+        combined = "\n".join(log_messages)
+        self.assertIn("scan-1", combined)
+        self.assertNotIn("clip.wav", combined)
+        self.assertNotIn("token=", combined)
+
+    def test_audio_feature_pipeline_reuses_shared_frame_matrix_and_preserves_reference_values(self):
+        sr = 16000
+        duration_seconds = 5.0
+        sample_count = int(sr * duration_seconds)
+        base_time = audio.np.linspace(0.0, duration_seconds, sample_count, endpoint=False)
+        signals = [
+            ("silence", audio.np.zeros(sample_count, dtype=audio.np.float32)),
+            ("single_sine", audio.np.asarray(audio.np.sin(2.0 * audio.np.pi * 220.0 * base_time), dtype=audio.np.float32)),
+            (
+                "multi_tone",
+                audio.np.asarray(
+                    0.55 * audio.np.sin(2.0 * audio.np.pi * 180.0 * base_time)
+                    + 0.33 * audio.np.sin(2.0 * audio.np.pi * 420.0 * base_time)
+                    + 0.12 * audio.np.sin(2.0 * audio.np.pi * 860.0 * base_time),
+                    dtype=audio.np.float32,
+                ),
+            ),
+            (
+                "voice_like",
+                audio.np.asarray(
+                    (0.20 + 0.12 * audio.np.sin(2.0 * audio.np.pi * 1.7 * base_time))
+                    * (
+                        0.55 * audio.np.sin(2.0 * audio.np.pi * 140.0 * base_time)
+                        + 0.30 * audio.np.sin(2.0 * audio.np.pi * 280.0 * base_time)
+                        + 0.15 * audio.np.sin(2.0 * audio.np.pi * 420.0 * base_time)
+                    ),
+                    dtype=audio.np.float32,
+                ),
+            ),
+            ("clipped", audio.np.asarray(audio.np.clip(1.15 * audio.np.sin(2.0 * audio.np.pi * 260.0 * base_time), -1.0, 1.0), dtype=audio.np.float32)),
+            (
+                "noise",
+                audio.np.asarray(
+                    audio.np.random.default_rng(42).normal(0.0, 0.08, sample_count),
+                    dtype=audio.np.float32,
+                ),
+            ),
+        ]
+
+        class _FakeFilters:
+            @staticmethod
+            def mel(*, sr, n_fft, n_mels):
+                bins = n_fft // 2 + 1
+                basis = audio.np.zeros((n_mels, bins), dtype=audio.np.float64)
+                band_edges = audio.np.linspace(0, bins - 1, n_mels + 2)
+                for row in range(n_mels):
+                    left = int(round(band_edges[row]))
+                    center = int(round(band_edges[row + 1]))
+                    right = int(round(band_edges[row + 2]))
+                    center = max(center, left + 1)
+                    right = max(right, center + 1)
+                    for col in range(left, min(center + 1, bins)):
+                        basis[row, col] = (col - left) / max(center - left, 1)
+                    for col in range(center, min(right + 1, bins)):
+                        basis[row, col] = max(basis[row, col], (right - col) / max(right - center, 1))
+                return basis
+
+        class _FakeLibrosa:
+            filters = _FakeFilters()
+
+            @staticmethod
+            def power_to_db(power, ref=audio.np.max):
+                matrix = audio.np.asarray(power, dtype=audio.np.float64)
+                reference = ref(matrix) if callable(ref) else ref
+                reference = max(float(reference), 1e-10)
+                return 10.0 * audio.np.log10(audio.np.maximum(matrix, 1e-10) / reference)
+
+        frame_matrix_calls = []
+        original_frame_matrix = audio._frame_matrix
+
+        def spy_frame_matrix(samples_value, frame_length, hop_length):
+            frame_matrix_calls.append((frame_length, hop_length))
+            return original_frame_matrix(samples_value, frame_length, hop_length)
+
+        with unittest.mock.patch.object(audio, "librosa", _FakeAudioLibrosa):
+            for label, samples in signals:
+                frame_matrix_calls.clear()
+                frame_length = min(2048, max(512, int(sr * 0.032)))
+                hop_length = max(256, int(frame_length / 4))
+                reference = {
+                    "rms": audio._rms_numpy(samples, frame_length=frame_length, hop_length=hop_length),
+                    "zcr": audio._zero_crossing_rate_numpy(samples, frame_length=frame_length, hop_length=hop_length),
+                    "centroid": audio._spectral_centroid(samples, sr, hop_length=hop_length, n_fft=frame_length),
+                    "flatness": audio._spectral_flatness(samples, sr, hop_length=hop_length, n_fft=frame_length),
+                    "mfcc_summary": audio._mfcc_summary_like(samples, sr, hop_length=hop_length, n_fft=frame_length),
+                }
+                reference["rms_energy"] = float(audio.np.mean(reference["rms"])) if reference["rms"].size else 0.0
+                reference["silence_ratio"] = float(audio.np.mean(reference["rms"] < max(audio.MIN_RMS_ENERGY * 0.6, reference["rms_energy"] * 0.35))) if reference["rms"].size else 1.0
+                reference["zcr_mean"] = float(audio.np.mean(reference["zcr"])) if reference["zcr"].size else 0.0
+                reference["rms_variation"] = float(audio.np.std(reference["rms"]) / max(reference["rms_energy"], 1e-6)) if reference["rms"].size else 0.0
+                reference["full_spectrum"] = audio.np.abs(audio.np.fft.rfft(samples * audio.np.hanning(samples.size).astype(audio.np.float32, copy=False))) if samples.size else audio.np.asarray([], dtype=audio.np.float32)
+                reference["dominant_concentration"] = float(audio.np.max(reference["full_spectrum"]) / max(float(audio.np.sum(reference["full_spectrum"])), 1e-6)) if reference["full_spectrum"].size else 0.0
+                reference["tonal_concentration"] = float(audio.np.clip(0.55 * reference["dominant_concentration"] + 0.25 * (1.0 - reference["flatness"]) + 0.20 * audio.clamp01(1.0 - reference["rms_variation"] / 1.5, 0.0), 0.0, 1.0))
+
+                with unittest.mock.patch.object(audio, "_frame_matrix", side_effect=spy_frame_matrix):
+                    features = audio._feature_pipeline(samples, sr, scan_id=f"scan-{label}")
+
+                self.assertEqual(len(frame_matrix_calls), 1, msg=label)
+                self.assertAlmostEqual(features["rms_energy"], reference["rms_energy"], delta=1e-6, msg=label)
+                self.assertAlmostEqual(features["silence_ratio"], reference["silence_ratio"], delta=1e-6, msg=label)
+                self.assertAlmostEqual(features["zcr_mean"], reference["zcr_mean"], delta=1e-6, msg=label)
+                self.assertAlmostEqual(features["centroid"], reference["centroid"], delta=1e-6, msg=label)
+                self.assertAlmostEqual(features["flatness"], reference["flatness"], delta=1e-6, msg=label)
+                self.assertAlmostEqual(features["tonal_concentration"], reference["tonal_concentration"], delta=1e-6, msg=label)
+                for actual, expected in zip(features["mfcc_summary"], reference["mfcc_summary"]):
+                    self.assertAlmostEqual(actual, expected, delta=1e-6, msg=label)
+                self.assertGreaterEqual(features["audio_confidence"], 0.0, msg=label)
+
+    def test_audio_analyze_audio_decodes_once_when_success_details_are_stubbed(self):
+        frame_calls = []
+        original_frame_matrix = audio._frame_matrix
+
+        def spy_frame_matrix(samples_value, frame_length, hop_length):
+            frame_calls.append((frame_length, hop_length))
+            return original_frame_matrix(samples_value, frame_length, hop_length)
+
+        fake_result = {
+            "audio_confidence": 0.9,
+            "timings_ms": {},
+        }
+        decode_once = MagicMock(return_value=(audio.np.zeros(16, dtype=audio.np.float32), 16000, 5.0, 3.0, "wave", 1))
+
+        with unittest.mock.patch.object(audio, "_normalize_audio_path", return_value="clip.wav"):
+            with unittest.mock.patch.object(audio, "_prepare_audio_source", return_value=("ok", "clip.wav")):
+                with unittest.mock.patch.object(audio, "librosa", _FakeLibrosa):
+                    with unittest.mock.patch.object(audio, "_frame_matrix", side_effect=spy_frame_matrix):
+                        with unittest.mock.patch.object(audio, "_decode_audio_once", decode_once):
+                            with unittest.mock.patch.object(audio, "_build_success_details", return_value=fake_result):
+                                with unittest.mock.patch.object(audio, "_log_audio_perf"):
+                                    result = audio.analyze_audio("clip.wav", scan_id="scan-1")
+
+        self.assertEqual(result["score"], 0.9)
+        decode_once.assert_called_once()
+        self.assertEqual(len(frame_calls), 0)
+
+    def test_worker_supervisor_startup_timeout_defaults_to_fifteen_seconds(self):
+        supervisor = analysis_runtime.WorkerSupervisor("audio")
+        self.assertEqual(supervisor._startup_timeout_seconds, 15.0)
+
+    def test_worker_supervisor_startup_fails_closed_without_ready(self):
+        fake_context = _FakeContext(behaviors=[{"invoke_target": False, "alive_after_start": True, "alive_after_target": True}])
+
+        with unittest.mock.patch.object(analysis_runtime.multiprocessing, "get_context", return_value=fake_context):
+            with unittest.mock.patch.object(analysis_runtime, "_wait_handles", return_value=[]):
+                supervisor = analysis_runtime.WorkerSupervisor("audio", worker_entry=analysis_runtime._smoke_worker_main)
+                with self.assertRaises(analysis_runtime.AnalysisRuntimeStartupError):
+                    supervisor.start()
+
+        self.assertEqual(len(fake_context.processes), 1)
+        self.assertTrue(fake_context.processes[0].terminated or fake_context.processes[0].killed)
 
 
 

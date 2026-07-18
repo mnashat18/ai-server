@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import time
 from typing import Any
 
@@ -113,6 +114,19 @@ def _structured_success_payload(
     }
 
 
+def _invoke_analyzer(analyzer: Any, analyzer_name: str, path: str, scan_id: str | None) -> Any:
+    if analyzer_name == "audio":
+        try:
+            signature = inspect.signature(analyzer)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None:
+            parameters = signature.parameters
+            if "scan_id" in parameters or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+                return analyzer(path, scan_id=scan_id)
+    return analyzer(path)
+
+
 def worker_main(result_conn: Any, analyzer_name: str, worker_generation: int) -> None:
     started_at = time.perf_counter()
     analyzer = None
@@ -200,7 +214,7 @@ def worker_main(result_conn: Any, analyzer_name: str, worker_generation: int) ->
             else:
                 try:
                     execution_started_at = time.perf_counter()
-                    result = analyzer(path)
+                    result = _invoke_analyzer(analyzer, analyzer_name, path, scan_id)
                 except Exception as exc:
                     payload = _structured_error_payload(
                         analyzer_name=analyzer_name,
