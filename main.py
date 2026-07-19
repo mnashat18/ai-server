@@ -1050,11 +1050,13 @@ def _run_parallel_analysis(
     media: Media,
 ) -> tuple[dict, dict[str, dict[str, Any]]]:
     runtime = get_analyzer_runtime()
+    runtime_started = time.perf_counter()
     analysis_results, worker_states = runtime.run_scan(
         scan_id,
         media,
         deadline_seconds=MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS,
     )
+    _log_perf(scan_id, "analyzer_runtime_call_ms", _elapsed_ms(runtime_started))
     return {
         "video": analysis_results.get("video") or _analysis_worker_placeholder("video"),
         "audio": analysis_results.get("audio") or _analysis_worker_placeholder("audio"),
@@ -1473,6 +1475,28 @@ def _resolve_media_input(
             FAILURE_REASON_DIRECTUS_DOWNLOAD_FAILED,
             f"{media_kind} download failed: {exc}",
         ) from exc
+
+
+def _resolve_media_input_timed(
+    scan_id: str,
+    value: str | None,
+    suffix: str,
+    media_kind: str,
+    *,
+    allow_url: bool = True,
+    allow_local_path: bool = True,
+) -> tuple[str | None, bool]:
+    started_at = time.perf_counter()
+    try:
+        return _resolve_media_input(
+            value,
+            suffix,
+            media_kind,
+            allow_url=allow_url,
+            allow_local_path=allow_local_path,
+        )
+    finally:
+        _log_perf(scan_id, f"{media_kind}_resolution_ms", _elapsed_ms(started_at))
 
 
 def _resolve_scan_context(scan_id: str) -> dict:
@@ -2449,7 +2473,13 @@ def _required_modality_gate(
             continue
         required_modalities.append(modality)
         if modality in timed_out_modalities:
-            continue
+            if modality == "audio":
+                return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, required_modalities
+            if modality == "video":
+                return FAILURE_REASON_VIDEO_MISSING, required_modalities
+            if modality == "image":
+                return FAILURE_REASON_IMAGE_MISSING, required_modalities
+            return FAILURE_REASON_MISSING_MEDIA, required_modalities
         modality_quality = media_quality.get(modality) or {}
         if modality == "audio" and "audio_decode_timeout" in set(modality_quality.get("warnings") or []):
             return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, required_modalities
@@ -2466,10 +2496,38 @@ def _required_modality_gate(
     return None, required_modalities
 
 
+def _required_full_multimodal_evidence_failure(
+    *,
+    result: dict[str, Any],
+    worker_states: dict[str, dict[str, Any]],
+    valid_modalities: list[str],
+) -> str | None:
+    if not (VALIDATION_POLICY.require_video and VALIDATION_POLICY.require_audio and VALIDATION_POLICY.require_image):
+        return None
+    required = {"video", "audio", "image"}
+    valid = set(valid_modalities)
+    if not required.issubset(valid):
+        if "audio" not in valid:
+            audio_state = worker_states.get("audio") or {}
+            if audio_state.get("timed_out"):
+                return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT
+            return FAILURE_REASON_AUDIO_MISSING
+        if "video" not in valid:
+            return FAILURE_REASON_VIDEO_MISSING
+        if "image" not in valid:
+            return FAILURE_REASON_IMAGE_MISSING
+        return FAILURE_REASON_MISSING_MEDIA
+    if result.get("voice_confidence") is None:
+        return FAILURE_REASON_AUDIO_MISSING
+    return None
+
+
 def _process_scan_sync(scan_id: str) -> dict[str, Any]:
     total_started = time.perf_counter()
     _log_step(scan_id, "validation_start")
+    stage_started = time.perf_counter()
     scan_context = _resolve_scan_context(scan_id)
+    _log_perf(scan_id, "scan_context_resolution_ms", _elapsed_ms(stage_started))
     _log_step(scan_id, "scan_context_loaded", status=scan_context.get("status"))
 
     media_row = scan_context.get("scan_media") or directus.get_scan_media(scan_id)
@@ -2530,9 +2588,9 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             thread_name_prefix="media-download",
         )
         download_futures = {
-            "image": download_executor.submit(_resolve_media_input, media.image, ".jpg", "image", allow_url=False, allow_local_path=False),
-            "audio": download_executor.submit(_resolve_media_input, media.audio, ".bin", "audio", allow_url=False, allow_local_path=False),
-            "video": download_executor.submit(_resolve_media_input, media.video, ".mp4", "video", allow_url=False, allow_local_path=False),
+            "image": download_executor.submit(_resolve_media_input_timed, scan_id, media.image, ".jpg", "image", allow_url=False, allow_local_path=False),
+            "audio": download_executor.submit(_resolve_media_input_timed, scan_id, media.audio, ".bin", "audio", allow_url=False, allow_local_path=False),
+            "video": download_executor.submit(_resolve_media_input_timed, scan_id, media.video, ".mp4", "video", allow_url=False, allow_local_path=False),
         }
         done, not_done = concurrent.futures.wait(
             list(download_futures.values()),
@@ -2570,11 +2628,17 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             if path and is_temp:
                 temp_files.append(path)
         if audio_path and _should_convert_audio(audio_path):
+            conversion_started = time.perf_counter()
             converted = _convert_audio_to_wav(audio_path)
+            _log_perf(scan_id, "audio_conversion_ms", _elapsed_ms(conversion_started))
             temp_files.append(converted)
             audio_path = converted
+        else:
+            _log_perf(scan_id, "audio_conversion_ms", 0)
         resolved_media = Media(image=image_path, audio=audio_path, video=video_path)
-        _log_perf(scan_id, "media_download_ms", _elapsed_ms(stage_started))
+        media_resolution_ms = _elapsed_ms(stage_started)
+        _log_perf(scan_id, "media_resolution_total_ms", media_resolution_ms)
+        _log_perf(scan_id, "media_download_ms", media_resolution_ms)
         _log_step(
             scan_id,
             "media_download_done",
@@ -2590,6 +2654,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             scan_id,
             resolved_media,
         )
+        validation_post_runtime_started = time.perf_counter()
         timed_out_modalities = [
             modality
             for modality, state in worker_states.items()
@@ -2744,6 +2809,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             terminal_reason=terminal_reason,
         )
         _log_validation_lifecycle(scan_id, all_workers_terminal=all_workers_terminal, running_modalities=running_modalities)
+        _log_perf(scan_id, "validation_post_runtime_ms", _elapsed_ms(validation_post_runtime_started))
 
         if terminal_failure_reason:
             validation_result = fail_validation(terminal_failure_reason, warnings=quality_result.get("warnings"))
@@ -2784,8 +2850,11 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
         _log_step(scan_id, "validation_completed", scores=phrase_validation["quality_scores"], warnings=quality_result.get("warnings"))
         _log_step(scan_id, "analysis_start")
         stage_started = time.perf_counter()
+        fusion_started = time.perf_counter()
         feature_map, _ = features_from_signals(raw_signals, task=task)
         feature_vector = vector_from_features(feature_map)
+        _log_perf(scan_id, "feature_fusion_ms", _elapsed_ms(fusion_started))
+        classification_started = time.perf_counter()
         ml_result = ml_runtime.predict(feature_vector)
         preview_result = compute_result(
             signals=raw_signals,
@@ -2814,6 +2883,7 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             quality=quality_result,
             ml_result=ml_result,
         )
+        _log_perf(scan_id, "classification_ms", _elapsed_ms(classification_started))
         result.update(
             {
                 "spoken_transcript": transcript,
@@ -2853,6 +2923,27 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             result=result,
             baseline_eligibility=baseline_eligibility,
         )
+        full_evidence_failure = _required_full_multimodal_evidence_failure(
+            result=result,
+            worker_states=worker_states,
+            valid_modalities=valid_modalities,
+        )
+        if full_evidence_failure:
+            validation_result = fail_validation(full_evidence_failure, warnings=quality_result.get("warnings"))
+            _log_validation_decision(
+                scan_id,
+                valid_modalities=valid_modalities,
+                timed_out_modalities=timed_out_modalities,
+                terminal_reason="required_full_multimodal_evidence_missing",
+            )
+            _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=phrase_validation["quality_scores"])
+            _log_step(scan_id, "directus_writeback_start")
+            writeback_started = time.perf_counter()
+            terminal_writeback_status = _mark_scan_failed_terminal(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            validation_result["writeback_status"] = terminal_writeback_status
+            _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
+            _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
+            return {"status": SCAN_STATUS_FAILED, **validation_result}
         if not _result_has_valid_evidence(result):
             validation_result = fail_validation(quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA, warnings=quality_result.get("warnings"))
             _log_validation_decision(
