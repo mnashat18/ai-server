@@ -69,6 +69,39 @@ def _prewarm_analyzer(analyzer_name: str) -> dict[str, Any]:
     return prewarm_audio_analyzer()
 
 
+def _startup_failure_payload(
+    *,
+    analyzer_name: str,
+    worker_generation: int,
+    started_at: float,
+    analyzer_import_ms: int | None,
+    error_type: str,
+    terminal_reason: str,
+    failure_stage: str,
+    prewarm_metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metrics = {
+        "child_entry_ms": _elapsed_ms(started_at),
+        "analyzer_import_ms": analyzer_import_ms,
+        "total_worker_ms": _elapsed_ms(started_at),
+        "terminal_reason": terminal_reason,
+        "failure_stage": failure_stage,
+    }
+    if analyzer_name == "audio":
+        metrics["audio_import_ms"] = analyzer_import_ms
+        metrics.update(prewarm_metrics or {})
+    return {
+        "type": "ready",
+        "ok": False,
+        "analyzer": analyzer_name,
+        "worker_generation": worker_generation,
+        "error_type": error_type,
+        "terminal_reason": terminal_reason,
+        "failure_stage": failure_stage,
+        "metrics": metrics,
+    }
+
+
 def _ready_payload(
     analyzer_name: str,
     worker_generation: int,
@@ -165,39 +198,74 @@ def _invoke_analyzer(analyzer: Any, analyzer_name: str, path: str, scan_id: str 
 def worker_main(result_conn: Any, analyzer_name: str, worker_generation: int) -> None:
     started_at = time.perf_counter()
     analyzer = None
+    analyzer_import_ms = None
+    prewarm_metrics: dict[str, Any] = {}
     try:
         import_started_at = time.perf_counter()
-        analyzer = _load_analyzer_callable(analyzer_name)
+        try:
+            analyzer = _load_analyzer_callable(analyzer_name)
+        except Exception:
+            analyzer_import_ms = _elapsed_ms(import_started_at)
+            raise RuntimeError(f"{analyzer_name}_import_failed") from None
         analyzer_import_ms = _elapsed_ms(import_started_at)
-        prewarm_metrics = _prewarm_analyzer(analyzer_name)
+        try:
+            prewarm_metrics = _prewarm_analyzer(analyzer_name)
+        except Exception as exc:
+            terminal_reason = getattr(exc, "terminal_reason", f"{analyzer_name}_prewarm_failed")
+            failure_stage = getattr(exc, "failure_stage", "prewarm")
+            prewarm_metrics = getattr(exc, "metrics", {}) if isinstance(getattr(exc, "metrics", {}), dict) else {}
+            raise RuntimeError(f"{terminal_reason}|{failure_stage}") from exc
         if analyzer_name == "audio" and prewarm_metrics.get("audio_warm_benchmark_passed") is not True:
-            raise RuntimeError("audio_prewarm_failed")
+            prewarm_metrics["audio_prewarm_terminal_reason"] = "audio_prewarm_second_result_invalid"
+            prewarm_metrics["audio_prewarm_failure_stage"] = "warm_benchmark_validation"
+            raise RuntimeError("audio_prewarm_second_result_invalid|warm_benchmark_validation")
         ready = _ready_payload(analyzer_name, worker_generation, started_at, analyzer_import_ms, prewarm_metrics)
         try:
             result_conn.send(ready)
-        except Exception:
+        except Exception as exc:
+            logger.error(
+                "analysis_worker_start_failed analyzer=%s worker_generation=%s failure_stage=ready_publish error_type=%s terminal_reason=%s elapsed_startup_ms=%s",
+                analyzer_name,
+                worker_generation,
+                type(exc).__name__,
+                f"{analyzer_name}_ready_publish_failed",
+                _elapsed_ms(started_at),
+            )
             return
     except Exception as exc:
         error_type = type(exc).__name__
+        raw_reason = str(exc)
+        terminal_reason = f"{analyzer_name}_startup_failed"
+        failure_stage = "startup"
+        if raw_reason.endswith("_import_failed"):
+            terminal_reason = raw_reason
+            failure_stage = "import"
+        elif "|" in raw_reason:
+            terminal_reason, failure_stage = raw_reason.split("|", 1)
+        elif analyzer_name == "audio":
+            terminal_reason = str(prewarm_metrics.get("audio_prewarm_terminal_reason") or "audio_prewarm_failed")
+            failure_stage = str(prewarm_metrics.get("audio_prewarm_failure_stage") or "prewarm")
         logger.error(
-            "analysis_worker_start_failed analyzer=%s error_type=%s",
+            "analysis_worker_start_failed analyzer=%s worker_generation=%s failure_stage=%s error_type=%s terminal_reason=%s elapsed_startup_ms=%s",
             analyzer_name,
+            worker_generation,
+            failure_stage,
             error_type,
+            terminal_reason,
+            _elapsed_ms(started_at),
         )
         try:
             result_conn.send(
-                {
-                    "type": "ready",
-                    "ok": False,
-                    "analyzer": analyzer_name,
-                    "worker_generation": worker_generation,
-                    "error_type": error_type,
-                    "metrics": {
-                        "child_entry_ms": _elapsed_ms(started_at),
-                        "analyzer_import_ms": None,
-                        "total_worker_ms": _elapsed_ms(started_at),
-                    },
-                }
+                _startup_failure_payload(
+                    analyzer_name=analyzer_name,
+                    worker_generation=worker_generation,
+                    started_at=started_at,
+                    analyzer_import_ms=analyzer_import_ms,
+                    error_type=error_type,
+                    terminal_reason=terminal_reason,
+                    failure_stage=failure_stage,
+                    prewarm_metrics=prewarm_metrics,
+                )
             )
         except Exception:
             pass
