@@ -133,6 +133,14 @@ FAILURE_REASON_DIRECTUS_DOWNLOAD_FAILED = "directus_download_failed"
 FAILURE_REASON_ANALYSIS_EXCEPTION = "analysis_exception"
 FAILURE_REASON_WRITEBACK_FAILED = "writeback_failed"
 
+_FULL_EVIDENCE_RESULT_KEY_ALLOWLIST = (
+    "face_metrics",
+    "fusion_details",
+    "modality_scores",
+    "voice_confidence",
+    "voice_metrics",
+)
+
 OPTIONAL_SCAN_RESULT_FIELDS = [
     "analysis_metadata",
     "media_quality",
@@ -1120,6 +1128,109 @@ def _result_has_valid_evidence(result: dict[str, Any]) -> bool:
         ):
             return True
     return False
+
+
+def _raw_analysis_has_valid_evidence(
+    modality: str,
+    result: dict[str, Any],
+    worker_state: dict[str, Any],
+) -> bool:
+    if not isinstance(result, dict) or not isinstance(worker_state, dict):
+        return False
+    if (
+        worker_state.get("result_received") is not True
+        or worker_state.get("timed_out") is True
+        or worker_state.get("analyzer_error") is True
+        or worker_state.get("final_alive") is True
+    ):
+        return False
+
+    details = result.get("details")
+    if not isinstance(details, dict) or details.get("status") != "ok":
+        return False
+
+    confidence_key = {
+        "video": "visual_confidence",
+        "audio": "audio_confidence",
+        "image": "image_confidence",
+    }.get(modality)
+    quality_key = {
+        "video": "visual_quality_score",
+        "audio": "audio_quality_score",
+        "image": "image_quality_score",
+    }.get(modality)
+    if confidence_key is None or quality_key is None:
+        return False
+    if not _finite_result_score(details.get(confidence_key)) or not _finite_result_score(details.get(quality_key)):
+        return False
+    if modality in {"video", "audio"}:
+        duration = details.get("duration_seconds")
+        if duration is None and modality == "audio":
+            duration = details.get("duration_sec")
+        if not _finite_result_score(duration) or float(duration) < 0.0:
+            return False
+    return True
+
+
+def _fused_result_valid_modalities(
+    result: dict[str, Any],
+    *,
+    raw_valid_modalities: list[str],
+) -> list[str]:
+    raw_valid = set(raw_valid_modalities)
+    profiles = ((result.get("fusion_details") or {}).get("signal_profiles") or {})
+    modality_scores = result.get("modality_scores") or {}
+    face_metrics = result.get("face_metrics") or {}
+    voice_metrics = result.get("voice_metrics") or {}
+    metric_scores = {
+        "video": face_metrics.get("video_score"),
+        "audio": voice_metrics.get("voice_score"),
+        "image": face_metrics.get("image_score"),
+    }
+
+    valid: list[str] = []
+    for modality in ("video", "audio", "image"):
+        profile = profiles.get(modality) if isinstance(profiles, dict) else None
+        if (
+            modality in raw_valid
+            and isinstance(profile, dict)
+            and profile.get("present") is True
+            and _finite_result_score(profile.get("score"))
+            and _finite_result_score(modality_scores.get(modality))
+            and _finite_result_score(metric_scores[modality])
+        ):
+            valid.append(modality)
+    return valid
+
+
+def _log_full_evidence_gate(
+    scan_id: str,
+    *,
+    result: dict[str, Any],
+    worker_states: dict[str, dict[str, Any]],
+    valid_modalities: list[str],
+) -> None:
+    valid = set(valid_modalities)
+    voice_confidence = result.get("voice_confidence")
+    logger.info(
+        "[FULL_EVIDENCE_GATE] scan_id=%s video_evidence_present=%s audio_evidence_present=%s "
+        "image_evidence_present=%s voice_confidence_present=%s voice_confidence_numeric=%s "
+        "video_timeout=%s audio_timeout=%s image_timeout=%s video_analyzer_error=%s "
+        "audio_analyzer_error=%s image_analyzer_error=%s final_result_keys=%s",
+        scan_id,
+        "video" in valid,
+        "audio" in valid,
+        "image" in valid,
+        voice_confidence is not None,
+        _finite_result_score(voice_confidence),
+        bool((worker_states.get("video") or {}).get("timed_out")),
+        bool((worker_states.get("audio") or {}).get("timed_out")),
+        bool((worker_states.get("image") or {}).get("timed_out")),
+        bool((worker_states.get("video") or {}).get("analyzer_error")),
+        bool((worker_states.get("audio") or {}).get("analyzer_error")),
+        bool((worker_states.get("image") or {}).get("analyzer_error")),
+        [key for key in _FULL_EVIDENCE_RESULT_KEY_ALLOWLIST if key in result],
+    )
 
 
 def _build_scan_result_response(
@@ -2517,7 +2628,7 @@ def _required_full_multimodal_evidence_failure(
         if "image" not in valid:
             return FAILURE_REASON_IMAGE_MISSING
         return FAILURE_REASON_MISSING_MEDIA
-    if result.get("voice_confidence") is None:
+    if not _finite_result_score(result.get("voice_confidence")):
         return FAILURE_REASON_AUDIO_MISSING
     return None
 
@@ -2758,11 +2869,16 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             quality_result["retake_required"] = True
             quality_result["suggested_action"] = "rescan_recommended"
 
-        valid_modalities = [
+        raw_valid_modalities = [
             modality
             for modality, result in analysis_results.items()
-            if _result_has_valid_evidence(result)
+            if _raw_analysis_has_valid_evidence(
+                modality,
+                result,
+                worker_states.get(modality) or {},
+            )
         ]
+        valid_modalities = list(raw_valid_modalities)
         analyzer_error_modalities = [
             modality
             for modality, state in worker_states.items()
@@ -2922,6 +3038,16 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             validation_result=phrase_validation,
             result=result,
             baseline_eligibility=baseline_eligibility,
+        )
+        valid_modalities = _fused_result_valid_modalities(
+            result,
+            raw_valid_modalities=raw_valid_modalities,
+        )
+        _log_full_evidence_gate(
+            scan_id,
+            result=result,
+            worker_states=worker_states,
+            valid_modalities=valid_modalities,
         )
         full_evidence_failure = _required_full_multimodal_evidence_failure(
             result=result,

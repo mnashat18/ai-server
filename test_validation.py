@@ -20,6 +20,7 @@ def _video_result(**overrides):
         "duration_seconds": 5.0,
         "brightness_score": 0.8,
         "sharpness_score": 0.8,
+        "visual_confidence": 0.82,
         "visual_quality_score": 0.8,
         "face_or_subject_visibility": 0.8,
         "face_frames": 20,
@@ -54,6 +55,7 @@ def _image_result(**overrides):
         "status": "ok",
         "brightness_score": 0.82,
         "sharpness_score": 0.84,
+        "image_confidence": 0.81,
         "image_quality_score": 0.83,
         "face_detected": True,
         "image_warnings": [],
@@ -98,11 +100,6 @@ class _ReadyRuntimeForAnalysis:
         results = {}
         for name, result in self._results.items():
             copied = dict(result)
-            score = copied.get("score")
-            if name == "audio":
-                copied.setdefault("voice_metrics", {"voice_score": score})
-            else:
-                copied.setdefault("face_metrics", {f"{name}_score": score})
             results[name] = copied
         return results, {name: dict(state) for name in ("video", "audio", "image")}
 
@@ -2357,14 +2354,20 @@ class MainPayloadTests(unittest.TestCase):
                         "task_performance_score": None,
                         "baseline_used": False,
                         "confidence_drift": 0.0,
-                        "face_metrics": {"face_score": 0.8, "baseline_drifts": {}},
+                        "face_metrics": {"face_score": 0.8, "video_score": 0.8, "image_score": 0.8, "baseline_drifts": {}},
                         "voice_metrics": {"voice_score": 0.8, "baseline_drifts": {}},
                         "reaction_metrics": {"reaction_score": None, "baseline_drifts": {}},
                         "explanation": "ok",
                         "suggested_action": "continue_normal_activity",
                         "ai_model_version": "cie_v1_2",
-                        "modality_scores": {},
-                        "fusion_details": {},
+                        "modality_scores": {"video": 0.8, "audio": 0.8, "image": 0.8},
+                        "fusion_details": {
+                            "signal_profiles": {
+                                "video": {"present": True, "score": 0.8},
+                                "audio": {"present": True, "score": 0.8},
+                                "image": {"present": True, "score": 0.8},
+                            }
+                        },
                     },
                 ), patch.object(
                     main.directus,

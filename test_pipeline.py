@@ -1,5 +1,6 @@
 import unittest
 import json
+import math
 import multiprocessing
 import os
 import sys
@@ -31,6 +32,63 @@ import main
 
 def _signal(score, details):
     return {"score": score, "details": details}
+
+
+def _production_multimodal_results():
+    return {
+        "video": _signal(
+            0.7666,
+            {
+                "status": "ok",
+                "visual_confidence": 0.7666,
+                "visual_quality_score": 0.8,
+                "duration_seconds": 5.0,
+                "visual_warnings": [],
+                "face_frames": 10,
+                "sampled_frames": 12,
+                "face_or_subject_visibility": 0.8,
+            },
+        ),
+        "audio": _signal(
+            0.9158,
+            {
+                "status": "ok",
+                "audio_confidence": 0.9158,
+                "audio_quality_score": 0.82,
+                "duration_seconds": 4.0,
+                "audio_warnings": [],
+                "rms_energy": 0.03,
+                "zero_crossing_rate": 0.08,
+                "spectral_centroid": 1200.0,
+                "silent": False,
+            },
+        ),
+        "image": _signal(
+            0.8969,
+            {
+                "status": "ok",
+                "image_confidence": 0.8969,
+                "image_quality_score": 0.83,
+                "image_warnings": [],
+                "face_detected": True,
+                "avg_ear": 0.3,
+            },
+        ),
+    }
+
+
+def _successful_worker_states():
+    return {
+        modality: {
+            "result_received": True,
+            "timed_out": False,
+            "analyzer_error": False,
+            "final_alive": False,
+            "process_exitcode": 0,
+            "worker_generation": 1,
+        }
+        for modality in ("video", "audio", "image")
+    }
 
 
 class _FakePipeEndpoint:
@@ -1960,7 +2018,7 @@ class PipelineTests(unittest.TestCase):
             result = main._process_scan_sync("scan-1")
 
         self.assertEqual(result["status"], main.SCAN_STATUS_FAILED)
-        self.assertEqual(result["failure_reason"], main.FAILURE_REASON_AUDIO_MISSING)
+        self.assertEqual(result["failure_reason"], main.FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT)
         write_success.assert_not_called()
         transcribe_optional.assert_not_called()
 
@@ -2192,7 +2250,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["failure_reason"], "validation_timeout")
         mark_failed_terminal.assert_called_once()
 
-    def test_process_scan_sync_success_path_returns_completed(self):
+    def test_process_scan_sync_production_scores_preserve_full_multimodal_evidence(self):
         with ExitStack() as stack:
             stack.enter_context(
                 unittest.mock.patch.object(
@@ -2224,18 +2282,7 @@ class PipelineTests(unittest.TestCase):
                 unittest.mock.patch.object(
                     main,
                     "_run_parallel_analysis",
-                    return_value=(
-                        {
-                            "video": {"score": 0.8, "details": {"status": "ok", "visual_quality_score": 0.8, "visual_warnings": []}},
-                            "audio": {"score": 0.8, "details": {"status": "ok", "audio_quality_score": 0.8, "audio_warnings": [], "timings_ms": {}}},
-                            "image": {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": []}},
-                        },
-                        {
-                            "video": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
-                            "audio": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
-                            "image": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
-                        },
-                    ),
+                    return_value=(_production_multimodal_results(), _successful_worker_states()),
                 )
             )
             stack.enter_context(
@@ -2271,31 +2318,9 @@ class PipelineTests(unittest.TestCase):
             )
             stack.enter_context(unittest.mock.patch.object(main, "_required_modality_gate", return_value=(None, ["video", "audio", "image"])))
             stack.enter_context(unittest.mock.patch.object(main, "_face_eye_evidence_unreliable", return_value=False))
-            stack.enter_context(unittest.mock.patch.object(main, "_result_has_valid_evidence", return_value=True))
             stack.enter_context(unittest.mock.patch.object(main, "features_from_signals", return_value=({}, {})))
             stack.enter_context(unittest.mock.patch.object(main, "vector_from_features", return_value=[0.0] * 21))
             stack.enter_context(unittest.mock.patch.object(main.ml_runtime, "predict", return_value={"score": 0.5}))
-            stack.enter_context(
-                unittest.mock.patch.object(
-                    main,
-                    "compute_result",
-                    return_value={
-                        "readiness_score": 80,
-                        "confidence": 0.8,
-                        "voice_confidence": 0.8,
-                        "risk_level": "stable",
-                        "suggested_action": "continue_normal_activity",
-                        "explanation": "ok",
-                        "retake_required": False,
-                        "baseline_used": False,
-                        "fusion_details": {"baseline_flags": {}},
-                        "modality_scores": {},
-                        "face_metrics": {"baseline_drifts": {}},
-                        "voice_metrics": {"baseline_drifts": {}},
-                        "reaction_metrics": {"baseline_drifts": {}},
-                    },
-                )
-            )
             stack.enter_context(
                 unittest.mock.patch.object(
                     main,
@@ -2319,6 +2344,7 @@ class PipelineTests(unittest.TestCase):
             )
             write_success = MagicMock(return_value={"scan_result": "updated:scan-1", "wellness_scan": "updated"})
             stack.enter_context(unittest.mock.patch.object(main, "_write_success", write_success))
+            mark_failed_terminal = stack.enter_context(unittest.mock.patch.object(main, "_mark_scan_failed_terminal"))
             stack.enter_context(unittest.mock.patch.object(main, "_log_step", side_effect=lambda *args, **kwargs: None))
             stack.enter_context(unittest.mock.patch.object(main, "_log_perf", side_effect=lambda *args, **kwargs: None))
             stack.enter_context(unittest.mock.patch.object(main, "_log_validation_decision", side_effect=lambda *args, **kwargs: None))
@@ -2330,6 +2356,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["status"], main.SCAN_STATUS_COMPLETED)
         self.assertNotEqual(result["status"], main.SCAN_STATUS_PROCESSING)
         write_success.assert_called_once()
+        mark_failed_terminal.assert_not_called()
+        written_result = write_success.call_args.kwargs["result"]
+        self.assertEqual(written_result["voice_confidence"], 0.9158)
+        self.assertEqual(written_result["modality_scores"]["video"], 0.7666)
+        self.assertEqual(written_result["modality_scores"]["audio"], 0.9158)
+        self.assertEqual(written_result["modality_scores"]["image"], 0.8969)
         upsert_baseline.assert_not_called()
 
     def test_process_scan_sync_writeback_failure_without_recovery_attempts_terminal_failed_update(self):
@@ -2364,18 +2396,7 @@ class PipelineTests(unittest.TestCase):
                 unittest.mock.patch.object(
                     main,
                     "_run_parallel_analysis",
-                    return_value=(
-                        {
-                            "video": {"score": 0.8, "details": {"status": "ok", "visual_quality_score": 0.8, "visual_warnings": []}},
-                            "audio": {"score": 0.8, "details": {"status": "ok", "audio_quality_score": 0.8, "audio_warnings": [], "timings_ms": {}}},
-                            "image": {"score": 0.8, "details": {"status": "ok", "image_quality_score": 0.8, "image_warnings": []}},
-                        },
-                        {
-                            "video": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
-                            "audio": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
-                            "image": {"timed_out": False, "alive": False, "terminated": False, "killed": False, "process_exitcode": 0},
-                        },
-                    ),
+                    return_value=(_production_multimodal_results(), _successful_worker_states()),
                 )
             )
             stack.enter_context(
@@ -2455,6 +2476,13 @@ class PipelineTests(unittest.TestCase):
                         "hard_gates_triggered": [],
                         "reasons": [],
                     },
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
+                    "_fused_result_valid_modalities",
+                    return_value=["video", "audio", "image"],
                 )
             )
             write_failure = main.ProcessingError(main.FAILURE_REASON_WRITEBACK_FAILED, "RuntimeError")
@@ -3340,6 +3368,13 @@ class PipelineTests(unittest.TestCase):
             stack.enter_context(
                 unittest.mock.patch.object(
                     main,
+                    "_fused_result_valid_modalities",
+                    return_value=["video", "audio", "image"],
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    main,
                     "_resolve_scan_context",
                     return_value={
                         "status": main.SCAN_STATUS_MEDIA_READY,
@@ -4044,6 +4079,132 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(reason, main.FAILURE_REASON_AUDIO_MISSING)
+
+    def test_production_multimodal_schema_survives_validation_fusion_and_classification(self):
+        analysis_results = _production_multimodal_results()
+        worker_states = _successful_worker_states()
+        media = main.Media(video="video.mp4", audio="audio.wav", image="image.jpg")
+
+        validation_result = main.validate_scan_inputs(
+            policy=main.VALIDATION_POLICY,
+            media=media,
+            video_result=analysis_results["video"],
+            audio_result=analysis_results["audio"],
+            image_result=analysis_results["image"],
+            expected_phrase=None,
+            transcript=None,
+        )
+        self.assertTrue(validation_result["passed"])
+
+        raw_valid_modalities = [
+            modality
+            for modality, result in analysis_results.items()
+            if main._raw_analysis_has_valid_evidence(modality, result, worker_states[modality])
+        ]
+        signals = {
+            "video": analysis_results["video"],
+            "voice": analysis_results["audio"],
+            "camera": analysis_results["image"],
+        }
+        quality_result = assess_quality(signals, speech_required=False)
+        result = compute_result(
+            signals=signals,
+            task=None,
+            previous_confidence=None,
+            baseline=None,
+            baseline_used=False,
+            quality=quality_result,
+            ml_result={"confidence": 0.5},
+        )
+        valid_modalities = main._fused_result_valid_modalities(
+            result,
+            raw_valid_modalities=raw_valid_modalities,
+        )
+
+        self.assertEqual(raw_valid_modalities, ["video", "audio", "image"])
+        self.assertEqual(valid_modalities, ["video", "audio", "image"])
+        self.assertIsInstance(result["voice_confidence"], float)
+        self.assertTrue(math.isfinite(result["voice_confidence"]))
+        self.assertIsNone(
+            main._required_full_multimodal_evidence_failure(
+                result=result,
+                worker_states=worker_states,
+                valid_modalities=valid_modalities,
+            )
+        )
+
+    def test_full_multimodal_gate_rejects_missing_timeout_error_and_noncanonical_audio(self):
+        base_results = _production_multimodal_results()
+        base_states = _successful_worker_states()
+        signals = {
+            "video": base_results["video"],
+            "voice": base_results["audio"],
+            "camera": base_results["image"],
+        }
+        fused = compute_result(
+            signals=signals,
+            task=None,
+            previous_confidence=None,
+            baseline=None,
+            baseline_used=False,
+            quality=assess_quality(signals, speech_required=False),
+            ml_result=None,
+        )
+
+        negative_cases = []
+        missing_results = _production_multimodal_results()
+        missing_results["audio"] = {"score": None, "details": {"status": "missing"}}
+        negative_cases.append(("missing", missing_results, _successful_worker_states(), main.FAILURE_REASON_AUDIO_MISSING))
+
+        timeout_results = _production_multimodal_results()
+        timeout_results["audio"] = main._analysis_worker_placeholder("audio")
+        timeout_states = _successful_worker_states()
+        timeout_states["audio"]["result_received"] = False
+        timeout_states["audio"]["timed_out"] = True
+        negative_cases.append(("timeout", timeout_results, timeout_states, main.FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT))
+
+        error_results = _production_multimodal_results()
+        error_results["audio"] = main._analysis_worker_placeholder("audio")
+        error_states = _successful_worker_states()
+        error_states["audio"]["result_received"] = False
+        error_states["audio"]["analyzer_error"] = True
+        negative_cases.append(("analyzer_error", error_results, error_states, main.FAILURE_REASON_AUDIO_MISSING))
+
+        score_only_results = _production_multimodal_results()
+        score_only_results["audio"]["details"].pop("audio_confidence")
+        negative_cases.append(("score_only", score_only_results, _successful_worker_states(), main.FAILURE_REASON_AUDIO_MISSING))
+
+        for label, analysis_results, worker_states, expected_reason in negative_cases:
+            with self.subTest(label=label):
+                raw_valid = [
+                    modality
+                    for modality, result in analysis_results.items()
+                    if main._raw_analysis_has_valid_evidence(modality, result, worker_states[modality])
+                ]
+                valid_modalities = main._fused_result_valid_modalities(
+                    fused,
+                    raw_valid_modalities=raw_valid,
+                )
+                self.assertNotIn("audio", valid_modalities)
+                self.assertEqual(
+                    main._required_full_multimodal_evidence_failure(
+                        result=fused,
+                        worker_states=worker_states,
+                        valid_modalities=valid_modalities,
+                    ),
+                    expected_reason,
+                )
+
+        no_voice_confidence = dict(fused)
+        no_voice_confidence["voice_confidence"] = None
+        self.assertEqual(
+            main._required_full_multimodal_evidence_failure(
+                result=no_voice_confidence,
+                worker_states=base_states,
+                valid_modalities=["video", "audio", "image"],
+            ),
+            main.FAILURE_REASON_AUDIO_MISSING,
+        )
 
     def test_successful_audio_populates_voice_confidence_and_enters_fusion(self):
         signals = {
