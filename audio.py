@@ -4,11 +4,13 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import wave
 from contextlib import suppress
+from typing import Any
 
 import numpy as np
 
@@ -78,6 +80,14 @@ class _AudioEmptyError(RuntimeError):
     pass
 
 
+class AudioPrewarmError(RuntimeError):
+    def __init__(self, terminal_reason: str, *, failure_stage: str, metrics: dict[str, Any] | None = None):
+        super().__init__(terminal_reason)
+        self.terminal_reason = terminal_reason
+        self.failure_stage = failure_stage
+        self.metrics = metrics or {}
+
+
 def _elapsed_ms(started_at: float) -> int:
     return int(round((time.perf_counter() - started_at) * 1000))
 
@@ -112,12 +122,34 @@ def _write_deterministic_prewarm_wav(path: str) -> None:
         handle.writeframes(pcm.tobytes())
 
 
-def prewarm_audio_analyzer() -> dict[str, int | bool]:
+def _prewarm_result_summary(result: dict | None) -> dict[str, Any]:
+    details = result.get("details") if isinstance(result, dict) else {}
+    if not isinstance(details, dict):
+        details = {}
+    return {
+        "status": details.get("status"),
+        "audio_warnings": list(details.get("audio_warnings") or []),
+        "audio_confidence": details.get("audio_confidence"),
+        "duration_seconds": details.get("duration_seconds"),
+        "rms_energy": details.get("rms_energy"),
+        "spectral_centroid": details.get("spectral_centroid"),
+        "zero_crossing_rate": details.get("zero_crossing_rate"),
+        "mfcc_length": len(details.get("mfcc_summary") or []) if isinstance(details.get("mfcc_summary"), list) else 0,
+    }
+
+
+def _raise_audio_prewarm_error(terminal_reason: str, *, failure_stage: str, metrics: dict[str, Any]) -> None:
+    metrics["audio_prewarm_terminal_reason"] = terminal_reason
+    metrics["audio_prewarm_failure_stage"] = failure_stage
+    raise AudioPrewarmError(terminal_reason, failure_stage=failure_stage, metrics=dict(metrics))
+
+
+def prewarm_audio_analyzer() -> dict[str, Any]:
     fd = None
     path = None
     first_result: dict | None = None
     second_result: dict | None = None
-    metrics: dict[str, int | bool] = {
+    metrics: dict[str, Any] = {
         "audio_prewarm_first_call_ms": 0,
         "audio_prewarm_second_call_ms": 0,
         "audio_prewarm_decode_ms": 0,
@@ -128,21 +160,61 @@ def prewarm_audio_analyzer() -> dict[str, int | bool]:
         "audio_prewarm_mfcc_ms": 0,
         "audio_prewarm_total_ms": 0,
         "audio_warm_benchmark_passed": False,
+        "audio_prewarm_temp_deleted": False,
+        "audio_prewarm_terminal_reason": None,
+        "audio_prewarm_failure_stage": None,
     }
     total_started = time.perf_counter()
     try:
-        fd, path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        fd = None
-        _write_deterministic_prewarm_wav(path)
+        try:
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            fd = None
+            _write_deterministic_prewarm_wav(path)
+        except Exception:
+            _raise_audio_prewarm_error(
+                "audio_prewarm_file_generation_failed",
+                failure_stage="file_generation",
+                metrics=metrics,
+            )
 
         first_started = time.perf_counter()
-        first_result = analyze_audio(path, scan_id=None)
+        try:
+            first_result = analyze_audio(path, scan_id=None)
+        except Exception:
+            metrics["audio_prewarm_first_call_ms"] = _elapsed_ms(first_started)
+            _raise_audio_prewarm_error(
+                "audio_prewarm_first_call_failed",
+                failure_stage="first_call",
+                metrics=metrics,
+            )
         metrics["audio_prewarm_first_call_ms"] = _elapsed_ms(first_started)
+        metrics["audio_prewarm_first_result"] = _prewarm_result_summary(first_result)
+        if not _audio_prewarm_result_valid(first_result):
+            _raise_audio_prewarm_error(
+                "audio_prewarm_first_result_invalid",
+                failure_stage="first_result_validation",
+                metrics=metrics,
+            )
 
         second_started = time.perf_counter()
-        second_result = analyze_audio(path, scan_id=None)
+        try:
+            second_result = analyze_audio(path, scan_id=None)
+        except Exception:
+            metrics["audio_prewarm_second_call_ms"] = _elapsed_ms(second_started)
+            _raise_audio_prewarm_error(
+                "audio_prewarm_second_call_failed",
+                failure_stage="second_call",
+                metrics=metrics,
+            )
         metrics["audio_prewarm_second_call_ms"] = _elapsed_ms(second_started)
+        metrics["audio_prewarm_second_result"] = _prewarm_result_summary(second_result)
+        if not _audio_prewarm_result_valid(second_result):
+            _raise_audio_prewarm_error(
+                "audio_prewarm_second_result_invalid",
+                failure_stage="second_result_validation",
+                metrics=metrics,
+            )
 
         details = second_result.get("details") if isinstance(second_result, dict) else {}
         timings = details.get("timings_ms") if isinstance(details, dict) else {}
@@ -153,16 +225,33 @@ def prewarm_audio_analyzer() -> dict[str, int | bool]:
         metrics["audio_prewarm_spectral_ms"] = int(quality_timings.get("spectral_total_ms") or 0)
         metrics["audio_prewarm_mel_ms"] = int(quality_timings.get("mel_ms") or 0)
         metrics["audio_prewarm_mfcc_ms"] = int(quality_timings.get("mfcc_transform_ms") or quality_timings.get("mfcc_ms") or 0)
-        metrics["audio_warm_benchmark_passed"] = _audio_prewarm_result_valid(first_result) and _audio_prewarm_result_valid(second_result)
+        metrics["audio_warm_benchmark_passed"] = True
         return metrics
     finally:
         metrics["audio_prewarm_total_ms"] = _elapsed_ms(total_started)
+        cleanup_failed = False
         if fd is not None:
-            with suppress(Exception):
+            try:
                 os.close(fd)
+            except Exception:
+                cleanup_failed = True
         if path:
-            with suppress(Exception):
+            try:
                 os.remove(path)
+                metrics["audio_prewarm_temp_deleted"] = True
+            except FileNotFoundError:
+                metrics["audio_prewarm_temp_deleted"] = True
+            except Exception:
+                cleanup_failed = True
+        if cleanup_failed:
+            metrics["audio_prewarm_terminal_reason"] = "audio_prewarm_cleanup_failed"
+            metrics["audio_prewarm_failure_stage"] = "cleanup"
+            if sys.exc_info()[0] is None:
+                raise AudioPrewarmError(
+                    "audio_prewarm_cleanup_failed",
+                    failure_stage="cleanup",
+                    metrics=dict(metrics),
+                )
 
 
 def _audio_prewarm_result_valid(result: dict | None) -> bool:

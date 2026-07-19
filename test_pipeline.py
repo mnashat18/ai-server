@@ -3,6 +3,7 @@ import json
 import multiprocessing
 import os
 import sys
+import tempfile
 import time
 import types
 from contextlib import ExitStack
@@ -124,6 +125,81 @@ class _FakeContext:
         return process
 
 
+class _AsyncFakeProcess:
+    def __init__(self, target, args, daemon, behavior=None):
+        self.target = target
+        self.args = args
+        self.daemon = daemon
+        self.behavior = behavior or {}
+        self.sentinel = object()
+        self.started = False
+        self.terminated = False
+        self.killed = False
+        self.closed = False
+        self.exitcode = None
+        self._alive = False
+        self._thread = None
+
+    def start(self):
+        self.started = True
+        self._alive = True
+
+        def runner():
+            try:
+                if self.target is not None:
+                    self.target(*self.args)
+                if self.exitcode is None:
+                    self.exitcode = 0
+            finally:
+                if not self.behavior.get("stay_alive_after_target", True):
+                    self._alive = False
+
+        import threading as _threading
+
+        self._thread = _threading.Thread(target=runner, daemon=True)
+        self._thread.start()
+
+    def is_alive(self):
+        return bool(self._alive)
+
+    def terminate(self):
+        self.terminated = True
+        self._alive = False
+        self.exitcode = -15
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+        self.exitcode = -9
+
+    def join(self, timeout=None):
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def close(self):
+        self.closed = True
+
+
+class _AsyncFakeContext:
+    def __init__(self, behaviors=None):
+        self.behaviors = list(behaviors or [])
+        self.processes = []
+        self.parent_conns = []
+
+    def Pipe(self, duplex=False):
+        shared_state = {"payload": None, "ready": False}
+        parent = _FakePipeEndpoint(shared_state)
+        child = _FakePipeEndpoint(shared_state)
+        self.parent_conns.append(parent)
+        return parent, child
+
+    def Process(self, target, args, daemon):
+        behavior = self.behaviors.pop(0) if self.behaviors else {}
+        process = _AsyncFakeProcess(target, args, daemon, behavior)
+        self.processes.append(process)
+        return process
+
+
 class _ReadyThenEOFConn:
     def __init__(self):
         self.sent = []
@@ -137,6 +213,53 @@ class _ReadyThenEOFConn:
 
     def close(self):
         self.closed = True
+
+
+class _SlowStartupSupervisor:
+    def __init__(self, name, delay_seconds, startup_timeout_seconds):
+        self.name = name
+        self.delay_seconds = delay_seconds
+        self._startup_timeout_seconds = startup_timeout_seconds
+        self.ready = False
+        self.shutdown_called = False
+
+    def start(self, *, startup_cancel_token=None):
+        if startup_cancel_token is not None and startup_cancel_token.is_cancelled():
+            raise analysis_runtime.AnalysisRuntimeStartupError(f"{self.name}_worker_start_cancelled")
+        time.sleep(self.delay_seconds)
+        if startup_cancel_token is not None and startup_cancel_token.is_cancelled():
+            raise analysis_runtime.AnalysisRuntimeStartupError(f"{self.name}_worker_start_cancelled")
+        self.ready = True
+        return {
+            "worker_generation": 1,
+            "spawn_metrics": {
+                "ready_wait_ms": int(round(self.delay_seconds * 1000)),
+                "analyzer_import_ms": int(round(self.delay_seconds * 1000)),
+                "audio_import_ms": int(round(self.delay_seconds * 1000)) if self.name == "audio" else None,
+                "audio_prewarm_first_call_ms": 9000 if self.name == "audio" else None,
+                "audio_prewarm_second_call_ms": 1000 if self.name == "audio" else None,
+                "audio_prewarm_total_ms": 10000 if self.name == "audio" else None,
+            },
+        }
+
+    @property
+    def delay_seconds(self):
+        return self._delay_seconds
+
+    @delay_seconds.setter
+    def delay_seconds(self, value):
+        self._delay_seconds = float(value)
+
+    def health(self):
+        return {
+            "ready": self.ready,
+            "worker_generation": 1 if self.ready else 0,
+            "process_alive": self.ready,
+        }
+
+    def shutdown(self):
+        self.shutdown_called = True
+        self.ready = False
 
 
 class _ProbeRLock:
@@ -3793,6 +3916,35 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(conn.sent), 1)
         self.assertEqual(conn.sent[0]["type"], "ready")
         self.assertFalse(conn.sent[0]["ok"])
+        self.assertEqual(conn.sent[0]["terminal_reason"], "audio_prewarm_second_result_invalid")
+
+    def test_audio_worker_ready_failure_reason_distinguishes_import_failed(self):
+        conn = _ReadyThenEOFConn()
+
+        with unittest.mock.patch.object(analysis_worker, "_load_analyzer_callable", side_effect=RuntimeError("boom")):
+            analysis_worker.worker_main(conn, "audio", 1)
+
+        self.assertEqual(conn.sent[0]["type"], "ready")
+        self.assertFalse(conn.sent[0]["ok"])
+        self.assertEqual(conn.sent[0]["terminal_reason"], "audio_import_failed")
+        self.assertEqual(conn.sent[0]["failure_stage"], "import")
+
+    def test_audio_worker_ready_failure_reason_distinguishes_first_call_failed(self):
+        conn = _ReadyThenEOFConn()
+        error = audio.AudioPrewarmError(
+            "audio_prewarm_first_call_failed",
+            failure_stage="first_call",
+            metrics={"audio_prewarm_first_call_ms": 3},
+        )
+
+        with unittest.mock.patch.object(analysis_worker, "_load_analyzer_callable", return_value=lambda path, scan_id=None: {}):
+            with unittest.mock.patch.object(analysis_worker, "_prewarm_analyzer", side_effect=error):
+                analysis_worker.worker_main(conn, "audio", 1)
+
+        self.assertEqual(conn.sent[0]["type"], "ready")
+        self.assertFalse(conn.sent[0]["ok"])
+        self.assertEqual(conn.sent[0]["terminal_reason"], "audio_prewarm_first_call_failed")
+        self.assertEqual(conn.sent[0]["failure_stage"], "first_call")
 
     def test_audio_prewarm_executes_once_per_worker_generation(self):
         calls = []
@@ -3897,6 +4049,276 @@ class PipelineTests(unittest.TestCase):
                 "missing_video",
             ],
         )
+
+    def test_audio_prewarm_structural_health_allows_quality_warnings(self):
+        result = {
+            "score": 0.05,
+            "details": {
+                "status": "ok",
+                "audio_confidence": 0.05,
+                "audio_quality_score": 0.1,
+                "duration_seconds": 3.0,
+                "rms_energy": 0.001,
+                "spectral_centroid": 1200.0,
+                "zero_crossing_rate": 0.02,
+                "mfcc_summary": [0.0, 1.0, 2.0, 3.0, 4.0],
+                "audio_warnings": ["speech_not_detected", "audio_too_quiet"],
+            },
+        }
+
+        self.assertTrue(audio._audio_prewarm_result_valid(result))
+
+    def test_audio_prewarm_structural_health_rejects_failed_analyzer_result(self):
+        result = {
+            "score": None,
+            "details": {
+                "status": "load_failed",
+                "audio_warnings": ["audio_decode_failed"],
+            },
+        }
+
+        self.assertFalse(audio._audio_prewarm_result_valid(result))
+
+    def test_real_audio_prewarm_analyzer_runs_twice_and_deletes_temp_wav(self):
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        if os.path.exists(path):
+            os.remove(path)
+
+        with unittest.mock.patch.object(audio.tempfile, "mkstemp", return_value=(os.open(path, os.O_CREAT | os.O_RDWR), path)):
+            metrics = audio.prewarm_audio_analyzer()
+
+        self.assertTrue(metrics["audio_warm_benchmark_passed"])
+        self.assertTrue(metrics["audio_prewarm_temp_deleted"])
+        self.assertFalse(os.path.exists(path))
+        self.assertGreater(metrics["audio_prewarm_first_call_ms"], 0)
+        self.assertGreaterEqual(metrics["audio_prewarm_second_call_ms"], 0)
+        for key in ["audio_prewarm_first_result", "audio_prewarm_second_result"]:
+            summary = metrics[key]
+            self.assertEqual(summary["status"], "ok")
+            self.assertIsInstance(summary["audio_warnings"], list)
+            for numeric_key in [
+                "audio_confidence",
+                "duration_seconds",
+                "rms_energy",
+                "spectral_centroid",
+                "zero_crossing_rate",
+            ]:
+                value = summary[numeric_key]
+                self.assertIsInstance(value, (int, float))
+                self.assertTrue(audio.math.isfinite(float(value)))
+            self.assertEqual(summary["mfcc_length"], 5)
+
+    def test_audio_prewarm_rejects_actual_failed_statuses(self):
+        for status in ["missing", "empty_audio", "load_failed", "weak"]:
+            result = {
+                "score": None,
+                "details": {
+                    "status": status,
+                    "audio_warnings": ["audio_decode_failed"],
+                    "audio_confidence": 0.1,
+                    "audio_quality_score": 0.1,
+                    "duration_seconds": 3.0,
+                    "rms_energy": 0.01,
+                    "spectral_centroid": 1200.0,
+                    "zero_crossing_rate": 0.01,
+                    "mfcc_summary": [0.0] * 5,
+                },
+            }
+            self.assertFalse(audio._audio_prewarm_result_valid(result), msg=status)
+
+    def test_runtime_startup_allows_slow_audio_prewarm_under_derived_budget(self):
+        runtime = analysis_runtime.WarmAnalyzerRuntime(worker_entry_map={
+            "video": analysis_runtime._smoke_worker_main,
+            "audio": analysis_runtime._smoke_worker_main,
+            "image": analysis_runtime._smoke_worker_main,
+        })
+        runtime._supervisors = {
+            "video": _SlowStartupSupervisor("video", 6.2, 15.0),
+            "audio": _SlowStartupSupervisor("audio", 12.0, 30.0),
+            "image": _SlowStartupSupervisor("image", 6.2, 15.0),
+        }
+        runtime._startup_budget_seconds = runtime._derive_startup_budget_seconds()
+
+        started = time.perf_counter()
+        result = runtime.start()
+        elapsed = time.perf_counter() - started
+
+        self.assertGreaterEqual(runtime._startup_budget_seconds, 32.0)
+        self.assertLess(elapsed, 14.0)
+        self.assertGreaterEqual(elapsed, 11.5)
+        self.assertTrue(runtime.is_ready())
+        self.assertEqual(set(result["workers"].keys()), {"video", "audio", "image"})
+        self.assertTrue(all(worker["ready"] for worker in runtime.health()["workers"].values()))
+        self.assertEqual(main.MEDIA_VALIDATION_WALL_TIMEOUT_SECONDS, 8.0)
+
+    def test_runtime_startup_timeout_alignment_cleans_workers(self):
+        fake_context = _FakeContext(behaviors=[
+            {"invoke_target": False, "alive_after_start": True, "alive_after_target": True},
+            {"invoke_target": False, "alive_after_start": True, "alive_after_target": True},
+            {"invoke_target": False, "alive_after_start": True, "alive_after_target": True},
+        ])
+        runtime = analysis_runtime.WarmAnalyzerRuntime(context_factory=lambda: fake_context)
+        runtime._supervisors = {
+            "video": analysis_runtime.WorkerSupervisor("video", startup_timeout_seconds=0.05, recovery_timeout_seconds=0.01, context_factory=lambda: fake_context),
+            "audio": analysis_runtime.WorkerSupervisor("audio", startup_timeout_seconds=0.10, recovery_timeout_seconds=0.01, context_factory=lambda: fake_context),
+            "image": analysis_runtime.WorkerSupervisor("image", startup_timeout_seconds=0.05, recovery_timeout_seconds=0.01, context_factory=lambda: fake_context),
+        }
+        runtime._startup_budget_seconds = runtime._derive_startup_budget_seconds()
+
+        with unittest.mock.patch.object(analysis_runtime, "_wait_handles", return_value=[]):
+            with self.assertRaises(analysis_runtime.AnalysisRuntimeStartupError):
+                runtime.start()
+
+        self.assertFalse(runtime.is_ready())
+        self.assertTrue(fake_context.processes)
+        self.assertTrue(all(not process.is_alive() for process in fake_context.processes))
+        self.assertTrue(all(process.terminated or process.killed for process in fake_context.processes))
+        self.assertTrue(all(supervisor.health()["ready"] is False for supervisor in runtime._supervisors.values()))
+
+    def test_runtime_startup_budget_derived_from_slowest_worker(self):
+        runtime = analysis_runtime.WarmAnalyzerRuntime(worker_entry_map={
+            "video": analysis_runtime._smoke_worker_main,
+            "audio": analysis_runtime._smoke_worker_main,
+            "image": analysis_runtime._smoke_worker_main,
+        })
+        runtime._supervisors = {
+            "video": _SlowStartupSupervisor("video", 0.1, 15.0),
+            "audio": _SlowStartupSupervisor("audio", 0.2, 30.0),
+            "image": _SlowStartupSupervisor("image", 0.1, 15.0),
+        }
+        runtime._startup_budget_seconds = runtime._derive_startup_budget_seconds()
+        first_budget = runtime._startup_budget_seconds
+
+        runtime.start()
+        runtime.shutdown()
+        runtime._stopped = False
+        runtime._supervisors = {
+            "video": _SlowStartupSupervisor("video", 0.01, 15.0),
+            "audio": _SlowStartupSupervisor("audio", 0.02, 30.0),
+            "image": _SlowStartupSupervisor("image", 0.01, 15.0),
+        }
+        runtime._startup_budget_seconds = runtime._derive_startup_budget_seconds()
+        second_budget = runtime._startup_budget_seconds
+        runtime.start()
+
+        self.assertEqual(first_budget, 32.0)
+        self.assertEqual(second_budget, 32.0)
+        self.assertTrue(runtime.is_ready())
+
+    def test_runtime_deadline_cancels_running_startup_future_and_late_ready_is_rejected(self):
+        release_ready = __import__("threading").Event()
+        worker_entered = __import__("threading").Event()
+        fake_context = _AsyncFakeContext(behaviors=[{"stay_alive_after_target": True}])
+
+        def delayed_ready_worker(result_conn, analyzer_name, worker_generation):
+            worker_entered.set()
+            release_ready.wait(timeout=1.0)
+            try:
+                result_conn.send({
+                    "type": "ready",
+                    "ok": True,
+                    "analyzer": analyzer_name,
+                    "worker_generation": worker_generation,
+                    "metrics": {
+                        "child_entry_ms": 1,
+                        "analyzer_import_ms": 1,
+                        "total_worker_ms": 1,
+                    },
+                })
+            except Exception:
+                pass
+
+        supervisor = analysis_runtime.WorkerSupervisor(
+            "audio",
+            startup_timeout_seconds=5.0,
+            recovery_timeout_seconds=0.01,
+            context_factory=lambda: fake_context,
+            worker_entry=delayed_ready_worker,
+        )
+        runtime = analysis_runtime.WarmAnalyzerRuntime(worker_entry_map={
+            "video": analysis_runtime._smoke_worker_main,
+            "audio": analysis_runtime._smoke_worker_main,
+            "image": analysis_runtime._smoke_worker_main,
+        })
+        runtime._supervisors = {"audio": supervisor}
+        runtime._startup_budget_seconds = 0.05
+
+        def fake_wait(handles, timeout=None):
+            time.sleep(min(float(timeout or 0.0), 0.01))
+            return [handle for handle in handles if hasattr(handle, "poll") and handle.poll(0)]
+
+        with unittest.mock.patch.object(analysis_runtime, "_wait_handles", side_effect=fake_wait):
+            with self.assertRaises(analysis_runtime.AnalysisRuntimeStartupError):
+                runtime.start()
+
+        self.assertTrue(worker_entered.is_set())
+        release_ready.set()
+        time.sleep(0.05)
+        self.assertFalse(runtime.is_ready())
+        self.assertFalse(supervisor.health()["ready"])
+        self.assertTrue(fake_context.processes)
+        self.assertTrue(all(not process.is_alive() for process in fake_context.processes))
+        self.assertTrue(all(process.terminated or process.killed for process in fake_context.processes))
+
+        replacement = _SlowStartupSupervisor("audio", 0.01, 5.0)
+        runtime._stopped = False
+        runtime._supervisors = {"audio": replacement}
+        runtime._startup_budget_seconds = runtime._derive_startup_budget_seconds()
+        runtime.start()
+        self.assertTrue(runtime.is_ready())
+
+    def test_supervisor_start_cancel_token_rejects_late_ready_without_publishing(self):
+        release_ready = __import__("threading").Event()
+        fake_context = _AsyncFakeContext(behaviors=[{"stay_alive_after_target": True}])
+
+        def delayed_ready_worker(result_conn, analyzer_name, worker_generation):
+            release_ready.wait(timeout=1.0)
+            try:
+                result_conn.send({
+                    "type": "ready",
+                    "ok": True,
+                    "analyzer": analyzer_name,
+                    "worker_generation": worker_generation,
+                    "metrics": {
+                        "child_entry_ms": 1,
+                        "analyzer_import_ms": 1,
+                        "total_worker_ms": 1,
+                    },
+                })
+            except Exception:
+                pass
+
+        supervisor = analysis_runtime.WorkerSupervisor(
+            "audio",
+            startup_timeout_seconds=5.0,
+            recovery_timeout_seconds=0.01,
+            context_factory=lambda: fake_context,
+            worker_entry=delayed_ready_worker,
+        )
+        token = analysis_runtime.StartupCancelToken()
+        future_holder = {}
+
+        import concurrent.futures as _futures
+
+        with _futures.ThreadPoolExecutor(max_workers=1) as executor:
+            def fake_wait(handles, timeout=None):
+                time.sleep(min(float(timeout or 0.0), 0.01))
+                return [handle for handle in handles if hasattr(handle, "poll") and handle.poll(0)]
+
+            with unittest.mock.patch.object(analysis_runtime, "_wait_handles", side_effect=fake_wait):
+                future = executor.submit(supervisor.start, startup_cancel_token=token)
+                time.sleep(0.02)
+                future_holder["cancel_returned"] = future.cancel()
+                token.cancel()
+                release_ready.set()
+                with self.assertRaises(analysis_runtime.AnalysisRuntimeStartupError):
+                    future.result(timeout=2.0)
+
+        self.assertFalse(future_holder["cancel_returned"])
+        self.assertFalse(supervisor.health()["ready"])
+        self.assertTrue(fake_context.processes)
+        self.assertTrue(all(not process.is_alive() for process in fake_context.processes))
 
 
 
