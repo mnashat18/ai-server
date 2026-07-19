@@ -475,6 +475,13 @@ class _SubmitOnlySupervisor:
     def forget_job(self, job_id):
         return None
 
+    def health(self):
+        return {
+            "ready": True,
+            "worker_generation": self._generation,
+            "process_alive": True,
+        }
+
 
 class _FakeAudioLibrosa:
     @staticmethod
@@ -1952,8 +1959,9 @@ class PipelineTests(unittest.TestCase):
 
             result = main._process_scan_sync("scan-1")
 
-        self.assertEqual(result["status"], main.SCAN_STATUS_COMPLETED)
-        write_success.assert_called_once()
+        self.assertEqual(result["status"], main.SCAN_STATUS_FAILED)
+        self.assertEqual(result["failure_reason"], main.FAILURE_REASON_AUDIO_MISSING)
+        write_success.assert_not_called()
         transcribe_optional.assert_not_called()
 
     def test_process_scan_sync_partial_timeout_with_sufficient_evidence_completes(self):
@@ -2088,8 +2096,9 @@ class PipelineTests(unittest.TestCase):
 
             result = main._process_scan_sync("scan-1")
 
-        self.assertEqual(result["status"], main.SCAN_STATUS_COMPLETED)
-        write_success.assert_called_once()
+        self.assertEqual(result["status"], main.SCAN_STATUS_FAILED)
+        self.assertEqual(result["failure_reason"], main.FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT)
+        write_success.assert_not_called()
 
     def test_process_scan_sync_timeout_path_finalizes_failed_scan(self):
         with ExitStack() as stack:
@@ -2273,6 +2282,7 @@ class PipelineTests(unittest.TestCase):
                     return_value={
                         "readiness_score": 80,
                         "confidence": 0.8,
+                        "voice_confidence": 0.8,
                         "risk_level": "stable",
                         "suggested_action": "continue_normal_activity",
                         "explanation": "ok",
@@ -2412,6 +2422,7 @@ class PipelineTests(unittest.TestCase):
                     return_value={
                         "readiness_score": 80,
                         "confidence": 0.8,
+                        "voice_confidence": 0.8,
                         "risk_level": "stable",
                         "suggested_action": "continue_normal_activity",
                         "explanation": "ok",
@@ -2580,7 +2591,10 @@ class PipelineTests(unittest.TestCase):
 
     def test_spawn_worker_smoke_receives_payload_and_exits(self):
         ctx = multiprocessing.get_context("spawn")
-        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        try:
+            parent_conn, child_conn = ctx.Pipe(duplex=False)
+        except PermissionError as exc:
+            self.skipTest(f"multiprocessing Pipe unavailable in this sandbox: {exc}")
         process = ctx.Process(
             target=analysis_worker.run_analysis_worker,
             args=(child_conn, "video", None, "video_missing", "scan-smoke", time.perf_counter()),
@@ -2610,9 +2624,9 @@ class PipelineTests(unittest.TestCase):
 
     def test_warm_runtime_start_reports_ready_once(self):
         fake_context = _FakeContext(behaviors=[
-            {"alive_after_target": True},
-            {"alive_after_target": True},
-            {"alive_after_target": True},
+            {"alive_after_start": True, "alive_after_target": True},
+            {"alive_after_start": True, "alive_after_target": True},
+            {"alive_after_start": True, "alive_after_target": True},
         ])
 
         def ready_worker(result_conn, analyzer_name, generation):
@@ -3038,7 +3052,18 @@ class PipelineTests(unittest.TestCase):
             "image": analysis_runtime._smoke_worker_main,
         })
         try:
-            runtime.start()
+            try:
+                runtime.start()
+            except PermissionError as exc:
+                self.skipTest(f"multiprocessing unavailable in this sandbox: {exc}")
+            except analysis_runtime.AnalysisRuntimeStartupError as exc:
+                if (
+                    isinstance(exc.__cause__, PermissionError)
+                    or "WinError 5" in str(exc)
+                    or "Access is denied" in str(exc)
+                ):
+                    self.skipTest(f"multiprocessing unavailable in this sandbox: {exc}")
+                raise
             first = runtime.run_scan("scan-smoke-1", main.Media(image=None, audio=None, video=None), deadline_seconds=2.0)
             second = runtime.run_scan("scan-smoke-2", main.Media(image=None, audio=None, video=None), deadline_seconds=2.0)
         finally:
@@ -3071,6 +3096,7 @@ class PipelineTests(unittest.TestCase):
         runtime = analysis_runtime.WarmAnalyzerRuntime()
         runtime._started = True
         runtime._stopped = False
+        runtime._runtime_state = "ready"
         runtime._supervisors = {
             "video": _SubmitOnlySupervisor(video_future),
             "audio": _SubmitOnlySupervisor(
@@ -3230,9 +3256,17 @@ class PipelineTests(unittest.TestCase):
             def forget_job(self, job_id):
                 self.forgotten.append(job_id)
 
+            def health(self):
+                return {
+                    "ready": True,
+                    "worker_generation": self._generation,
+                    "process_alive": True,
+                }
+
         runtime = analysis_runtime.WarmAnalyzerRuntime()
         runtime._started = True
         runtime._stopped = False
+        runtime._runtime_state = "ready"
         supervisors = {name: _SlowSupervisor(name) for name in ("video", "audio", "image")}
         runtime._supervisors = supervisors
 
@@ -3390,6 +3424,7 @@ class PipelineTests(unittest.TestCase):
                     return_value={
                         "readiness_score": 80,
                         "confidence": 0.8,
+                        "voice_confidence": 0.8,
                         "risk_level": "stable",
                         "suggested_action": "continue_normal_activity",
                         "explanation": "ok",
@@ -3537,6 +3572,7 @@ class PipelineTests(unittest.TestCase):
                     return_value={
                         "readiness_score": 80,
                         "confidence": 0.8,
+                        "voice_confidence": 0.8,
                         "risk_level": "stable",
                         "suggested_action": "continue_normal_activity",
                         "explanation": "ok",
@@ -3586,13 +3622,14 @@ class PipelineTests(unittest.TestCase):
 
             result = main._process_scan_sync("scan-1")
 
-        self.assertEqual(result["status"], main.SCAN_STATUS_COMPLETED)
+        self.assertEqual(result["status"], main.SCAN_STATUS_FAILED)
+        self.assertEqual(result["failure_reason"], main.FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT)
         decision_entry = next(item for item in lifecycle if item[0] == "decision")
         lifecycle_entry = next(item for item in lifecycle if item[0] == "lifecycle")
         self.assertNotEqual(decision_entry[1]["terminal_reason"], "workers_not_terminal")
         self.assertEqual(lifecycle_entry[1]["running_modalities"], [])
         self.assertTrue(lifecycle_entry[1]["all_workers_terminal"])
-        write_success.assert_called_once()
+        write_success.assert_not_called()
 
     def test_audio_analyze_audio_accepts_optional_scan_id(self):
         decode_calls = []
@@ -3846,7 +3883,7 @@ class PipelineTests(unittest.TestCase):
 
         with unittest.mock.patch.object(audio, "_normalize_audio_path", return_value="clip.wav"):
             with unittest.mock.patch.object(audio, "_prepare_audio_source", return_value=("ok", "clip.wav")):
-                with unittest.mock.patch.object(audio, "librosa", _FakeLibrosa):
+                with unittest.mock.patch.object(audio, "librosa", _FakeAudioLibrosa):
                     with unittest.mock.patch.object(audio, "_frame_matrix", side_effect=spy_frame_matrix):
                         with unittest.mock.patch.object(audio, "_decode_audio_once", decode_once):
                             with unittest.mock.patch.object(audio, "_build_success_details", return_value=fake_result):
@@ -3877,9 +3914,9 @@ class PipelineTests(unittest.TestCase):
         conn = _ReadyThenEOFConn()
         order = []
 
-        def prewarm():
+        def prewarm(progress=None):
             order.append("prewarm")
-            self.assertEqual(conn.sent, [])
+            self.assertTrue(all(item.get("type") == "startup_progress" for item in conn.sent))
             return {
                 "audio_prewarm_first_call_ms": 11,
                 "audio_prewarm_second_call_ms": 3,
@@ -3894,12 +3931,13 @@ class PipelineTests(unittest.TestCase):
             }
 
         with unittest.mock.patch.object(analysis_worker, "_load_analyzer_callable", return_value=lambda path, scan_id=None: {}):
-            with unittest.mock.patch.object(analysis_worker, "_prewarm_analyzer", side_effect=lambda name: prewarm()):
+            with unittest.mock.patch.object(analysis_worker, "_prewarm_analyzer", side_effect=lambda name, progress=None: prewarm(progress)):
                 analysis_worker.worker_main(conn, "audio", 7)
 
         self.assertEqual(order, ["prewarm"])
-        self.assertEqual(len(conn.sent), 1)
-        ready = conn.sent[0]
+        ready_payloads = [item for item in conn.sent if item.get("type") == "ready"]
+        self.assertEqual(len(ready_payloads), 1)
+        ready = ready_payloads[0]
         self.assertEqual(ready["type"], "ready")
         self.assertTrue(ready["ok"])
         self.assertEqual(ready["worker_generation"], 7)
@@ -3913,10 +3951,10 @@ class PipelineTests(unittest.TestCase):
             with unittest.mock.patch.object(analysis_worker, "_prewarm_analyzer", return_value={"audio_warm_benchmark_passed": False}):
                 analysis_worker.worker_main(conn, "audio", 1)
 
-        self.assertEqual(len(conn.sent), 1)
-        self.assertEqual(conn.sent[0]["type"], "ready")
-        self.assertFalse(conn.sent[0]["ok"])
-        self.assertEqual(conn.sent[0]["terminal_reason"], "audio_prewarm_second_result_invalid")
+        ready = [item for item in conn.sent if item.get("type") == "ready"]
+        self.assertEqual(len(ready), 1)
+        self.assertFalse(ready[0]["ok"])
+        self.assertEqual(ready[0]["terminal_reason"], "audio_prewarm_second_result_invalid")
 
     def test_audio_worker_ready_failure_reason_distinguishes_import_failed(self):
         conn = _ReadyThenEOFConn()
@@ -3924,10 +3962,11 @@ class PipelineTests(unittest.TestCase):
         with unittest.mock.patch.object(analysis_worker, "_load_analyzer_callable", side_effect=RuntimeError("boom")):
             analysis_worker.worker_main(conn, "audio", 1)
 
-        self.assertEqual(conn.sent[0]["type"], "ready")
-        self.assertFalse(conn.sent[0]["ok"])
-        self.assertEqual(conn.sent[0]["terminal_reason"], "audio_import_failed")
-        self.assertEqual(conn.sent[0]["failure_stage"], "import")
+        ready = [item for item in conn.sent if item.get("type") == "ready"]
+        self.assertEqual(len(ready), 1)
+        self.assertFalse(ready[0]["ok"])
+        self.assertEqual(ready[0]["terminal_reason"], "audio_import_failed")
+        self.assertEqual(ready[0]["failure_stage"], "import")
 
     def test_audio_worker_ready_failure_reason_distinguishes_first_call_failed(self):
         conn = _ReadyThenEOFConn()
@@ -3941,15 +3980,16 @@ class PipelineTests(unittest.TestCase):
             with unittest.mock.patch.object(analysis_worker, "_prewarm_analyzer", side_effect=error):
                 analysis_worker.worker_main(conn, "audio", 1)
 
-        self.assertEqual(conn.sent[0]["type"], "ready")
-        self.assertFalse(conn.sent[0]["ok"])
-        self.assertEqual(conn.sent[0]["terminal_reason"], "audio_prewarm_first_call_failed")
-        self.assertEqual(conn.sent[0]["failure_stage"], "first_call")
+        ready = [item for item in conn.sent if item.get("type") == "ready"]
+        self.assertEqual(len(ready), 1)
+        self.assertFalse(ready[0]["ok"])
+        self.assertEqual(ready[0]["terminal_reason"], "audio_prewarm_first_call_failed")
+        self.assertEqual(ready[0]["failure_stage"], "first_call")
 
     def test_audio_prewarm_executes_once_per_worker_generation(self):
         calls = []
 
-        def prewarm():
+        def prewarm(progress=None):
             calls.append(time.time())
             return {
                 "audio_prewarm_first_call_ms": 10,
@@ -3967,7 +4007,7 @@ class PipelineTests(unittest.TestCase):
         for generation in [1, 2]:
             conn = _ReadyThenEOFConn()
             with unittest.mock.patch.object(analysis_worker, "_load_analyzer_callable", return_value=lambda path, scan_id=None: {}):
-                with unittest.mock.patch.object(analysis_worker, "_prewarm_analyzer", side_effect=lambda name: prewarm()):
+                with unittest.mock.patch.object(analysis_worker, "_prewarm_analyzer", side_effect=lambda name, progress=None: prewarm(progress)):
                     analysis_worker.worker_main(conn, "audio", generation)
             self.assertEqual(conn.sent[0]["worker_generation"], generation)
 
@@ -4145,8 +4185,8 @@ class PipelineTests(unittest.TestCase):
         elapsed = time.perf_counter() - started
 
         self.assertGreaterEqual(runtime._startup_budget_seconds, 32.0)
-        self.assertLess(elapsed, 14.0)
-        self.assertGreaterEqual(elapsed, 11.5)
+        self.assertLess(elapsed, 20.0)
+        self.assertGreaterEqual(elapsed, 18.0)
         self.assertTrue(runtime.is_ready())
         self.assertEqual(set(result["workers"].keys()), {"video", "audio", "image"})
         self.assertTrue(all(worker["ready"] for worker in runtime.health()["workers"].values()))
@@ -4231,7 +4271,7 @@ class PipelineTests(unittest.TestCase):
 
         supervisor = analysis_runtime.WorkerSupervisor(
             "audio",
-            startup_timeout_seconds=5.0,
+            startup_timeout_seconds=0.05,
             recovery_timeout_seconds=0.01,
             context_factory=lambda: fake_context,
             worker_entry=delayed_ready_worker,
@@ -4242,7 +4282,7 @@ class PipelineTests(unittest.TestCase):
             "image": analysis_runtime._smoke_worker_main,
         })
         runtime._supervisors = {"audio": supervisor}
-        runtime._startup_budget_seconds = 0.05
+        runtime._startup_budget_seconds = runtime._derive_startup_budget_seconds()
 
         def fake_wait(handles, timeout=None):
             time.sleep(min(float(timeout or 0.0), 0.01))
@@ -4319,6 +4359,426 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(supervisor.health()["ready"])
         self.assertTrue(fake_context.processes)
         self.assertTrue(all(not process.is_alive() for process in fake_context.processes))
+
+    def test_liveness_is_200_while_readiness_is_503_during_startup(self):
+        class StartingRuntime:
+            def readiness(self):
+                return {
+                    "ready": False,
+                    "runtime_state": "starting",
+                    "video_ready": False,
+                    "audio_ready": False,
+                    "image_ready": False,
+                    "startup_elapsed_ms": 12,
+                    "terminal_reason": None,
+                }
+
+        with unittest.mock.patch.object(main, "get_analyzer_runtime", return_value=StartingRuntime()):
+            live = main.health()
+            ready = main.readiness()
+
+        self.assertEqual(live["status"], "alive")
+        self.assertEqual(ready.status_code, 503)
+        self.assertEqual(json.loads(ready.body)["runtime_state"], "starting")
+
+    def test_process_returns_503_before_runtime_ready_without_marking_processing(self):
+        class StartingRuntime:
+            def __init__(self):
+                self.start_background_calls = 0
+
+            def is_ready(self):
+                return False
+
+            def start_background(self):
+                self.start_background_calls += 1
+
+        runtime = StartingRuntime()
+        with unittest.mock.patch.object(main, "get_analyzer_runtime", return_value=runtime), unittest.mock.patch.object(
+            main, "_authenticate_process_user", return_value="user-1"
+        ) as auth_mock, unittest.mock.patch.object(
+            main, "_resolve_scan_auth_context", return_value={"status": main.SCAN_STATUS_MEDIA_READY}
+        ), unittest.mock.patch.object(
+            main, "_authorize_scan_access"
+        ), unittest.mock.patch.object(
+            main, "_ensure_scan_media_ready"
+        ), unittest.mock.patch.object(main.directus, "update_wellness_scan") as update_mock:
+            response = main.process_scan(main.ScanRequest(scan_id="scan-123"), main.BackgroundTasks(), authorization="Bearer token")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body)["error"], "analyzer_runtime_not_ready")
+        self.assertEqual(runtime.start_background_calls, 1)
+        auth_mock.assert_called_once()
+        update_mock.assert_not_called()
+
+    def test_runtime_starts_audio_before_video_and_image_concurrently(self):
+        events = []
+
+        class OrderedSupervisor(_SlowStartupSupervisor):
+            def start(self, *, startup_cancel_token=None):
+                events.append(("start", self.name, time.perf_counter()))
+                result = super().start(startup_cancel_token=startup_cancel_token)
+                events.append(("ready", self.name, time.perf_counter()))
+                return result
+
+        runtime = analysis_runtime.WarmAnalyzerRuntime(worker_entry_map={
+            "video": analysis_runtime._smoke_worker_main,
+            "audio": analysis_runtime._smoke_worker_main,
+            "image": analysis_runtime._smoke_worker_main,
+        })
+        runtime._supervisors = {
+            "video": OrderedSupervisor("video", 0.05, 15.0),
+            "audio": OrderedSupervisor("audio", 0.05, 90.0),
+            "image": OrderedSupervisor("image", 0.05, 15.0),
+        }
+        runtime._startup_budget_seconds = runtime._derive_startup_budget_seconds()
+
+        runtime.start()
+
+        audio_ready_at = next(ts for event, name, ts in events if event == "ready" and name == "audio")
+        video_start_at = next(ts for event, name, ts in events if event == "start" and name == "video")
+        image_start_at = next(ts for event, name, ts in events if event == "start" and name == "image")
+        self.assertGreaterEqual(video_start_at, audio_ready_at)
+        self.assertGreaterEqual(image_start_at, audio_ready_at)
+        self.assertLess(abs(video_start_at - image_start_at), 0.04)
+        self.assertTrue(runtime.is_ready())
+
+    def test_audio_startup_progress_is_accepted_until_ready(self):
+        fake_context = _AsyncFakeContext(behaviors=[{"stay_alive_after_target": True}])
+
+        def progress_then_ready_worker(result_conn, analyzer_name, worker_generation):
+            for stage in ["import_started", "import_completed", "first_call_started"]:
+                result_conn.send({
+                    "type": "startup_progress",
+                    "analyzer": analyzer_name,
+                    "worker_generation": worker_generation,
+                    "stage": stage,
+                    "elapsed_ms": 1,
+                })
+                time.sleep(0.01)
+            result_conn.send({
+                "type": "ready",
+                "ok": True,
+                "analyzer": analyzer_name,
+                "worker_generation": worker_generation,
+                "metrics": {"child_entry_ms": 1, "analyzer_import_ms": 1, "total_worker_ms": 1},
+            })
+
+        with unittest.mock.patch.object(analysis_runtime.multiprocessing, "get_context", return_value=fake_context):
+            with unittest.mock.patch.object(
+                analysis_runtime,
+                "_wait_handles",
+                side_effect=lambda handles, timeout=None: [handle for handle in handles if hasattr(handle, "poll") and handle.poll()] or (time.sleep(min(float(timeout or 0.0), 0.01)) or []),
+            ):
+                supervisor = analysis_runtime.WorkerSupervisor("audio", worker_entry=progress_then_ready_worker)
+                result = supervisor.start()
+
+        self.assertEqual(result["spawn_metrics"]["last_startup_stage"], "first_call_started")
+        self.assertTrue(supervisor.health()["ready"])
+
+    def test_audio_startup_inactivity_timeout_reports_last_stage(self):
+        fake_context = _FakeContext(behaviors=[{"alive_after_target": True}])
+
+        def progress_only_worker(result_conn, analyzer_name, worker_generation):
+            result_conn.send({
+                "type": "startup_progress",
+                "analyzer": analyzer_name,
+                "worker_generation": worker_generation,
+                "stage": "first_call_started",
+                "elapsed_ms": 1,
+            })
+
+        def fake_wait(handles, timeout=None):
+            ready = [handle for handle in handles if hasattr(handle, "poll") and handle.poll()]
+            if ready:
+                return ready
+            time.sleep(min(float(timeout or 0.0), 0.01))
+            return []
+
+        with unittest.mock.patch.object(analysis_runtime.multiprocessing, "get_context", return_value=fake_context):
+            with unittest.mock.patch.object(analysis_runtime, "_wait_handles", side_effect=fake_wait):
+                supervisor = analysis_runtime.WorkerSupervisor(
+                    "audio",
+                    startup_timeout_seconds=1.0,
+                    startup_progress_inactivity_timeout_seconds=0.02,
+                    recovery_timeout_seconds=0.01,
+                    worker_entry=progress_only_worker,
+                )
+                with self.assertRaises(analysis_runtime.AnalysisRuntimeStartupError) as raised:
+                    supervisor.start()
+
+        self.assertIn("startup_inactivity_timeout", str(raised.exception))
+        self.assertEqual(supervisor.health()["last_startup_stage"], "first_call_started")
+        self.assertFalse(supervisor.health()["ready"])
+
+    def test_background_startup_retries_are_serialized_and_bounded(self):
+        attempts = []
+
+        class TokenAwareFailingSupervisor(_SlowStartupSupervisor):
+            def start(self, *, startup_cancel_token=None):
+                attempts.append((self.name, startup_cancel_token, time.perf_counter()))
+                if startup_cancel_token is not None:
+                    startup_cancel_token.cancel()
+                raise analysis_runtime.AnalysisRuntimeStartupError(
+                    f"{self.name}_worker_ready_timeout",
+                    analyzer_name=self.name,
+                    terminal_reason=f"{self.name}_worker_ready_timeout",
+                )
+
+        class FailingRuntime(analysis_runtime.WarmAnalyzerRuntime):
+            def _build_supervisors(self):
+                return {
+                    "video": _SlowStartupSupervisor("video", 0.0, 15.0),
+                    "audio": TokenAwareFailingSupervisor("audio", 0.0, 90.0),
+                    "image": _SlowStartupSupervisor("image", 0.0, 15.0),
+                }
+
+            def _cleanup_workers(self):
+                for supervisor in self._supervisors.values():
+                    supervisor.shutdown()
+                self._reset_supervisors()
+
+        runtime = FailingRuntime(worker_entry_map={
+            "video": analysis_runtime._smoke_worker_main,
+            "audio": analysis_runtime._smoke_worker_main,
+            "image": analysis_runtime._smoke_worker_main,
+        })
+        with unittest.mock.patch.object(analysis_runtime, "BACKGROUND_STARTUP_RETRY_DELAYS_SECONDS", (0.01, 0.01, 0.01)):
+            runtime.start_background()
+            runtime._startup_thread.join(timeout=2.0)
+
+        self.assertEqual(len(attempts), analysis_runtime.MAX_BACKGROUND_STARTUP_ATTEMPTS)
+        self.assertEqual(len({id(token) for _, token, _ in attempts}), analysis_runtime.MAX_BACKGROUND_STARTUP_ATTEMPTS)
+        self.assertTrue(all(token.is_cancelled() for _, token, _ in attempts))
+        self.assertEqual(runtime.health()["runtime_state"], "failed")
+        self.assertTrue(runtime.health()["final_failure_latched"])
+        self.assertFalse(runtime.is_ready())
+
+    def test_retry_uses_fresh_token_after_cancelled_attempt_and_then_succeeds(self):
+        tokens = []
+
+        class AudioFailOnceSupervisor(_SlowStartupSupervisor):
+            calls = 0
+
+            def start(self, *, startup_cancel_token=None):
+                self.__class__.calls += 1
+                tokens.append(startup_cancel_token)
+                if self.__class__.calls == 1:
+                    self.ready = False
+                    if startup_cancel_token is not None:
+                        startup_cancel_token.cancel()
+                    raise analysis_runtime.AnalysisRuntimeStartupError(
+                        "audio_worker_ready_timeout",
+                        analyzer_name="audio",
+                        terminal_reason="audio_worker_ready_timeout",
+                    )
+                return super().start(startup_cancel_token=startup_cancel_token)
+
+        class RetryRuntime(analysis_runtime.WarmAnalyzerRuntime):
+            def _build_supervisors(self):
+                return {
+                    "video": _SlowStartupSupervisor("video", 0.0, 15.0),
+                    "audio": AudioFailOnceSupervisor("audio", 0.0, 90.0),
+                    "image": _SlowStartupSupervisor("image", 0.0, 15.0),
+                }
+
+            def _cleanup_workers(self):
+                for supervisor in self._supervisors.values():
+                    supervisor.shutdown()
+                self._reset_supervisors()
+
+        AudioFailOnceSupervisor.calls = 0
+        runtime = RetryRuntime()
+        with unittest.mock.patch.object(analysis_runtime, "BACKGROUND_STARTUP_RETRY_DELAYS_SECONDS", (0.01, 0.01, 0.01)):
+            runtime.start_background()
+            runtime._startup_thread.join(timeout=2.0)
+
+        self.assertTrue(runtime.is_ready())
+        self.assertEqual(AudioFailOnceSupervisor.calls, 2)
+        self.assertEqual(runtime.health()["startup_attempts"], 2)
+        self.assertEqual(len(tokens), 2)
+        self.assertIsNot(tokens[0], tokens[1])
+        self.assertTrue(tokens[0].is_cancelled())
+        self.assertFalse(tokens[1].is_cancelled())
+        self.assertFalse(runtime.health()["final_failure_latched"])
+
+    def test_final_failure_latch_blocks_restarts_and_repeated_process_requests(self):
+        start_calls = []
+
+        class AlwaysFailSupervisor(_SlowStartupSupervisor):
+            def start(self, *, startup_cancel_token=None):
+                start_calls.append((self.name, startup_cancel_token))
+                if startup_cancel_token is not None:
+                    startup_cancel_token.cancel()
+                raise analysis_runtime.AnalysisRuntimeStartupError(
+                    f"{self.name}_worker_ready_timeout",
+                    analyzer_name=self.name,
+                    terminal_reason=f"{self.name}_worker_ready_timeout",
+                )
+
+        class LatchingRuntime(analysis_runtime.WarmAnalyzerRuntime):
+            def _build_supervisors(self):
+                return {
+                    "video": _SlowStartupSupervisor("video", 0.0, 15.0),
+                    "audio": AlwaysFailSupervisor("audio", 0.0, 90.0),
+                    "image": _SlowStartupSupervisor("image", 0.0, 15.0),
+                }
+
+            def _cleanup_workers(self):
+                for supervisor in self._supervisors.values():
+                    supervisor.shutdown()
+                self._reset_supervisors()
+
+        runtime = LatchingRuntime()
+        with unittest.mock.patch.object(analysis_runtime, "BACKGROUND_STARTUP_RETRY_DELAYS_SECONDS", (0.01, 0.01, 0.01)):
+            runtime.start_background()
+            runtime._startup_thread.join(timeout=2.0)
+
+        first_thread = runtime._startup_thread
+        attempts_after_failure = runtime.health()["startup_attempts"]
+        calls_after_failure = len(start_calls)
+        for _ in range(3):
+            runtime.start_background()
+        with unittest.mock.patch.object(main, "get_analyzer_runtime", return_value=runtime), unittest.mock.patch.object(
+            main, "_authenticate_process_user", return_value="user-1"
+        ) as auth_mock, unittest.mock.patch.object(
+            main, "_resolve_scan_auth_context", return_value={"status": main.SCAN_STATUS_MEDIA_READY}
+        ), unittest.mock.patch.object(
+            main, "_authorize_scan_access"
+        ), unittest.mock.patch.object(
+            main, "_ensure_scan_media_ready"
+        ), unittest.mock.patch.object(main.directus, "update_wellness_scan") as update_mock:
+            for index in range(3):
+                response = main.process_scan(main.ScanRequest(scan_id=f"scan-{index}"), main.BackgroundTasks(), authorization="Bearer token")
+                self.assertEqual(response.status_code, 503)
+
+        self.assertIs(runtime._startup_thread, first_thread)
+        self.assertFalse(runtime.health()["startup_thread_alive"])
+        self.assertEqual(runtime.health()["startup_attempts"], attempts_after_failure)
+        self.assertEqual(len(start_calls), calls_after_failure)
+        self.assertTrue(runtime.health()["final_failure_latched"])
+        self.assertEqual(runtime.readiness()["runtime_state"], "failed")
+        self.assertFalse(runtime.readiness()["ready"])
+        self.assertEqual(auth_mock.call_count, 3)
+        update_mock.assert_not_called()
+
+    def test_shutdown_interrupts_retry_wait_and_joins_startup_thread(self):
+        entered = __import__("threading").Event()
+
+        class WaitingRuntime(analysis_runtime.WarmAnalyzerRuntime):
+            def start(self, *, startup_cancel_token=None):
+                entered.set()
+                raise analysis_runtime.AnalysisRuntimeStartupError("audio_worker_ready_timeout")
+
+            def _cleanup_workers(self):
+                pass
+
+        runtime = WaitingRuntime(worker_entry_map={
+            "video": analysis_runtime._smoke_worker_main,
+            "audio": analysis_runtime._smoke_worker_main,
+            "image": analysis_runtime._smoke_worker_main,
+        })
+        with unittest.mock.patch.object(analysis_runtime, "BACKGROUND_STARTUP_RETRY_DELAYS_SECONDS", (5.0, 5.0, 5.0)):
+            runtime.start_background()
+            self.assertTrue(entered.wait(timeout=1.0))
+            runtime.shutdown()
+
+        self.assertFalse(runtime.health()["startup_thread_alive"])
+
+    def test_shutdown_terminates_active_audio_startup_candidate(self):
+        entered = __import__("threading").Event()
+        release = __import__("threading").Event()
+        fake_context = _AsyncFakeContext(behaviors=[{"stay_alive_after_target": True}])
+
+        def delayed_prewarm_worker(result_conn, analyzer_name, worker_generation):
+            result_conn.send({
+                "type": "startup_progress",
+                "analyzer": analyzer_name,
+                "worker_generation": worker_generation,
+                "stage": "first_call_started",
+                "elapsed_ms": 1,
+            })
+            entered.set()
+            release.wait(timeout=5.0)
+            try:
+                result_conn.send({
+                    "type": "ready",
+                    "ok": True,
+                    "analyzer": analyzer_name,
+                    "worker_generation": worker_generation,
+                    "metrics": {"child_entry_ms": 1, "analyzer_import_ms": 1, "total_worker_ms": 1},
+                })
+            except Exception:
+                pass
+
+        runtime = analysis_runtime.WarmAnalyzerRuntime(worker_entry_map={
+            "video": analysis_runtime._smoke_worker_main,
+            "audio": delayed_prewarm_worker,
+            "image": analysis_runtime._smoke_worker_main,
+        })
+        runtime._supervisors = {
+            "audio": analysis_runtime.WorkerSupervisor(
+                "audio",
+                startup_timeout_seconds=5.0,
+                startup_progress_inactivity_timeout_seconds=5.0,
+                recovery_timeout_seconds=0.01,
+                context_factory=lambda: fake_context,
+                worker_entry=delayed_prewarm_worker,
+            )
+        }
+        runtime._startup_budget_seconds = runtime._derive_startup_budget_seconds()
+
+        def fake_wait(handles, timeout=None):
+            ready = [handle for handle in handles if hasattr(handle, "poll") and handle.poll(0)]
+            if ready:
+                return ready
+            time.sleep(min(float(timeout or 0.0), 0.01))
+            return []
+
+        with unittest.mock.patch.object(analysis_runtime, "_wait_handles", side_effect=fake_wait):
+            runtime.start_background()
+            self.assertTrue(entered.wait(timeout=1.0))
+            runtime.shutdown()
+
+        release.set()
+        self.assertFalse(runtime.health()["startup_thread_alive"])
+        self.assertTrue(fake_context.processes)
+        self.assertTrue(all(not process.is_alive() for process in fake_context.processes))
+        self.assertTrue(all(process.terminated or process.killed for process in fake_context.processes))
+        self.assertFalse(runtime.is_ready())
+
+    def test_video_and_image_startup_failures_are_attributed_to_real_analyzer(self):
+        class SelectiveFailSupervisor(_SlowStartupSupervisor):
+            def __init__(self, name, fail_name):
+                super().__init__(name, 0.0, 15.0 if name != "audio" else 90.0)
+                self.fail_name = fail_name
+
+            def start(self, *, startup_cancel_token=None):
+                if self.name == self.fail_name:
+                    if startup_cancel_token is not None:
+                        startup_cancel_token.cancel()
+                    raise analysis_runtime.AnalysisRuntimeStartupError(
+                        f"{self.name}_worker_ready_timeout",
+                        analyzer_name=self.name,
+                        terminal_reason=f"{self.name}_worker_ready_timeout",
+                    )
+                return super().start(startup_cancel_token=startup_cancel_token)
+
+        for failing_analyzer in ("video", "image"):
+            runtime = analysis_runtime.WarmAnalyzerRuntime(worker_entry_map={
+                "video": analysis_runtime._smoke_worker_main,
+                "audio": analysis_runtime._smoke_worker_main,
+                "image": analysis_runtime._smoke_worker_main,
+            })
+            runtime._supervisors = {
+                "video": SelectiveFailSupervisor("video", failing_analyzer),
+                "audio": SelectiveFailSupervisor("audio", failing_analyzer),
+                "image": SelectiveFailSupervisor("image", failing_analyzer),
+            }
+            runtime._startup_budget_seconds = runtime._derive_startup_budget_seconds()
+            with self.assertRaises(analysis_runtime.AnalysisRuntimeStartupError) as raised:
+                runtime.start()
+            self.assertEqual(raised.exception.analyzer_name, failing_analyzer)
+            self.assertEqual(runtime.health()["terminal_reason"], f"{failing_analyzer}_worker_ready_timeout")
 
 
 
