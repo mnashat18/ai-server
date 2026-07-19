@@ -83,6 +83,27 @@ def _signal_profile(samples: np.ndarray, sample_rate: int) -> tuple[float, float
 
 
 def _build_fake_librosa(samples: np.ndarray, sample_rate: int, *, mfcc_matrix: np.ndarray | None = None, centroid: float | None = None, flatness: float | None = None):
+    def _stft(y, n_fft, hop_length, win_length=None, window="hann", center=True, pad_mode="constant"):
+        prepared = np.asarray(y, dtype=np.float32).reshape(-1)
+        win_length = win_length or n_fft
+        pad = n_fft // 2 if center else 0
+        padded = np.pad(prepared, (pad, pad), mode=pad_mode)
+        if padded.size < n_fft:
+            padded = np.pad(padded, (0, n_fft - padded.size), mode=pad_mode)
+        frames = np.ascontiguousarray(np.lib.stride_tricks.sliding_window_view(padded, n_fft)[::hop_length])
+        if frames.size == 0:
+            frames = padded[-n_fft:][np.newaxis, :]
+        window_values = np.hanning(win_length).astype(np.float32, copy=False)
+        if win_length != n_fft:
+            window_values = np.pad(window_values, (0, n_fft - win_length), mode="constant")
+        return np.fft.rfft(np.ascontiguousarray(frames * window_values), axis=-1).T
+
+    def _power_to_db(power, ref=np.max):
+        matrix = np.asarray(power, dtype=np.float64)
+        reference = ref(matrix) if callable(ref) else ref
+        reference = max(float(reference), 1e-10)
+        return 10.0 * np.log10(np.maximum(matrix, 1e-10) / reference)
+
     def _centroid(y, sr, hop_length, n_fft):
         frames = _frame_count_for(samples, hop_length, n_fft)
         value = centroid if centroid is not None else _signal_profile(samples, sample_rate)[0]
@@ -102,7 +123,57 @@ def _build_fake_librosa(samples: np.ndarray, sample_rate: int, *, mfcc_matrix: n
             matrix = np.asarray(mfcc_matrix, dtype=np.float32)
         return matrix
 
-    return SimpleNamespace(feature=SimpleNamespace(spectral_centroid=_centroid, spectral_flatness=_flatness, mfcc=_mfcc))
+    def _centroid_from_s(*, y=None, sr=None, hop_length=512, n_fft=2048, S=None):
+        return _centroid(samples if y is None else y, sr or sample_rate, hop_length, n_fft)
+
+    def _flatness_from_s(*, y=None, hop_length=512, n_fft=2048, S=None, power=2.0):
+        return _flatness(samples if y is None else y, hop_length, n_fft)
+
+    def _melspectrogram(*, y=None, sr=None, S=None, n_mels=128, n_fft=2048, hop_length=512):
+        if S is None:
+            magnitude = np.abs(_stft(samples if y is None else y, n_fft=n_fft, hop_length=hop_length))
+            S = magnitude * magnitude
+        power = np.asarray(S, dtype=np.float64)
+        bins = power.shape[0]
+        edges = np.linspace(0, bins - 1, n_mels + 2)
+        basis = np.zeros((n_mels, bins), dtype=np.float64)
+        for row in range(n_mels):
+            left = int(round(edges[row]))
+            center = max(int(round(edges[row + 1])), left + 1)
+            right = max(int(round(edges[row + 2])), center + 1)
+            for col in range(left, min(center + 1, bins)):
+                basis[row, col] = (col - left) / max(center - left, 1)
+            for col in range(center, min(right + 1, bins)):
+                basis[row, col] = max(basis[row, col], (right - col) / max(right - center, 1))
+        return basis @ power
+
+    def _mfcc_from_s(*, y=None, sr=None, S=None, n_mfcc=5, hop_length=512, n_fft=2048):
+        if S is not None and y is None:
+            frames = np.asarray(S).shape[-1] if np.asarray(S).ndim >= 2 else _frame_count_for(samples, hop_length, n_fft)
+            if mfcc_matrix is None:
+                base = float(np.log1p(max(float(np.mean(np.abs(np.asarray(samples, dtype=np.float32)))), 0.0)))
+                return np.vstack([np.full(frames, base + idx, dtype=np.float32) for idx in range(n_mfcc)])
+            return np.asarray(mfcc_matrix, dtype=np.float32)
+        return _mfcc(samples if y is None else y, sr or sample_rate, n_mfcc, hop_length, n_fft)
+
+    return SimpleNamespace(
+        stft=_stft,
+        power_to_db=_power_to_db,
+        feature=SimpleNamespace(
+            spectral_centroid=_centroid_from_s,
+            spectral_flatness=_flatness_from_s,
+            melspectrogram=_melspectrogram,
+            mfcc=_mfcc_from_s,
+        ),
+    )
+
+
+def _fake_librosa_with_feature(feature) -> SimpleNamespace:
+    base = _build_fake_librosa(_speech_like(), audio.TARGET_SAMPLE_RATE)
+    base.feature = feature
+    if not hasattr(base.feature, "melspectrogram"):
+        base.feature.melspectrogram = _build_fake_librosa(_speech_like(), audio.TARGET_SAMPLE_RATE).feature.melspectrogram
+    return base
 
 
 class FakeQueue:
@@ -248,7 +319,7 @@ class AudioUnitTests(TestCase):
         fake_mfcc = MagicMock(return_value=mfcc_matrix)
         fake_centroid = MagicMock(return_value=np.array([[111.0, 111.0, 111.0]], dtype=np.float32))
         fake_flatness = MagicMock(return_value=np.array([[0.25, 0.25, 0.25]], dtype=np.float32))
-        fake_librosa = SimpleNamespace(feature=SimpleNamespace(mfcc=fake_mfcc, spectral_centroid=fake_centroid, spectral_flatness=fake_flatness))
+        fake_librosa = _fake_librosa_with_feature(SimpleNamespace(mfcc=fake_mfcc, spectral_centroid=fake_centroid, spectral_flatness=fake_flatness))
         with patch.object(audio, "librosa", fake_librosa), patch.object(
             audio,
             "_prepare_audio_source",
@@ -274,8 +345,8 @@ class AudioUnitTests(TestCase):
         ]
         for matrix in bad_cases:
             with self.subTest(shape=getattr(matrix, "shape", None)):
-                fake_librosa = SimpleNamespace(
-                    feature=SimpleNamespace(
+                fake_librosa = _fake_librosa_with_feature(
+                    SimpleNamespace(
                         mfcc=MagicMock(return_value=matrix),
                         spectral_centroid=MagicMock(return_value=np.array([[111.0, 111.0]], dtype=np.float32)),
                         spectral_flatness=MagicMock(return_value=np.array([[0.25, 0.25]], dtype=np.float32)),
@@ -297,8 +368,8 @@ class AudioUnitTests(TestCase):
             (None, RuntimeError("boom")),
         ]:
             with self.subTest(case=(centroid_side_effect, flatness_side_effect)):
-                fake_librosa = SimpleNamespace(
-                    feature=SimpleNamespace(
+                fake_librosa = _fake_librosa_with_feature(
+                    SimpleNamespace(
                         mfcc=MagicMock(return_value=np.ones((5, 3), dtype=np.float32)),
                         spectral_centroid=MagicMock(side_effect=centroid_side_effect) if centroid_side_effect else MagicMock(return_value=np.array([[111.0, 111.0]], dtype=np.float32)),
                         spectral_flatness=MagicMock(side_effect=flatness_side_effect) if flatness_side_effect else MagicMock(return_value=np.array([[0.25, 0.25]], dtype=np.float32)),
@@ -315,20 +386,30 @@ class AudioUnitTests(TestCase):
     def test_feature_calls_receive_bounded_samples(self):
         captured = {}
 
-        def _recording_mfcc(y, sr, n_mfcc, hop_length, n_fft):
-            captured["mfcc_samples"] = len(np.asarray(y).reshape(-1))
+        samples = _speech_like()
+        fake_librosa = _build_fake_librosa(samples, audio.TARGET_SAMPLE_RATE)
+        original_stft = fake_librosa.stft
+
+        def _recording_stft(y, *args, **kwargs):
+            captured["stft_samples"] = len(np.asarray(y).reshape(-1))
+            return original_stft(y, *args, **kwargs)
+
+        def _recording_mfcc(*, S, n_mfcc, **_kwargs):
+            captured["mfcc_from_mel_bins"] = np.asarray(S).shape[0]
             return np.ones((5, 3), dtype=np.float32)
 
-        def _recording_centroid(y, sr, hop_length, n_fft):
-            captured["centroid_samples"] = len(np.asarray(y).reshape(-1))
+        def _recording_centroid(*, S, sr, **_kwargs):
+            captured["centroid_bins"] = np.asarray(S).shape[0]
             return np.array([[111.0, 111.0, 111.0]], dtype=np.float32)
 
-        def _recording_flatness(y, hop_length, n_fft):
-            captured["flatness_samples"] = len(np.asarray(y).reshape(-1))
+        def _recording_flatness(*, S, **_kwargs):
+            captured["flatness_bins"] = np.asarray(S).shape[0]
             return np.array([[0.2, 0.2, 0.2]], dtype=np.float32)
 
-        samples = _speech_like()
-        fake_librosa = SimpleNamespace(feature=SimpleNamespace(mfcc=_recording_mfcc, spectral_centroid=_recording_centroid, spectral_flatness=_recording_flatness))
+        fake_librosa.stft = _recording_stft
+        fake_librosa.feature.mfcc = _recording_mfcc
+        fake_librosa.feature.spectral_centroid = _recording_centroid
+        fake_librosa.feature.spectral_flatness = _recording_flatness
         with patch.object(audio, "librosa", fake_librosa), patch.object(audio, "_prepare_audio_source", return_value=("ok", "clip.wav")), patch.object(
             audio,
             "_decode_audio_once",
@@ -336,9 +417,10 @@ class AudioUnitTests(TestCase):
         ):
             result = audio.analyze_audio("clip.wav")
         self.assertEqual(result["details"]["status"], "ok")
-        self.assertLessEqual(captured["mfcc_samples"], audio.MAX_AUDIO_SAMPLES)
-        self.assertLessEqual(captured["centroid_samples"], audio.MAX_AUDIO_SAMPLES)
-        self.assertLessEqual(captured["flatness_samples"], audio.MAX_AUDIO_SAMPLES)
+        self.assertLessEqual(captured["stft_samples"], audio.MAX_AUDIO_SAMPLES)
+        self.assertGreater(captured["mfcc_from_mel_bins"], 0)
+        self.assertGreater(captured["centroid_bins"], 0)
+        self.assertGreater(captured["flatness_bins"], 0)
 
     def test_high_source_rate_resampling_is_bounded_and_contiguous(self):
         for sample_rate in (48000, 96000, 192000):

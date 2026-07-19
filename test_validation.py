@@ -38,6 +38,7 @@ def _audio_result(**overrides):
         "rms_energy": 0.03,
         "noise_estimate": 0.2,
         "speech_presence_score": 0.9,
+        "audio_confidence": 0.84,
         "usable_speech_detected": True,
         "speech_state": "usable_speech",
         "quiet_but_usable": False,
@@ -72,6 +73,38 @@ def _analysis_dispatcher(*, video_result, image_result, audio_result):
         return results[missing_warning]
 
     return dispatch
+
+
+class _ReadyRuntimeForAnalysis:
+    def __init__(self, *, video_result, image_result, audio_result):
+        self._results = {
+            "video": video_result,
+            "image": image_result,
+            "audio": audio_result,
+        }
+
+    def is_ready(self):
+        return True
+
+    def run_scan(self, _scan_id, _media, *, deadline_seconds):
+        state = {
+            "timed_out": False,
+            "analyzer_error": False,
+            "final_alive": False,
+            "result_received": True,
+            "worker_generation": 1,
+            "process_exitcode": 0,
+        }
+        results = {}
+        for name, result in self._results.items():
+            copied = dict(result)
+            score = copied.get("score")
+            if name == "audio":
+                copied.setdefault("voice_metrics", {"voice_score": score})
+            else:
+                copied.setdefault("face_metrics", {f"{name}_score": score})
+            results[name] = copied
+        return results, {name: dict(state) for name in ("video", "audio", "image")}
 
 
 def _media_input_dispatcher():
@@ -281,8 +314,8 @@ class ValidationTests(unittest.TestCase):
             side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
-            "_safe_analyze",
-            side_effect=_analysis_dispatcher(
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
                 video_result=_video_result(),
                 image_result=_image_result(),
                 audio_result=_audio_result(
@@ -428,8 +461,8 @@ class MainPayloadTests(unittest.TestCase):
             side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
-            "_safe_analyze",
-            side_effect=_analysis_dispatcher(
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
                 video_result=video_result,
                 image_result=image_result,
                 audio_result=audio_result,
@@ -572,6 +605,14 @@ class MainPayloadTests(unittest.TestCase):
             "_baseline_rows_for_member",
             return_value=[],
         ), patch.object(
+            main,
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
+                video_result=main._analysis_worker_placeholder("video"),
+                image_result=main._analysis_worker_placeholder("image"),
+                audio_result=main._analysis_worker_placeholder("audio"),
+            ),
+        ), patch.object(
             main.directus,
             "upsert_scan_result",
             return_value=("created", {"id": "result-1"}),
@@ -617,8 +658,8 @@ class MainPayloadTests(unittest.TestCase):
             side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
-            "_safe_analyze",
-            side_effect=_analysis_dispatcher(
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
                 video_result=_video_result(
                     sharpness_score=0.2,
                     visual_quality_score=0.25,
@@ -710,6 +751,14 @@ class MainPayloadTests(unittest.TestCase):
             "_baseline_rows_for_member",
             return_value=[],
         ), patch.object(
+            main,
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
+                video_result=main._analysis_worker_placeholder("video"),
+                image_result=main._analysis_worker_placeholder("image"),
+                audio_result=main._analysis_worker_placeholder("audio"),
+            ),
+        ), patch.object(
             main.directus,
             "supports_fields",
             return_value=set(),
@@ -779,8 +828,8 @@ class MainPayloadTests(unittest.TestCase):
             side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
-            "_safe_analyze",
-            side_effect=_analysis_dispatcher(
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
                 video_result=_video_result(),
                 image_result=_image_result(),
                 audio_result={
@@ -845,7 +894,7 @@ class MainPayloadTests(unittest.TestCase):
             "is_configured",
             return_value=True,
         ):
-            health = main.health()
+            health = main._model_health()
 
         self.assertEqual(health["model_version"], "cie_v1_2")
         self.assertFalse(health["ml_loaded"])
@@ -879,8 +928,8 @@ class MainPayloadTests(unittest.TestCase):
             side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
-            "_safe_analyze",
-            side_effect=_analysis_dispatcher(
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
                 video_result=_video_result(),
                 image_result=_image_result(),
                 audio_result=_audio_result(),
@@ -1360,7 +1409,8 @@ class MainPayloadTests(unittest.TestCase):
             "_resolve_scan_auth_context",
             return_value={"id": "scan-123", "status": "processing", "user": "user-1", "business_profile": "bp-1"},
         ), patch.object(main, "_authorize_scan_access", return_value=None):
-            response = client.post("/process", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
+            with patch.object(main.directus, "get_scan_result_by_scan_id", return_value=None):
+                response = client.post("/process", json={"scan_id": "scan-123"}, headers={"Authorization": "Bearer test-token"})
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["status"], "already_processing")
 
@@ -1507,6 +1557,10 @@ class MainPayloadTests(unittest.TestCase):
             main,
             "process_scan_background",
             return_value=None,
+        ), patch.object(
+            main,
+            "get_analyzer_runtime",
+            return_value=MagicMock(is_ready=MagicMock(return_value=True)),
         ):
             response = client.post(
                 "/process",
@@ -1744,8 +1798,8 @@ class MainPayloadTests(unittest.TestCase):
             side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
-            "_safe_analyze",
-            side_effect=_analysis_dispatcher(
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
                 video_result=_video_result(),
                 image_result=_image_result(),
                 audio_result=_audio_result(),
@@ -2006,8 +2060,8 @@ class MainPayloadTests(unittest.TestCase):
             side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
-            "_safe_analyze",
-            side_effect=_analysis_dispatcher(
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
                 video_result=_video_result(),
                 image_result=_image_result(),
                 audio_result=_audio_result(),
@@ -2062,8 +2116,8 @@ class MainPayloadTests(unittest.TestCase):
             side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
-            "_safe_analyze",
-            side_effect=_analysis_dispatcher(
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
                 video_result=_video_result(),
                 image_result=_image_result(),
                 audio_result=_audio_result(),
@@ -2116,8 +2170,8 @@ class MainPayloadTests(unittest.TestCase):
             side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
-            "_safe_analyze",
-            side_effect=_analysis_dispatcher(
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
                 video_result=_video_result(
                     visual_quality_score=0.2,
                     visual_warnings=["video_blurry"],
@@ -2217,8 +2271,8 @@ class MainPayloadTests(unittest.TestCase):
             side_effect=_media_input_dispatcher(),
         ), patch.object(
             main,
-            "_safe_analyze",
-            side_effect=_analysis_dispatcher(
+            "get_analyzer_runtime",
+            return_value=_ReadyRuntimeForAnalysis(
                 video_result=_video_result(),
                 image_result=_image_result(),
                 audio_result=_audio_result(),
@@ -2273,8 +2327,8 @@ class MainPayloadTests(unittest.TestCase):
                     side_effect=_media_input_dispatcher(),
                 ), patch.object(
                     main,
-                    "_safe_analyze",
-                    side_effect=_analysis_dispatcher(
+                    "get_analyzer_runtime",
+                    return_value=_ReadyRuntimeForAnalysis(
                 video_result=_video_result(),
                 image_result=_image_result(),
                 audio_result=_audio_result(),

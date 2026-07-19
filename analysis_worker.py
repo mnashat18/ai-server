@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import inspect
 import time
-from typing import Any
+from typing import Any, Callable
 
 from logger import get_logger
 
 
 logger = get_logger()
+
+STARTUP_PROGRESS_STAGES = {
+    "import_started",
+    "import_completed",
+    "prewarm_file_created",
+    "first_call_started",
+    "first_call_completed",
+    "first_result_validated",
+    "second_call_started",
+    "second_call_completed",
+    "second_result_validated",
+    "cleanup_completed",
+    "ready_publish_started",
+}
 
 
 def _elapsed_ms(started_at: float) -> int:
@@ -29,6 +43,29 @@ def _log_worker_perf(scan_id: str | None, analyzer_name: str, metric: str, start
             handler.flush()
         except Exception:
             pass
+
+
+def _send_startup_progress(
+    result_conn: Any,
+    *,
+    analyzer_name: str,
+    worker_generation: int,
+    stage: str,
+    started_at: float,
+) -> None:
+    if analyzer_name != "audio" or stage not in STARTUP_PROGRESS_STAGES:
+        return
+    payload = {
+        "type": "startup_progress",
+        "analyzer": analyzer_name,
+        "worker_generation": worker_generation,
+        "stage": stage,
+        "elapsed_ms": _elapsed_ms(started_at),
+    }
+    try:
+        result_conn.send(payload)
+    except Exception:
+        raise RuntimeError("audio_startup_progress_publish_failed") from None
 
 
 def _warning_key(analyzer_name: str) -> str:
@@ -61,12 +98,12 @@ def _load_analyzer_callable(analyzer_name: str):
     return analyzer
 
 
-def _prewarm_analyzer(analyzer_name: str) -> dict[str, Any]:
+def _prewarm_analyzer(analyzer_name: str, progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     if analyzer_name != "audio":
         return {}
     from audio import prewarm_audio_analyzer
 
-    return prewarm_audio_analyzer()
+    return prewarm_audio_analyzer(progress=progress)
 
 
 def _startup_failure_payload(
@@ -202,14 +239,37 @@ def worker_main(result_conn: Any, analyzer_name: str, worker_generation: int) ->
     prewarm_metrics: dict[str, Any] = {}
     try:
         import_started_at = time.perf_counter()
+        _send_startup_progress(
+            result_conn,
+            analyzer_name=analyzer_name,
+            worker_generation=worker_generation,
+            stage="import_started",
+            started_at=started_at,
+        )
         try:
             analyzer = _load_analyzer_callable(analyzer_name)
         except Exception:
             analyzer_import_ms = _elapsed_ms(import_started_at)
             raise RuntimeError(f"{analyzer_name}_import_failed") from None
         analyzer_import_ms = _elapsed_ms(import_started_at)
+        _send_startup_progress(
+            result_conn,
+            analyzer_name=analyzer_name,
+            worker_generation=worker_generation,
+            stage="import_completed",
+            started_at=started_at,
+        )
         try:
-            prewarm_metrics = _prewarm_analyzer(analyzer_name)
+            prewarm_metrics = _prewarm_analyzer(
+                analyzer_name,
+                progress=lambda stage: _send_startup_progress(
+                    result_conn,
+                    analyzer_name=analyzer_name,
+                    worker_generation=worker_generation,
+                    stage=stage,
+                    started_at=started_at,
+                ),
+            )
         except Exception as exc:
             terminal_reason = getattr(exc, "terminal_reason", f"{analyzer_name}_prewarm_failed")
             failure_stage = getattr(exc, "failure_stage", "prewarm")
@@ -221,6 +281,13 @@ def worker_main(result_conn: Any, analyzer_name: str, worker_generation: int) ->
             raise RuntimeError("audio_prewarm_second_result_invalid|warm_benchmark_validation")
         ready = _ready_payload(analyzer_name, worker_generation, started_at, analyzer_import_ms, prewarm_metrics)
         try:
+            _send_startup_progress(
+                result_conn,
+                analyzer_name=analyzer_name,
+                worker_generation=worker_generation,
+                stage="ready_publish_started",
+                started_at=started_at,
+            )
             result_conn.send(ready)
         except Exception as exc:
             logger.error(

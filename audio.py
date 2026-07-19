@@ -10,7 +10,7 @@ import threading
 import time
 import wave
 from contextlib import suppress
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -144,7 +144,7 @@ def _raise_audio_prewarm_error(terminal_reason: str, *, failure_stage: str, metr
     raise AudioPrewarmError(terminal_reason, failure_stage=failure_stage, metrics=dict(metrics))
 
 
-def prewarm_audio_analyzer() -> dict[str, Any]:
+def prewarm_audio_analyzer(progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     fd = None
     path = None
     first_result: dict | None = None
@@ -165,12 +165,18 @@ def prewarm_audio_analyzer() -> dict[str, Any]:
         "audio_prewarm_failure_stage": None,
     }
     total_started = time.perf_counter()
+    def _progress(stage: str) -> None:
+        if progress is None:
+            return
+        progress(stage)
+
     try:
         try:
             fd, path = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
             fd = None
             _write_deterministic_prewarm_wav(path)
+            _progress("prewarm_file_created")
         except Exception:
             _raise_audio_prewarm_error(
                 "audio_prewarm_file_generation_failed",
@@ -179,6 +185,7 @@ def prewarm_audio_analyzer() -> dict[str, Any]:
             )
 
         first_started = time.perf_counter()
+        _progress("first_call_started")
         try:
             first_result = analyze_audio(path, scan_id=None)
         except Exception:
@@ -189,6 +196,7 @@ def prewarm_audio_analyzer() -> dict[str, Any]:
                 metrics=metrics,
             )
         metrics["audio_prewarm_first_call_ms"] = _elapsed_ms(first_started)
+        _progress("first_call_completed")
         metrics["audio_prewarm_first_result"] = _prewarm_result_summary(first_result)
         if not _audio_prewarm_result_valid(first_result):
             _raise_audio_prewarm_error(
@@ -196,8 +204,10 @@ def prewarm_audio_analyzer() -> dict[str, Any]:
                 failure_stage="first_result_validation",
                 metrics=metrics,
             )
+        _progress("first_result_validated")
 
         second_started = time.perf_counter()
+        _progress("second_call_started")
         try:
             second_result = analyze_audio(path, scan_id=None)
         except Exception:
@@ -208,6 +218,7 @@ def prewarm_audio_analyzer() -> dict[str, Any]:
                 metrics=metrics,
             )
         metrics["audio_prewarm_second_call_ms"] = _elapsed_ms(second_started)
+        _progress("second_call_completed")
         metrics["audio_prewarm_second_result"] = _prewarm_result_summary(second_result)
         if not _audio_prewarm_result_valid(second_result):
             _raise_audio_prewarm_error(
@@ -215,6 +226,7 @@ def prewarm_audio_analyzer() -> dict[str, Any]:
                 failure_stage="second_result_validation",
                 metrics=metrics,
             )
+        _progress("second_result_validated")
 
         details = second_result.get("details") if isinstance(second_result, dict) else {}
         timings = details.get("timings_ms") if isinstance(details, dict) else {}
@@ -243,6 +255,8 @@ def prewarm_audio_analyzer() -> dict[str, Any]:
                 metrics["audio_prewarm_temp_deleted"] = True
             except Exception:
                 cleanup_failed = True
+        if not cleanup_failed:
+            _progress("cleanup_completed")
         if cleanup_failed:
             metrics["audio_prewarm_terminal_reason"] = "audio_prewarm_cleanup_failed"
             metrics["audio_prewarm_failure_stage"] = "cleanup"

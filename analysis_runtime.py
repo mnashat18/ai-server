@@ -19,6 +19,14 @@ import analysis_worker
 
 logger = get_logger()
 RUNTIME_STARTUP_MARGIN_SECONDS = 2.0
+AUDIO_COLD_STARTUP_TIMEOUT_SECONDS = 90.0
+STARTUP_PROGRESS_INACTIVITY_TIMEOUT_SECONDS = 20.0
+BACKGROUND_STARTUP_RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
+MAX_BACKGROUND_STARTUP_ATTEMPTS = 3
+STARTUP_THREAD_JOIN_TIMEOUT_SECONDS = 2.0
+STARTUP_READY_POLL_SLICE_SECONDS = 0.05
+RUNTIME_STATES = {"not_started", "starting", "ready", "failed", "shutting_down"}
+STARTUP_PROGRESS_STAGES = analysis_worker.STARTUP_PROGRESS_STAGES
 
 
 def _elapsed_ms(started_at: float) -> int:
@@ -186,7 +194,16 @@ class AnalysisRuntimeError(RuntimeError):
 
 
 class AnalysisRuntimeStartupError(AnalysisRuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        analyzer_name: str | None = None,
+        terminal_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.analyzer_name = analyzer_name
+        self.terminal_reason = terminal_reason or message
 
 
 class AnalysisRuntimeUnavailable(AnalysisRuntimeError):
@@ -198,8 +215,9 @@ class AnalysisRuntimeBusyError(AnalysisRuntimeError):
 
 
 class StartupCancelToken:
-    def __init__(self) -> None:
+    def __init__(self, attempt_id: int | None = None) -> None:
         self._event = threading.Event()
+        self.attempt_id = attempt_id
 
     def cancel(self) -> None:
         self._event.set()
@@ -214,6 +232,20 @@ def _startup_error_reason(analyzer_name: str, exc: Exception) -> str:
         if text:
             return text
     return f"{analyzer_name}_startup_failed"
+
+
+def _sanitize_runtime_token(value: Any, fallback: str = "startup_failed") -> str:
+    if not isinstance(value, str):
+        return fallback
+    cleaned = value.strip().casefold()
+    allowed = []
+    for character in cleaned:
+        if character.isalnum() or character == "_":
+            allowed.append(character)
+        elif character in {"-", " "}:
+            allowed.append("_")
+    token = "".join(allowed).strip("_")
+    return token[:80] or fallback
 
 
 @dataclass
@@ -237,6 +269,7 @@ class WorkerSupervisor:
         *,
         queue_capacity: int = 4,
         startup_timeout_seconds: float = 15.0,
+        startup_progress_inactivity_timeout_seconds: float = STARTUP_PROGRESS_INACTIVITY_TIMEOUT_SECONDS,
         recovery_timeout_seconds: float = 1.5,
         poll_interval_seconds: float = 0.05,
         context_factory: Callable[[], Any] | None = None,
@@ -245,6 +278,7 @@ class WorkerSupervisor:
         self.analyzer_name = analyzer_name
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=queue_capacity)
         self._startup_timeout_seconds = startup_timeout_seconds
+        self._startup_progress_inactivity_timeout_seconds = startup_progress_inactivity_timeout_seconds
         self._recovery_timeout_seconds = recovery_timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._context_factory = context_factory or (lambda: multiprocessing.get_context("spawn"))
@@ -264,6 +298,8 @@ class WorkerSupervisor:
         self._child_conn = None
         self._ready = False
         self._ready_metrics: dict[str, Any] = {}
+        self._last_startup_stage: str | None = None
+        self._last_startup_terminal_reason: str | None = None
         self._last_spawn_metrics: dict[str, Any] = {}
         self._jobs_by_id: dict[str, _WorkerJob] = {}
         self._completed_jobs: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -283,6 +319,8 @@ class WorkerSupervisor:
         self._active_restart_token: int | None = None
         self._restart_candidate_process = None
         self._restart_candidate_parent_conn = None
+        self._startup_candidate_process = None
+        self._startup_candidate_parent_conn = None
 
     def _prune_job_registries_locked(self) -> None:
         while len(self._completed_jobs) > self._completed_job_limit:
@@ -331,35 +369,79 @@ class WorkerSupervisor:
             child_conn.close()
         except Exception:
             pass
-        if restart_token is not None:
-            with self._lock:
+        with self._lock:
+            if restart_token is not None:
                 if self._stop_event.is_set() or self._active_restart_token != restart_token:
                     process_state = None
                 else:
                     self._restart_candidate_process = process
                     self._restart_candidate_parent_conn = parent_conn
                     process_state = True
-            if process_state is None:
-                self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
-                raise AnalysisRuntimeStartupError(f"{self.analyzer_name}_worker_start_stale")
+            else:
+                if self._stop_event.is_set() or (startup_cancel_token is not None and startup_cancel_token.is_cancelled()):
+                    process_state = None
+                else:
+                    self._startup_candidate_process = process
+                    self._startup_candidate_parent_conn = parent_conn
+                    process_state = True
+        if process_state is None:
+            stale_reason = (
+                f"{self.analyzer_name}_worker_start_stale"
+                if restart_token is not None
+                else f"{self.analyzer_name}_worker_start_cancelled"
+            )
+            self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
+            raise AnalysisRuntimeStartupError(
+                stale_reason,
+                analyzer_name=self.analyzer_name,
+                terminal_reason=stale_reason,
+            )
 
         ready_deadline = time.perf_counter() + self._startup_timeout_seconds
+        inactivity_deadline = time.perf_counter() + self._startup_progress_inactivity_timeout_seconds
         ready_payload: dict[str, Any] | None = None
         terminal_reason = None
         error_type = None
+        last_startup_stage: str | None = None
         while time.perf_counter() < ready_deadline:
             if startup_cancel_token is not None and startup_cancel_token.is_cancelled():
                 terminal_reason = f"{self.analyzer_name}_worker_start_cancelled"
                 error_type = "startup_cancelled"
                 break
-            timeout = max(0.0, ready_deadline - time.perf_counter())
+            now = time.perf_counter()
+            if now >= inactivity_deadline:
+                terminal_reason = f"{self.analyzer_name}_worker_startup_inactivity_timeout"
+                error_type = "startup_inactivity_timeout"
+                break
+            timeout = max(0.0, min(ready_deadline, inactivity_deadline) - now)
+            timeout = min(timeout, STARTUP_READY_POLL_SLICE_SECONDS)
             ready_handles = _wait_handles([parent_conn, process.sentinel], timeout=timeout)
             if parent_conn in ready_handles:
                 try:
                     message = parent_conn.recv()
                 except EOFError:
                     message = None
-                if isinstance(message, dict) and message.get("type") == "ready":
+                if isinstance(message, dict) and message.get("type") == "startup_progress":
+                    if (
+                        message.get("analyzer") == self.analyzer_name
+                        and message.get("worker_generation") == generation
+                        and message.get("stage") in STARTUP_PROGRESS_STAGES
+                    ):
+                        last_startup_stage = str(message.get("stage"))
+                        with self._lock:
+                            self._last_startup_stage = last_startup_stage
+                        inactivity_deadline = time.perf_counter() + self._startup_progress_inactivity_timeout_seconds
+                        logger.info(
+                            "analysis_worker_startup_progress analyzer=%s worker_generation=%s stage=%s elapsed_startup_ms=%s",
+                            self.analyzer_name,
+                            generation,
+                            last_startup_stage,
+                            int(message.get("elapsed_ms") or 0),
+                        )
+                        continue
+                    terminal_reason = f"{self.analyzer_name}_worker_startup_progress_invalid"
+                    error_type = "invalid_startup_progress"
+                elif isinstance(message, dict) and message.get("type") == "ready":
                     ready_payload = message
                 else:
                     terminal_reason = f"{self.analyzer_name}_worker_ready_payload_invalid"
@@ -372,6 +454,9 @@ class WorkerSupervisor:
         if ready_payload is None and terminal_reason is None:
             terminal_reason = f"{self.analyzer_name}_worker_ready_timeout"
             error_type = "startup_timeout"
+        if terminal_reason is not None:
+            with self._lock:
+                self._last_startup_terminal_reason = _sanitize_runtime_token(terminal_reason)
         if not (
             isinstance(ready_payload, dict)
             and ready_payload.get("ok") is True
@@ -389,15 +474,27 @@ class WorkerSupervisor:
                     error_type = "invalid_ready_payload"
             process_state = self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
             logger.error(
-                "analysis_worker_start_failed analyzer=%s worker_generation=%s error_type=%s terminal_reason=%s process_exitcode=%s elapsed_startup_ms=%s",
+                "analysis_worker_start_failed analyzer=%s worker_generation=%s error_type=%s terminal_reason=%s last_startup_stage=%s process_exitcode=%s elapsed_startup_ms=%s",
                 self.analyzer_name,
                 generation,
                 error_type or "invalid_ready_payload",
                 terminal_reason or f"{self.analyzer_name}_worker_start_failed",
+                last_startup_stage,
                 process_state.get("process_exitcode"),
                 _elapsed_ms(process_started_at),
             )
-            raise AnalysisRuntimeStartupError(terminal_reason or f"{self.analyzer_name}_worker_start_failed")
+            with self._lock:
+                if self._startup_candidate_process is process:
+                    self._startup_candidate_process = None
+                    self._startup_candidate_parent_conn = None
+                if self._restart_candidate_process is process:
+                    self._restart_candidate_process = None
+                    self._restart_candidate_parent_conn = None
+            raise AnalysisRuntimeStartupError(
+                terminal_reason or f"{self.analyzer_name}_worker_start_failed",
+                analyzer_name=self.analyzer_name,
+                terminal_reason=terminal_reason or f"{self.analyzer_name}_worker_start_failed",
+            )
         if startup_cancel_token is not None and startup_cancel_token.is_cancelled():
             process_state = self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
             logger.error(
@@ -409,7 +506,18 @@ class WorkerSupervisor:
                 process_state.get("process_exitcode"),
                 _elapsed_ms(process_started_at),
             )
-            raise AnalysisRuntimeStartupError(f"{self.analyzer_name}_worker_start_cancelled")
+            with self._lock:
+                if self._startup_candidate_process is process:
+                    self._startup_candidate_process = None
+                    self._startup_candidate_parent_conn = None
+                if self._restart_candidate_process is process:
+                    self._restart_candidate_process = None
+                    self._restart_candidate_parent_conn = None
+            raise AnalysisRuntimeStartupError(
+                f"{self.analyzer_name}_worker_start_cancelled",
+                analyzer_name=self.analyzer_name,
+                terminal_reason=f"{self.analyzer_name}_worker_start_cancelled",
+            )
 
         ready_metrics = ready_payload.get("metrics") if isinstance(ready_payload.get("metrics"), dict) else {}
         spawn_metrics = {
@@ -418,9 +526,17 @@ class WorkerSupervisor:
             "child_entry_ms": ready_metrics.get("child_entry_ms"),
             "total_worker_ms": ready_metrics.get("total_worker_ms"),
             "ready_wait_ms": _elapsed_ms(ready_wait_started_at),
+            "last_startup_stage": last_startup_stage,
         }
         for key, value in ready_metrics.items():
             spawn_metrics.setdefault(key, value)
+        with self._lock:
+            if self._startup_candidate_process is process:
+                self._startup_candidate_process = None
+                self._startup_candidate_parent_conn = None
+            if self._restart_candidate_process is process:
+                self._restart_candidate_process = None
+                self._restart_candidate_parent_conn = None
         return process, parent_conn, child_conn, spawn_metrics
 
     def _publish_spawned_worker_locked(self, generation: int, process: Any, parent_conn: Any, child_conn: Any, spawn_metrics: dict[str, Any]) -> None:
@@ -1233,6 +1349,8 @@ class WorkerSupervisor:
             process = self._process
             ready = self._ready
             generation = self._generation
+            last_startup_stage = self._last_startup_stage
+            last_startup_terminal_reason = self._last_startup_terminal_reason
         return {
             "ready": ready,
             "worker_generation": generation,
@@ -1243,6 +1361,8 @@ class WorkerSupervisor:
             "restart_generation": self._restart_generation,
             "restart_error_type": self._restart_error_type,
             "ready_metrics": dict(self._ready_metrics),
+            "last_startup_stage": last_startup_stage,
+            "terminal_reason": last_startup_terminal_reason,
         }
 
     def shutdown(self) -> None:
@@ -1258,8 +1378,12 @@ class WorkerSupervisor:
             self._active_restart_token = None
             candidate_process = self._restart_candidate_process
             candidate_parent_conn = self._restart_candidate_parent_conn
+            startup_candidate_process = self._startup_candidate_process
+            startup_candidate_parent_conn = self._startup_candidate_parent_conn
             self._restart_candidate_process = None
             self._restart_candidate_parent_conn = None
+            self._startup_candidate_process = None
+            self._startup_candidate_parent_conn = None
             restart_thread = self._restart_thread
             process = self._process
             parent_conn = self._parent_conn
@@ -1268,10 +1392,13 @@ class WorkerSupervisor:
             self._child_conn = None
             self._ready = False
             self._ready_metrics = {}
+            self._last_startup_terminal_reason = "runtime_shutdown"
             self._restart_in_progress = False
             self._restart_ready = False
         if candidate_process is not None and candidate_parent_conn is not None:
             self._cleanup_process_locked(candidate_process, candidate_parent_conn, timeout_seconds=self._recovery_timeout_seconds)
+        if startup_candidate_process is not None and startup_candidate_parent_conn is not None:
+            self._cleanup_process_locked(startup_candidate_process, startup_candidate_parent_conn, timeout_seconds=self._recovery_timeout_seconds)
         if restart_thread is not None and restart_thread.is_alive():
             restart_thread.join(timeout=self._recovery_timeout_seconds)
         if process is not None and parent_conn is not None:
@@ -1324,15 +1451,50 @@ class WarmAnalyzerRuntime:
         self._lock = threading.RLock()
         self._started = False
         self._stopped = False
+        self._runtime_state = "not_started"
         self._startup_started_at: float | None = None
         self._startup_ready_at: float | None = None
+        self._startup_finished_at: float | None = None
+        self._startup_terminal_reason: str | None = None
+        self._startup_last_stage: str | None = None
+        self._startup_attempts = 0
+        self._startup_attempt_id = 0
+        self._startup_final_failure_latched = False
+        self._startup_thread: threading.Thread | None = None
+        self._startup_cancel_token: StartupCancelToken | None = None
+        self._retry_wakeup = threading.Event()
         worker_entry_map = worker_entry_map or {}
-        self._supervisors = {
-            "video": WorkerSupervisor("video", context_factory=context_factory, worker_entry=worker_entry_map.get("video")),
-            "audio": WorkerSupervisor("audio", startup_timeout_seconds=30.0, context_factory=context_factory, worker_entry=worker_entry_map.get("audio")),
-            "image": WorkerSupervisor("image", context_factory=context_factory, worker_entry=worker_entry_map.get("image")),
-        }
+        self._context_factory = context_factory
+        self._worker_entry_map = dict(worker_entry_map)
+        self._supervisors = self._build_supervisors()
         self._startup_budget_seconds = self._derive_startup_budget_seconds()
+
+    def _build_supervisors(self) -> dict[str, WorkerSupervisor]:
+        return {
+            "video": WorkerSupervisor("video", context_factory=self._context_factory, worker_entry=self._worker_entry_map.get("video")),
+            "audio": WorkerSupervisor(
+                "audio",
+                startup_timeout_seconds=AUDIO_COLD_STARTUP_TIMEOUT_SECONDS,
+                startup_progress_inactivity_timeout_seconds=STARTUP_PROGRESS_INACTIVITY_TIMEOUT_SECONDS,
+                context_factory=self._context_factory,
+                worker_entry=self._worker_entry_map.get("audio"),
+            ),
+            "image": WorkerSupervisor("image", context_factory=self._context_factory, worker_entry=self._worker_entry_map.get("image")),
+        }
+
+    def _reset_supervisors(self) -> None:
+        with self._lock:
+            self._supervisors = self._build_supervisors()
+            self._startup_budget_seconds = self._derive_startup_budget_seconds()
+
+    def _reset_startup_failure_latch_for_tests(self) -> None:
+        with self._lock:
+            self._startup_final_failure_latched = False
+            self._startup_attempts = 0
+            self._startup_attempt_id = 0
+            self._startup_terminal_reason = None
+            if self._runtime_state == "failed":
+                self._runtime_state = "not_started"
 
     def _derive_startup_budget_seconds(self) -> float:
         worker_budgets = [
@@ -1408,12 +1570,103 @@ class WarmAnalyzerRuntime:
                 return f"{name}_worker_not_alive"
         return None
 
-    def start(self) -> dict[str, Any]:
+    def _all_workers_ready(self) -> bool:
+        return self._startup_health_failure_reason() is None
+
+    def start_background(self) -> dict[str, Any]:
         with self._lock:
-            if self._started and not self._stopped and all(supervisor.health()["ready"] for supervisor in self._supervisors.values()):
+            if self._runtime_state == "ready" and self._all_workers_ready():
+                return self.health()
+            if self._runtime_state in {"starting", "shutting_down"}:
+                return self.health()
+            if self._startup_final_failure_latched:
                 return self.health()
             if self._stopped:
                 raise AnalysisRuntimeUnavailable("analysis_runtime_stopped")
+            self._runtime_state = "starting"
+            self._startup_terminal_reason = None
+            self._startup_last_stage = None
+            self._retry_wakeup.clear()
+            if self._startup_thread is None or not self._startup_thread.is_alive():
+                self._startup_thread = threading.Thread(
+                    target=self._background_startup_loop,
+                    name="analyzer-runtime-startup",
+                    daemon=True,
+                )
+                self._startup_thread.start()
+            return self.health()
+
+    def _record_startup_failure(self, analyzer_name: str | None, exc: Exception) -> None:
+        failure_analyzer = analyzer_name or getattr(exc, "analyzer_name", None) or "runtime"
+        terminal_reason = getattr(exc, "terminal_reason", None) or _startup_error_reason(failure_analyzer, exc)
+        terminal_reason = _sanitize_runtime_token(terminal_reason)
+        supervisor_health = self._supervisors.get(failure_analyzer).health() if failure_analyzer in self._supervisors else {}
+        last_stage = supervisor_health.get("last_startup_stage")
+        with self._lock:
+            self._startup_terminal_reason = terminal_reason
+            if isinstance(last_stage, str):
+                self._startup_last_stage = last_stage
+
+    def _background_startup_loop(self) -> None:
+        while True:
+            with self._lock:
+                if self._runtime_state == "shutting_down" or self._startup_final_failure_latched:
+                    return
+                if self._startup_attempts >= MAX_BACKGROUND_STARTUP_ATTEMPTS:
+                    self._runtime_state = "failed"
+                    self._startup_final_failure_latched = True
+                    return
+                self._runtime_state = "starting"
+                self._startup_attempts += 1
+                self._startup_attempt_id += 1
+                attempt_number = self._startup_attempts
+                startup_cancel_token = StartupCancelToken(self._startup_attempt_id)
+                self._startup_cancel_token = startup_cancel_token
+            try:
+                self.start(startup_cancel_token=startup_cancel_token)
+            except Exception as exc:
+                failure_analyzer = getattr(exc, "analyzer_name", None)
+                self._record_startup_failure(failure_analyzer, exc)
+                cleanup_started_at = time.perf_counter()
+                self._cleanup_workers()
+                _log_perf("runtime", "startup_cleanup_ms", _elapsed_ms(cleanup_started_at))
+                with self._lock:
+                    if self._runtime_state == "shutting_down":
+                        return
+                    self._runtime_state = "failed"
+                    self._startup_finished_at = time.perf_counter()
+                    if self._startup_attempts >= MAX_BACKGROUND_STARTUP_ATTEMPTS:
+                        self._startup_final_failure_latched = True
+                logger.error(
+                    "analyzer_runtime_background_start_failed attempt=%s max_attempts=%s error_type=%s terminal_reason=%s",
+                    attempt_number,
+                    MAX_BACKGROUND_STARTUP_ATTEMPTS,
+                    type(exc).__name__,
+                    self._startup_terminal_reason,
+                )
+                if attempt_number >= MAX_BACKGROUND_STARTUP_ATTEMPTS:
+                    return
+                delay_seconds = BACKGROUND_STARTUP_RETRY_DELAYS_SECONDS[min(attempt_number - 1, len(BACKGROUND_STARTUP_RETRY_DELAYS_SECONDS) - 1)]
+                if self._retry_wakeup.wait(timeout=delay_seconds):
+                    return
+                continue
+            else:
+                return
+
+    def _cleanup_workers(self) -> None:
+        for supervisor in self._supervisors.values():
+            supervisor.shutdown()
+        self._reset_supervisors()
+
+    def start(self, *, startup_cancel_token: StartupCancelToken | None = None) -> dict[str, Any]:
+        with self._lock:
+            if self._started and not self._stopped and self._runtime_state == "ready" and self._all_workers_ready():
+                return self.health()
+            if self._stopped:
+                raise AnalysisRuntimeUnavailable("analysis_runtime_stopped")
+            self._runtime_state = "starting"
+            self._startup_terminal_reason = None
+            self._startup_last_stage = None
             self._startup_started_at = time.perf_counter()
 
         startup_started_at = self._startup_started_at
@@ -1423,26 +1676,49 @@ class WarmAnalyzerRuntime:
 
         startup_results: dict[str, Any] = {}
         errors: list[tuple[str, Exception]] = []
-        startup_cancel_token = StartupCancelToken()
-        executor = ThreadPoolExecutor(max_workers=len(self._supervisors))
-        futures = {
-            executor.submit(supervisor.start, startup_cancel_token=startup_cancel_token): analyzer_name
-            for analyzer_name, supervisor in self._supervisors.items()
-        }
-        deadline_at = startup_started_at + self._startup_budget_seconds
+        startup_cancel_token = startup_cancel_token or StartupCancelToken()
         try:
-            pending = set(futures.keys())
-            while pending:
-                remaining = deadline_at - time.perf_counter()
-                if remaining <= 0.0:
-                    break
-                done, pending = futures_wait(
-                    pending,
-                    timeout=remaining,
-                    return_when=concurrent.futures.FIRST_COMPLETED,
-                )
-                if not done:
-                    break
+            audio_started_at = time.perf_counter()
+            startup_results["audio"] = self._supervisors["audio"].start(startup_cancel_token=startup_cancel_token)
+            _log_perf("runtime", "audio_startup_stage_ms", _elapsed_ms(audio_started_at))
+        except Exception as exc:
+            errors.append(("audio", exc))
+            startup_results["audio"] = {
+                "error_type": type(exc).__name__,
+                "terminal_reason": _startup_error_reason("audio", exc),
+            }
+            startup_cancel_token.cancel()
+
+        if not errors:
+            media_started_at = time.perf_counter()
+            executor = ThreadPoolExecutor(max_workers=2)
+            media_names = [name for name in ("video", "image") if name in self._supervisors]
+            futures = {
+                executor.submit(self._supervisors[name].start, startup_cancel_token=startup_cancel_token): name
+                for name in media_names
+            }
+            try:
+                if futures:
+                    done, pending = futures_wait(
+                        set(futures.keys()),
+                        timeout=max(
+                            [self._supervisors[name]._startup_timeout_seconds for name in media_names] or [0.0],
+                        )
+                        + RUNTIME_STARTUP_MARGIN_SECONDS,
+                        return_when=concurrent.futures.ALL_COMPLETED,
+                    )
+                else:
+                    done, pending = set(), set()
+                if pending:
+                    startup_cancel_token.cancel()
+                    for future in pending:
+                        analyzer_name = futures[future]
+                        timeout_error = AnalysisRuntimeStartupError(f"{analyzer_name}_runtime_startup_timeout")
+                        startup_results[analyzer_name] = {
+                            "error_type": "startup_timeout",
+                            "terminal_reason": _startup_error_reason(analyzer_name, timeout_error),
+                        }
+                        errors.append((analyzer_name, timeout_error))
                 for future in done:
                     analyzer_name = futures[future]
                     try:
@@ -1453,48 +1729,38 @@ class WarmAnalyzerRuntime:
                             "error_type": type(exc).__name__,
                             "terminal_reason": _startup_error_reason(analyzer_name, exc),
                         }
-            if pending:
-                startup_cancel_token.cancel()
-                for future in pending:
-                    analyzer_name = futures[future]
-                    timeout_error = AnalysisRuntimeStartupError(f"{analyzer_name}_runtime_startup_timeout")
-                    startup_results[analyzer_name] = {
-                        "error_type": "startup_timeout",
-                        "terminal_reason": _startup_error_reason(analyzer_name, timeout_error),
-                    }
-                    errors.append((analyzer_name, timeout_error))
-            for future in set(futures.keys()) - pending:
-                analyzer_name = futures[future]
-                if analyzer_name in startup_results:
-                    continue
-                try:
-                    startup_results[analyzer_name] = future.result()
-                except Exception as exc:
-                    errors.append((analyzer_name, exc))
-                    startup_results[analyzer_name] = {
-                        "error_type": type(exc).__name__,
-                        "terminal_reason": _startup_error_reason(analyzer_name, exc),
-                    }
-            if errors:
-                startup_cancel_token.cancel()
-        finally:
-            if startup_cancel_token.is_cancelled():
-                futures_wait(set(futures.keys()), timeout=RUNTIME_STARTUP_MARGIN_SECONDS)
-            executor.shutdown(wait=False, cancel_futures=True)
+                        startup_cancel_token.cancel()
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+            _log_perf("runtime", "image_video_startup_stage_ms", _elapsed_ms(media_started_at))
 
         if errors:
             if not self._started:
                 first_analyzer, first_error = errors[0]
+                for analyzer_name, error in errors:
+                    reason = str(startup_results.get(analyzer_name, {}).get("terminal_reason") or _startup_error_reason(analyzer_name, error))
+                    if not reason.endswith("_worker_start_cancelled"):
+                        first_analyzer, first_error = analyzer_name, error
+                        break
+                first_terminal_reason = str(startup_results.get(first_analyzer, {}).get("terminal_reason") or "startup_failed")
                 self._log_startup_failure(
                     started_at=startup_started_at,
                     failure_analyzer=first_analyzer,
                     failure_type=type(first_error).__name__,
-                    terminal_reason=str(startup_results.get(first_analyzer, {}).get("terminal_reason") or "startup_failed"),
+                    terminal_reason=first_terminal_reason,
                 )
                 cleanup_started_at = time.perf_counter()
-                self.shutdown()
+                self._cleanup_workers()
                 _log_perf("runtime", "startup_cleanup_ms", _elapsed_ms(cleanup_started_at))
-                raise AnalysisRuntimeStartupError("analysis_runtime_start_failed") from first_error
+                with self._lock:
+                    self._runtime_state = "failed"
+                    self._startup_finished_at = time.perf_counter()
+                    self._startup_terminal_reason = _sanitize_runtime_token(first_terminal_reason)
+                raise AnalysisRuntimeStartupError(
+                    "analysis_runtime_start_failed",
+                    analyzer_name=first_analyzer,
+                    terminal_reason=first_terminal_reason,
+                ) from first_error
             logger.warning("analysis_runtime_partial_start_failed error_type=%s", type(errors[0][1]).__name__)
 
         health_failure = self._startup_health_failure_reason()
@@ -1507,14 +1773,24 @@ class WarmAnalyzerRuntime:
                 terminal_reason=health_failure,
             )
             cleanup_started_at = time.perf_counter()
-            self.shutdown()
+            self._cleanup_workers()
             _log_perf("runtime", "startup_cleanup_ms", _elapsed_ms(cleanup_started_at))
-            raise AnalysisRuntimeStartupError("analysis_runtime_start_failed")
+            with self._lock:
+                self._runtime_state = "failed"
+                self._startup_finished_at = time.perf_counter()
+                self._startup_terminal_reason = _sanitize_runtime_token(health_failure)
+            raise AnalysisRuntimeStartupError(
+                "analysis_runtime_start_failed",
+                analyzer_name=health_failure.split("_", 1)[0],
+                terminal_reason=health_failure,
+            )
 
         with self._lock:
             self._started = True
             self._stopped = False
+            self._runtime_state = "ready"
             self._startup_ready_at = time.perf_counter()
+            self._startup_finished_at = self._startup_ready_at
 
         self._log_worker_ready_metrics(startup_results)
         ready, pending_workers = self._startup_readiness_snapshot()
@@ -1522,6 +1798,7 @@ class WarmAnalyzerRuntime:
         logger.info("runtime_pending_workers=%s", pending_workers)
         _log_perf("runtime", "analyzer_runtime_start_ms", _elapsed_ms(startup_started_at))
         _log_perf("runtime", "analyzer_runtime_ready_ms", _elapsed_ms(startup_started_at))
+        _log_perf("runtime", "total_analyzer_readiness_ms", _elapsed_ms(startup_started_at))
         return {
             "analyzer_runtime_start_ms": _elapsed_ms(startup_started_at),
             "analyzer_runtime_ready_ms": _elapsed_ms(startup_started_at),
@@ -1530,8 +1807,8 @@ class WarmAnalyzerRuntime:
 
     def run_scan(self, scan_id: str, media: Any, *, deadline_seconds: float) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         runtime_started_at = time.perf_counter()
-        if not self._started:
-            self.start()
+        if not self.is_ready():
+            raise AnalysisRuntimeUnavailable("analyzer_runtime_not_ready")
 
         deadline_at = time.perf_counter() + deadline_seconds
         jobs: dict[str, Future] = {}
@@ -1691,27 +1968,71 @@ class WarmAnalyzerRuntime:
 
     def is_ready(self) -> bool:
         with self._lock:
-            return self._started and not self._stopped and all(supervisor.health()["ready"] for supervisor in self._supervisors.values())
+            return self._runtime_state == "ready" and self._started and not self._stopped and self._all_workers_ready()
+
+    def readiness(self) -> dict[str, Any]:
+        health = self.health()
+        workers = health.get("workers") if isinstance(health.get("workers"), dict) else {}
+        return {
+            "ready": bool(health.get("ready")),
+            "runtime_state": health.get("runtime_state"),
+            "video_ready": bool((workers.get("video") or {}).get("ready") and (workers.get("video") or {}).get("process_alive")),
+            "audio_ready": bool((workers.get("audio") or {}).get("ready") and (workers.get("audio") or {}).get("process_alive")),
+            "image_ready": bool((workers.get("image") or {}).get("ready") and (workers.get("image") or {}).get("process_alive")),
+            "startup_elapsed_ms": health.get("startup_elapsed_ms"),
+            "terminal_reason": health.get("terminal_reason"),
+        }
 
     def health(self) -> dict[str, Any]:
+        with self._lock:
+            runtime_state = self._runtime_state
+            startup_started_at = self._startup_started_at
+            startup_ready_at = self._startup_ready_at
+            startup_finished_at = self._startup_finished_at
+            terminal_reason = self._startup_terminal_reason
+            startup_attempts = self._startup_attempts
+            startup_attempt_id = self._startup_attempt_id
+            final_failure_latched = self._startup_final_failure_latched
+            startup_thread = self._startup_thread
+        if startup_started_at is not None:
+            end_at = startup_ready_at or startup_finished_at or time.perf_counter()
+            startup_elapsed_ms = int(round((end_at - startup_started_at) * 1000))
+        else:
+            startup_elapsed_ms = 0
         return {
             "ready": self.is_ready(),
             "started": self._started,
             "stopped": self._stopped,
+            "runtime_state": runtime_state,
             "workers": {name: supervisor.health() for name, supervisor in self._supervisors.items()},
-            "startup_started_at": self._startup_started_at,
-            "startup_ready_at": self._startup_ready_at,
+            "startup_started_at": startup_started_at,
+            "startup_ready_at": startup_ready_at,
+            "startup_elapsed_ms": startup_elapsed_ms,
+            "terminal_reason": terminal_reason,
+            "startup_attempts": startup_attempts,
+            "startup_attempt_id": startup_attempt_id,
+            "final_failure_latched": final_failure_latched,
+            "startup_thread_alive": bool(startup_thread.is_alive()) if startup_thread is not None else False,
         }
 
     def shutdown(self) -> None:
+        startup_thread = None
         with self._lock:
             if self._stopped:
                 return
+            self._runtime_state = "shutting_down"
             self._stopped = True
+            if self._startup_cancel_token is not None:
+                self._startup_cancel_token.cancel()
+            self._retry_wakeup.set()
+            startup_thread = self._startup_thread
+        if startup_thread is not None and startup_thread.is_alive() and startup_thread is not threading.current_thread():
+            startup_thread.join(timeout=STARTUP_THREAD_JOIN_TIMEOUT_SECONDS)
         for supervisor in self._supervisors.values():
             supervisor.shutdown()
         with self._lock:
             self._started = False
+            self._runtime_state = "shutting_down"
 
 
 _RUNTIME: WarmAnalyzerRuntime | None = None

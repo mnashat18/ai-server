@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 import requests
 from requests import HTTPError, RequestException
 
-from analysis_runtime import AnalysisRuntimeStartupError, get_runtime as get_analyzer_runtime
+from analysis_runtime import AnalysisRuntimeStartupError, AnalysisRuntimeUnavailable, get_runtime as get_analyzer_runtime
 from baseline import (
     baseline_ready_for_personalized_scoring,
     baseline_signal_payload,
@@ -264,7 +264,7 @@ class ScanResultResponse(BaseModel):
 def _startup_analyzer_runtime() -> None:
     runtime = get_analyzer_runtime()
     try:
-        runtime.start()
+        runtime.start_background()
     except AnalysisRuntimeStartupError:
         logger.error("analyzer_runtime_start_failed error_type=AnalysisRuntimeStartupError")
         raise
@@ -2240,7 +2240,7 @@ def _recover_completed_scan_if_result_exists(scan_id: str) -> bool | None:
         )
         return None
 
-    if not existing_result:
+    if not isinstance(existing_result, dict) or not existing_result.get("id"):
         return False
 
     try:
@@ -3126,10 +3126,23 @@ def process_scan_background(scan_id: str) -> None:
 
 @app.get("/health")
 def health():
+    return {"ok": True, "status": "alive"}
+
+
+@app.get("/ready")
+def readiness():
     runtime = get_analyzer_runtime()
-    if not runtime.is_ready():
-        raise HTTPException(status_code=503, detail="analyzer_runtime_not_ready")
-    return _model_health()
+    readiness_payload = runtime.readiness()
+    if not readiness_payload.get("ready"):
+        return JSONResponse(status_code=503, content=readiness_payload)
+    payload = _model_health()
+    payload["analyzer_runtime"] = readiness_payload
+    return payload
+
+
+@app.get("/readiness")
+def readiness_alias():
+    return readiness()
 
 
 def debug_scan(scan_id: str):
@@ -3363,6 +3376,20 @@ def process_scan(
     except HTTPException as exc:
         error = exc.detail if exc.detail == "scan_media_not_ready" else "invalid_scan_status"
         return _build_scan_result_response(ok=False, scan_id=scan_id, error=error, status_code=exc.status_code)
+
+    runtime = get_analyzer_runtime()
+    if not runtime.is_ready():
+        try:
+            runtime.start_background()
+        except AnalysisRuntimeUnavailable:
+            pass
+        return _build_scan_result_response(
+            ok=False,
+            scan_id=scan_id,
+            error="analyzer_runtime_not_ready",
+            status="analyzer_runtime_not_ready",
+            status_code=503,
+        )
 
     update_payload = _wellness_scan_update_payload(
         {
