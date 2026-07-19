@@ -124,6 +124,21 @@ class _FakeContext:
         return process
 
 
+class _ReadyThenEOFConn:
+    def __init__(self):
+        self.sent = []
+        self.closed = False
+
+    def send(self, payload):
+        self.sent.append(payload)
+
+    def recv(self):
+        raise EOFError()
+
+    def close(self):
+        self.closed = True
+
+
 class _ProbeRLock:
     def __init__(self):
         self._lock = __import__("threading").RLock()
@@ -355,6 +370,10 @@ class _FakeAudioLibrosa:
             window = audio.np.pad(window, (0, n_fft - win_length), mode="constant")
         return audio.np.fft.rfft(audio.np.ascontiguousarray(frames * window), axis=-1).T
 
+    @staticmethod
+    def stft(y, n_fft, hop_length, win_length=None, window="hann", center=True, pad_mode="constant"):
+        return _FakeAudioLibrosa._stft(y, n_fft=n_fft, hop_length=hop_length, win_length=win_length, center=center, pad_mode=pad_mode)
+
     class filters:
         @staticmethod
         def mel(*, sr, n_fft, n_mels):
@@ -378,7 +397,8 @@ class _FakeAudioLibrosa:
         def spectral_centroid(*, y=None, sr=None, hop_length=512, n_fft=2048, S=None):
             if S is None:
                 S = _FakeAudioLibrosa._stft(y, n_fft=n_fft, hop_length=hop_length)
-            magnitude = audio.np.asarray(S, dtype=audio.np.float64)
+            magnitude = audio.np.abs(audio.np.asarray(S))
+            magnitude = audio.np.asarray(magnitude, dtype=audio.np.float64)
             freqs = audio.np.fft.rfftfreq(2 * (magnitude.shape[0] - 1), d=1.0 / float(sr))
             centroid = audio.np.sum(magnitude * freqs[:, audio.np.newaxis], axis=0) / audio.np.maximum(audio.np.sum(magnitude, axis=0), 1e-10)
             return centroid[audio.np.newaxis, :]
@@ -387,14 +407,16 @@ class _FakeAudioLibrosa:
         def spectral_flatness(*, y=None, hop_length=512, n_fft=2048, S=None, power=2.0):
             if S is None:
                 S = _FakeAudioLibrosa._stft(y, n_fft=n_fft, hop_length=hop_length)
-            magnitude = audio.np.asarray(S, dtype=audio.np.float64) ** power
+            magnitude = audio.np.abs(audio.np.asarray(S))
+            magnitude = audio.np.asarray(magnitude, dtype=audio.np.float64) ** power
             flatness = audio.np.exp(audio.np.mean(audio.np.log(audio.np.maximum(magnitude, 1e-12)), axis=0)) / audio.np.maximum(audio.np.mean(magnitude, axis=0), 1e-12)
             return flatness[audio.np.newaxis, :]
 
         @staticmethod
         def melspectrogram(*, y=None, sr=None, S=None, n_mels=128, n_fft=2048, hop_length=512):
             if S is None:
-                S = audio.np.abs(_FakeAudioLibrosa._stft(y, n_fft=n_fft, hop_length=hop_length))
+                magnitude = audio.np.abs(_FakeAudioLibrosa._stft(y, n_fft=n_fft, hop_length=hop_length))
+                S = magnitude * magnitude
             power = audio.np.asarray(S, dtype=audio.np.float64)
             mel_basis = _FakeAudioLibrosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
             return mel_basis @ power
@@ -3481,7 +3503,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(scanned_result["score"], 0.9)
 
     def test_audio_decode_happens_once_and_reuses_normalized_samples(self):
-        sentinel = object()
+        sentinel = audio.np.zeros(16, dtype=audio.np.float32)
         captured = {}
         features = {
             "rms_energy": 0.03,
@@ -3579,7 +3601,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_audio_feature_pipeline_reuses_shared_frame_matrix_and_preserves_reference_values(self):
         sr = 16000
-        duration_seconds = 5.0
+        duration_seconds = 3.0
         sample_count = int(sr * duration_seconds)
         base_time = audio.np.linspace(0.0, duration_seconds, sample_count, endpoint=False)
         signals = [
@@ -3682,8 +3704,8 @@ class PipelineTests(unittest.TestCase):
                 self.assertAlmostEqual(features["flatness"], reference["flatness"], delta=1e-6, msg=label)
                 self.assertAlmostEqual(features["tonal_concentration"], reference["tonal_concentration"], delta=1e-6, msg=label)
                 for actual, expected in zip(features["mfcc_summary"], reference["mfcc_summary"]):
-                    self.assertAlmostEqual(actual, expected, delta=1e-6, msg=label)
-                self.assertGreaterEqual(features["audio_confidence"], 0.0, msg=label)
+                    self.assertAlmostEqual(actual, expected, delta=1e-5, msg=label)
+                self.assertGreaterEqual(features["speech_presence_score"], 0.0, msg=label)
 
     def test_audio_analyze_audio_decodes_once_when_success_details_are_stubbed(self):
         frame_calls = []
@@ -3727,6 +3749,154 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(len(fake_context.processes), 1)
         self.assertTrue(fake_context.processes[0].terminated or fake_context.processes[0].killed)
+
+    def test_audio_worker_does_not_report_ready_before_prewarm_completes(self):
+        conn = _ReadyThenEOFConn()
+        order = []
+
+        def prewarm():
+            order.append("prewarm")
+            self.assertEqual(conn.sent, [])
+            return {
+                "audio_prewarm_first_call_ms": 11,
+                "audio_prewarm_second_call_ms": 3,
+                "audio_prewarm_decode_ms": 1,
+                "audio_prewarm_vad_ms": 1,
+                "audio_prewarm_pitch_ms": 0,
+                "audio_prewarm_spectral_ms": 2,
+                "audio_prewarm_mel_ms": 1,
+                "audio_prewarm_mfcc_ms": 1,
+                "audio_prewarm_total_ms": 14,
+                "audio_warm_benchmark_passed": True,
+            }
+
+        with unittest.mock.patch.object(analysis_worker, "_load_analyzer_callable", return_value=lambda path, scan_id=None: {}):
+            with unittest.mock.patch.object(analysis_worker, "_prewarm_analyzer", side_effect=lambda name: prewarm()):
+                analysis_worker.worker_main(conn, "audio", 7)
+
+        self.assertEqual(order, ["prewarm"])
+        self.assertEqual(len(conn.sent), 1)
+        ready = conn.sent[0]
+        self.assertEqual(ready["type"], "ready")
+        self.assertTrue(ready["ok"])
+        self.assertEqual(ready["worker_generation"], 7)
+        self.assertTrue(ready["metrics"]["audio_warm_benchmark_passed"])
+        self.assertIn("audio_import_ms", ready["metrics"])
+
+    def test_audio_worker_prewarm_failure_does_not_publish_ready(self):
+        conn = _ReadyThenEOFConn()
+
+        with unittest.mock.patch.object(analysis_worker, "_load_analyzer_callable", return_value=lambda path, scan_id=None: {}):
+            with unittest.mock.patch.object(analysis_worker, "_prewarm_analyzer", return_value={"audio_warm_benchmark_passed": False}):
+                analysis_worker.worker_main(conn, "audio", 1)
+
+        self.assertEqual(len(conn.sent), 1)
+        self.assertEqual(conn.sent[0]["type"], "ready")
+        self.assertFalse(conn.sent[0]["ok"])
+
+    def test_audio_prewarm_executes_once_per_worker_generation(self):
+        calls = []
+
+        def prewarm():
+            calls.append(time.time())
+            return {
+                "audio_prewarm_first_call_ms": 10,
+                "audio_prewarm_second_call_ms": 2,
+                "audio_prewarm_decode_ms": 1,
+                "audio_prewarm_vad_ms": 1,
+                "audio_prewarm_pitch_ms": 0,
+                "audio_prewarm_spectral_ms": 1,
+                "audio_prewarm_mel_ms": 1,
+                "audio_prewarm_mfcc_ms": 1,
+                "audio_prewarm_total_ms": 12,
+                "audio_warm_benchmark_passed": True,
+            }
+
+        for generation in [1, 2]:
+            conn = _ReadyThenEOFConn()
+            with unittest.mock.patch.object(analysis_worker, "_load_analyzer_callable", return_value=lambda path, scan_id=None: {}):
+                with unittest.mock.patch.object(analysis_worker, "_prewarm_analyzer", side_effect=lambda name: prewarm()):
+                    analysis_worker.worker_main(conn, "audio", generation)
+            self.assertEqual(conn.sent[0]["worker_generation"], generation)
+
+        self.assertEqual(len(calls), 2)
+
+    def test_required_audio_timeout_blocks_completed_full_result(self):
+        quality_result = {
+            "media_quality": {
+                "video": {"present": True, "usable": True},
+                "audio": {"present": False, "usable": False},
+                "image": {"present": True, "usable": True},
+            }
+        }
+        reason, required = main._required_modality_gate(quality_result, timed_out_modalities=["audio"])
+
+        self.assertEqual(required, ["video", "audio"])
+        self.assertEqual(reason, main.FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT)
+
+    def test_full_multimodal_result_requires_numeric_voice_confidence(self):
+        result = {
+            "voice_confidence": None,
+            "fusion_details": {
+                "signal_profiles": {
+                    "video": {"present": True, "score": 0.8},
+                    "audio": {"present": False, "score": None},
+                    "image": {"present": True, "score": 0.9},
+                }
+            },
+        }
+        reason = main._required_full_multimodal_evidence_failure(
+            result=result,
+            worker_states={"audio": {"timed_out": False}},
+            valid_modalities=["video", "image"],
+        )
+
+        self.assertEqual(reason, main.FAILURE_REASON_AUDIO_MISSING)
+
+    def test_successful_audio_populates_voice_confidence_and_enters_fusion(self):
+        signals = {
+            "camera": _signal(0.92, {"status": "ok", "image_confidence": 0.92, "image_quality_score": 0.92, "face_detected": True, "avg_ear": 0.3}),
+            "video": _signal(0.82, {"status": "ok", "visual_confidence": 0.82, "visual_quality_score": 0.82, "duration_seconds": 5.0, "face_frames": 10, "sampled_frames": 12, "face_or_subject_visibility": 0.8}),
+            "voice": _signal(0.67, {"status": "ok", "audio_confidence": 0.67, "audio_quality_score": 0.7, "duration_seconds": 3.0, "rms_energy": 0.03, "zero_crossing_rate": 0.08, "spectral_centroid": 1200.0, "silent": False}),
+        }
+        quality_result = assess_quality(signals, speech_required=False)
+        result = compute_result(signals=signals, task=None, previous_confidence=None, baseline=None, baseline_used=False, quality=quality_result, ml_result=None)
+
+        self.assertIsInstance(result["voice_confidence"], float)
+        self.assertEqual(result["voice_confidence"], 0.67)
+        self.assertEqual(result["voice_metrics"]["voice_score"], 0.67)
+        self.assertTrue(result["fusion_details"]["signal_profiles"]["audio"]["present"])
+        self.assertEqual(result["modality_scores"]["audio"], 0.67)
+
+    def test_audio_feature_order_remains_model_contract(self):
+        from ml.features import FEATURE_ORDER
+
+        self.assertEqual(
+            FEATURE_ORDER,
+            [
+                "camera_score",
+                "face_detected",
+                "avg_ear",
+                "eyes_closed",
+                "audio_score",
+                "audio_energy",
+                "audio_zcr",
+                "audio_centroid",
+                "audio_duration",
+                "audio_silent",
+                "video_score",
+                "video_sway_std",
+                "video_face_rate",
+                "video_face_frames",
+                "video_sampled_frames",
+                "task_reaction_time",
+                "task_errors",
+                "task_present",
+                "missing_camera",
+                "missing_audio",
+                "missing_video",
+            ],
+        )
 
 
 

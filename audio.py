@@ -85,6 +85,104 @@ def _elapsed_ms(started_at: float) -> int:
 def _log_audio_perf(scan_id: str | None, metric: str, started_at: float, *, status: str = "ok") -> None:
     value = 0 if status == "skipped" else _elapsed_ms(started_at)
     logger.info("[AUDIO_PERF] metric=%s scan_id=%s value=%s status=%s", metric, scan_id, value, status)
+    for handler in getattr(logger, "handlers", []):
+        with suppress(Exception):
+            handler.flush()
+
+
+def _write_deterministic_prewarm_wav(path: str) -> None:
+    sr = TARGET_SAMPLE_RATE
+    duration_seconds = 5.0
+    sample_count = int(sr * duration_seconds)
+    t = np.arange(sample_count, dtype=np.float32) / float(sr)
+    envelope = np.where((t > 0.35) & (t < 4.65), 1.0, 0.0).astype(np.float32)
+    slow_modulation = 0.65 + 0.35 * np.sin(2.0 * np.pi * 2.3 * t).astype(np.float32)
+    tone = (
+        0.035 * np.sin(2.0 * np.pi * 180.0 * t)
+        + 0.022 * np.sin(2.0 * np.pi * 360.0 * t)
+        + 0.012 * np.sin(2.0 * np.pi * 720.0 * t)
+    ).astype(np.float32)
+    noise = np.random.default_rng(42).normal(0.0, 0.003, sample_count).astype(np.float32)
+    samples = np.clip(envelope * slow_modulation * tone + envelope * noise, -0.95, 0.95)
+    pcm = np.asarray(np.round(samples * 32767.0), dtype="<i2")
+    with wave.open(path, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sr)
+        handle.writeframes(pcm.tobytes())
+
+
+def prewarm_audio_analyzer() -> dict[str, int | bool]:
+    fd = None
+    path = None
+    first_result: dict | None = None
+    second_result: dict | None = None
+    metrics: dict[str, int | bool] = {
+        "audio_prewarm_first_call_ms": 0,
+        "audio_prewarm_second_call_ms": 0,
+        "audio_prewarm_decode_ms": 0,
+        "audio_prewarm_vad_ms": 0,
+        "audio_prewarm_pitch_ms": 0,
+        "audio_prewarm_spectral_ms": 0,
+        "audio_prewarm_mel_ms": 0,
+        "audio_prewarm_mfcc_ms": 0,
+        "audio_prewarm_total_ms": 0,
+        "audio_warm_benchmark_passed": False,
+    }
+    total_started = time.perf_counter()
+    try:
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        fd = None
+        _write_deterministic_prewarm_wav(path)
+
+        first_started = time.perf_counter()
+        first_result = analyze_audio(path, scan_id=None)
+        metrics["audio_prewarm_first_call_ms"] = _elapsed_ms(first_started)
+
+        second_started = time.perf_counter()
+        second_result = analyze_audio(path, scan_id=None)
+        metrics["audio_prewarm_second_call_ms"] = _elapsed_ms(second_started)
+
+        details = second_result.get("details") if isinstance(second_result, dict) else {}
+        timings = details.get("timings_ms") if isinstance(details, dict) else {}
+        quality_timings = details.get("audio_quality_timings_ms") if isinstance(details, dict) else {}
+        metrics["audio_prewarm_decode_ms"] = int(timings.get("audio_decode_ms") or 0)
+        metrics["audio_prewarm_vad_ms"] = int(timings.get("voice_activity_ms") or 0)
+        metrics["audio_prewarm_pitch_ms"] = int(quality_timings.get("pitch_ms") or 0)
+        metrics["audio_prewarm_spectral_ms"] = int(quality_timings.get("spectral_total_ms") or 0)
+        metrics["audio_prewarm_mel_ms"] = int(quality_timings.get("mel_ms") or 0)
+        metrics["audio_prewarm_mfcc_ms"] = int(quality_timings.get("mfcc_transform_ms") or quality_timings.get("mfcc_ms") or 0)
+        metrics["audio_warm_benchmark_passed"] = _audio_prewarm_result_valid(first_result) and _audio_prewarm_result_valid(second_result)
+        return metrics
+    finally:
+        metrics["audio_prewarm_total_ms"] = _elapsed_ms(total_started)
+        if fd is not None:
+            with suppress(Exception):
+                os.close(fd)
+        if path:
+            with suppress(Exception):
+                os.remove(path)
+
+
+def _audio_prewarm_result_valid(result: dict | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    details = result.get("details")
+    if not isinstance(details, dict) or details.get("status") != "ok":
+        return False
+    required_numbers = [
+        details.get("audio_confidence"),
+        details.get("audio_quality_score"),
+        details.get("duration_seconds"),
+        details.get("rms_energy"),
+        details.get("spectral_centroid"),
+        details.get("zero_crossing_rate"),
+    ]
+    if not all(type(value) in {int, float} and math.isfinite(float(value)) for value in required_numbers):
+        return False
+    mfcc = details.get("mfcc_summary")
+    return isinstance(mfcc, list) and len(mfcc) == 5 and all(type(value) in {int, float} and math.isfinite(float(value)) for value in mfcc)
 
 
 def _is_string_like(value) -> bool:
@@ -316,7 +414,7 @@ def _mfcc_summary_like(y: np.ndarray, sr: int, *, hop_length: int, n_fft: int) -
         raise RuntimeError("mfcc_feature_failed") from exc
 
 
-def _mfcc_summary_like_from_power(power: np.ndarray, sr: int, *, n_fft: int, scan_id: str | None = None) -> list[float | None]:
+def _mfcc_summary_like_from_power_with_timings(power: np.ndarray, sr: int, *, n_fft: int, scan_id: str | None = None) -> tuple[list[float | None], int, int]:
     if librosa is None:
         raise RuntimeError("mfcc_feature_failed")
     try:
@@ -324,24 +422,30 @@ def _mfcc_summary_like_from_power(power: np.ndarray, sr: int, *, n_fft: int, sca
         if power_matrix.ndim != 2:
             raise RuntimeError("mfcc_feature_failed")
         mel_started = time.perf_counter()
-        mel_power = librosa.feature.melspectrogram(S=power_matrix, sr=sr, n_mels=128)
+        mel_power = librosa.feature.melspectrogram(S=power_matrix, sr=sr, n_mels=128, n_fft=n_fft)
         mel_db = librosa.power_to_db(mel_power, ref=np.max)
         _log_audio_perf(scan_id, "audio_mel_ms", mel_started)
         mfcc_started = time.perf_counter()
         mfcc_matrix = librosa.feature.mfcc(S=mel_db, n_mfcc=5)
         _log_audio_perf(scan_id, "audio_mfcc_ms", mfcc_started)
+        mfcc_transform_ms = _elapsed_ms(mfcc_started)
         arr = np.asarray(mfcc_matrix, dtype=np.float64)
         if arr.ndim != 2 or arr.shape[0] != 5 or arr.size == 0:
             raise RuntimeError("mfcc_feature_failed")
         if not np.isfinite(arr).all():
             raise RuntimeError("mfcc_feature_failed")
-        return [float(np.mean(row)) for row in arr]
+        return [float(np.mean(row)) for row in arr], _elapsed_ms(mel_started), mfcc_transform_ms
     except KeyboardInterrupt:
         raise
     except SystemExit:
         raise
     except Exception as exc:
         raise RuntimeError("mfcc_feature_failed") from exc
+
+
+def _mfcc_summary_like_from_power(power: np.ndarray, sr: int, *, n_fft: int, scan_id: str | None = None) -> list[float | None]:
+    summary, _, _ = _mfcc_summary_like_from_power_with_timings(power, sr, n_fft=n_fft, scan_id=scan_id)
+    return summary
 
 
 def _resample_if_needed(y: np.ndarray, sr: int) -> tuple[np.ndarray, int]:
@@ -507,6 +611,7 @@ def _decode_audio_once(audio_path: str, *, scan_id: str | None = None) -> tuple[
     _, ext = os.path.splitext(audio_path)
     if ext.lower() in {".wav", ".wave"}:
         try:
+            _log_audio_perf(scan_id, "audio_conversion_ms", time.perf_counter(), status="skipped")
             return _decode_wav_slice(audio_path, scan_id=scan_id)
         except _AudioEmptyError:
             raise
@@ -612,6 +717,7 @@ def _feature_pipeline(y: np.ndarray, sr: int, *, scan_id: str | None = None) -> 
     _log_audio_perf(scan_id, "audio_energy_ms", step_started)
 
     step_started = time.perf_counter()
+    stft_started = time.perf_counter()
     stft_matrix = librosa.stft(
         y=y,
         n_fft=frame_length,
@@ -621,6 +727,8 @@ def _feature_pipeline(y: np.ndarray, sr: int, *, scan_id: str | None = None) -> 
         center=True,
         pad_mode="constant",
     )
+    stft_ms = _elapsed_ms(stft_started)
+    _log_audio_perf(scan_id, "audio_stft_ms", stft_started)
     magnitude = np.asarray(np.abs(stft_matrix), dtype=np.float64)
     power = magnitude * magnitude
     centroid_started = time.perf_counter()
@@ -636,7 +744,7 @@ def _feature_pipeline(y: np.ndarray, sr: int, *, scan_id: str | None = None) -> 
     flatness_ms = _elapsed_ms(flatness_started)
 
     mfcc_started = time.perf_counter()
-    mfcc_summary = _mfcc_summary_like_from_power(power, sr, n_fft=frame_length, scan_id=scan_id)
+    mfcc_summary, mel_ms, mfcc_transform_ms = _mfcc_summary_like_from_power_with_timings(power, sr, n_fft=frame_length, scan_id=scan_id)
     mfcc_ms = _elapsed_ms(mfcc_started)
     spectral_ms = _elapsed_ms(step_started)
     _log_audio_perf(scan_id, "audio_spectral_ms", step_started)
@@ -696,7 +804,11 @@ def _feature_pipeline(y: np.ndarray, sr: int, *, scan_id: str | None = None) -> 
             "zcr_ms": rms_ms,
             "spectral_centroid_ms": centroid_ms,
             "spectral_flatness_ms": flatness_ms,
+            "stft_ms": stft_ms,
             "mfcc_ms": mfcc_ms,
+            "mel_ms": mel_ms,
+            "mfcc_transform_ms": mfcc_transform_ms,
+            "pitch_ms": 0,
             "derived_metrics_ms": derived_ms,
             "spectral_total_ms": spectral_ms,
         },

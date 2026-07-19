@@ -2473,7 +2473,13 @@ def _required_modality_gate(
             continue
         required_modalities.append(modality)
         if modality in timed_out_modalities:
-            continue
+            if modality == "audio":
+                return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, required_modalities
+            if modality == "video":
+                return FAILURE_REASON_VIDEO_MISSING, required_modalities
+            if modality == "image":
+                return FAILURE_REASON_IMAGE_MISSING, required_modalities
+            return FAILURE_REASON_MISSING_MEDIA, required_modalities
         modality_quality = media_quality.get(modality) or {}
         if modality == "audio" and "audio_decode_timeout" in set(modality_quality.get("warnings") or []):
             return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT, required_modalities
@@ -2488,6 +2494,32 @@ def _required_modality_gate(
         if not modality_quality.get("usable"):
             return FAILURE_REASON_LOW_QUALITY_MEDIA, required_modalities
     return None, required_modalities
+
+
+def _required_full_multimodal_evidence_failure(
+    *,
+    result: dict[str, Any],
+    worker_states: dict[str, dict[str, Any]],
+    valid_modalities: list[str],
+) -> str | None:
+    if not (VALIDATION_POLICY.require_video and VALIDATION_POLICY.require_audio and VALIDATION_POLICY.require_image):
+        return None
+    required = {"video", "audio", "image"}
+    valid = set(valid_modalities)
+    if not required.issubset(valid):
+        if "audio" not in valid:
+            audio_state = worker_states.get("audio") or {}
+            if audio_state.get("timed_out"):
+                return FAILURE_REASON_AUDIO_VALIDATION_TIMEOUT
+            return FAILURE_REASON_AUDIO_MISSING
+        if "video" not in valid:
+            return FAILURE_REASON_VIDEO_MISSING
+        if "image" not in valid:
+            return FAILURE_REASON_IMAGE_MISSING
+        return FAILURE_REASON_MISSING_MEDIA
+    if result.get("voice_confidence") is None:
+        return FAILURE_REASON_AUDIO_MISSING
+    return None
 
 
 def _process_scan_sync(scan_id: str) -> dict[str, Any]:
@@ -2891,6 +2923,27 @@ def _process_scan_sync(scan_id: str) -> dict[str, Any]:
             result=result,
             baseline_eligibility=baseline_eligibility,
         )
+        full_evidence_failure = _required_full_multimodal_evidence_failure(
+            result=result,
+            worker_states=worker_states,
+            valid_modalities=valid_modalities,
+        )
+        if full_evidence_failure:
+            validation_result = fail_validation(full_evidence_failure, warnings=quality_result.get("warnings"))
+            _log_validation_decision(
+                scan_id,
+                valid_modalities=valid_modalities,
+                timed_out_modalities=timed_out_modalities,
+                terminal_reason="required_full_multimodal_evidence_missing",
+            )
+            _log_step(scan_id, "validation_failed", reason=validation_result["failure_reason"], scores=phrase_validation["quality_scores"])
+            _log_step(scan_id, "directus_writeback_start")
+            writeback_started = time.perf_counter()
+            terminal_writeback_status = _mark_scan_failed_terminal(scan_id, validation_result["failure_reason"], validation_result["failure_message"])
+            validation_result["writeback_status"] = terminal_writeback_status
+            _log_perf(scan_id, "directus_writeback_ms", _elapsed_ms(writeback_started))
+            _log_perf(scan_id, "total_process_ms", _elapsed_ms(total_started))
+            return {"status": SCAN_STATUS_FAILED, **validation_result}
         if not _result_has_valid_evidence(result):
             validation_result = fail_validation(quality_result.get("failure_reason") or FAILURE_REASON_LOW_QUALITY_MEDIA, warnings=quality_result.get("warnings"))
             _log_validation_decision(

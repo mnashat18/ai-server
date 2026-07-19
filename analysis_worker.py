@@ -24,6 +24,11 @@ def _log_worker_perf(scan_id: str | None, analyzer_name: str, metric: str, start
         value,
         status,
     )
+    for handler in getattr(logger, "handlers", []):
+        try:
+            handler.flush()
+        except Exception:
+            pass
 
 
 def _warning_key(analyzer_name: str) -> str:
@@ -56,17 +61,35 @@ def _load_analyzer_callable(analyzer_name: str):
     return analyzer
 
 
-def _ready_payload(analyzer_name: str, worker_generation: int, started_at: float, import_started_at: float) -> dict[str, Any]:
+def _prewarm_analyzer(analyzer_name: str) -> dict[str, Any]:
+    if analyzer_name != "audio":
+        return {}
+    from audio import prewarm_audio_analyzer
+
+    return prewarm_audio_analyzer()
+
+
+def _ready_payload(
+    analyzer_name: str,
+    worker_generation: int,
+    started_at: float,
+    analyzer_import_ms: int,
+    prewarm_metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metrics = {
+        "child_entry_ms": _elapsed_ms(started_at),
+        "analyzer_import_ms": analyzer_import_ms,
+        "total_worker_ms": _elapsed_ms(started_at),
+    }
+    if analyzer_name == "audio":
+        metrics["audio_import_ms"] = metrics["analyzer_import_ms"]
+        metrics.update(prewarm_metrics or {})
     return {
         "type": "ready",
         "ok": True,
         "analyzer": analyzer_name,
         "worker_generation": worker_generation,
-        "metrics": {
-            "child_entry_ms": _elapsed_ms(started_at),
-            "analyzer_import_ms": _elapsed_ms(import_started_at),
-            "total_worker_ms": _elapsed_ms(started_at),
-        },
+        "metrics": metrics,
     }
 
 
@@ -145,7 +168,11 @@ def worker_main(result_conn: Any, analyzer_name: str, worker_generation: int) ->
     try:
         import_started_at = time.perf_counter()
         analyzer = _load_analyzer_callable(analyzer_name)
-        ready = _ready_payload(analyzer_name, worker_generation, started_at, import_started_at)
+        analyzer_import_ms = _elapsed_ms(import_started_at)
+        prewarm_metrics = _prewarm_analyzer(analyzer_name)
+        if analyzer_name == "audio" and prewarm_metrics.get("audio_warm_benchmark_passed") is not True:
+            raise RuntimeError("audio_prewarm_failed")
+        ready = _ready_payload(analyzer_name, worker_generation, started_at, analyzer_import_ms, prewarm_metrics)
         try:
             result_conn.send(ready)
         except Exception:

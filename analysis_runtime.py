@@ -356,6 +356,8 @@ class WorkerSupervisor:
             "total_worker_ms": ready_metrics.get("total_worker_ms"),
             "ready_wait_ms": _elapsed_ms(ready_wait_started_at),
         }
+        for key, value in ready_metrics.items():
+            spawn_metrics.setdefault(key, value)
         return process, parent_conn, child_conn, spawn_metrics
 
     def _publish_spawned_worker_locked(self, generation: int, process: Any, parent_conn: Any, child_conn: Any, spawn_metrics: dict[str, Any]) -> None:
@@ -364,6 +366,7 @@ class WorkerSupervisor:
         self._parent_conn = parent_conn
         self._child_conn = child_conn
         self._ready = True
+        self._ready_metrics = dict(spawn_metrics)
         self._last_spawn_metrics = spawn_metrics
 
     def _spawn_worker_locked(self) -> dict[str, Any]:
@@ -433,6 +436,7 @@ class WorkerSupervisor:
         self._parent_conn = None
         self._child_conn = None
         self._ready = False
+        self._ready_metrics = {}
         if process is None or parent_conn is None:
             return {"terminated": False, "killed": False, "process_exitcode": None, "alive": False, "process_exited": True}
         return self._cleanup_process_locked(process, parent_conn, timeout_seconds=self._recovery_timeout_seconds)
@@ -533,6 +537,7 @@ class WorkerSupervisor:
         self._restart_ready = False
         self._restart_error_type = None
         self._ready = False
+        self._ready_metrics = {}
         self._restart_thread = threading.Thread(
             target=self._restart_worker_async,
             args=(expected_generation, scheduled_at),
@@ -612,6 +617,7 @@ class WorkerSupervisor:
                 self._parent_conn = None
                 self._child_conn = None
                 self._ready = False
+                self._ready_metrics = {}
             elif not process_state:
                 process_state = self._snapshot_process_locked()
 
@@ -699,6 +705,7 @@ class WorkerSupervisor:
                 self._parent_conn = None
                 self._child_conn = None
                 self._ready = False
+                self._ready_metrics = {}
 
         startup_started_at = time.perf_counter()
         if process_to_reset is not None and parent_conn_to_reset is not None:
@@ -1011,6 +1018,7 @@ class WorkerSupervisor:
                         self._parent_conn = None
                         self._child_conn = None
                         self._ready = False
+                        self._ready_metrics = {}
                         if self._schedule_restart_locked(old_generation):
                             restart_thread = self._restart_thread
                 if process_to_reset is not None and parent_conn_to_reset is not None:
@@ -1167,6 +1175,7 @@ class WorkerSupervisor:
             "restart_ready": self._restart_ready,
             "restart_generation": self._restart_generation,
             "restart_error_type": self._restart_error_type,
+            "ready_metrics": dict(self._ready_metrics),
         }
 
     def shutdown(self) -> None:
@@ -1191,6 +1200,7 @@ class WorkerSupervisor:
             self._parent_conn = None
             self._child_conn = None
             self._ready = False
+            self._ready_metrics = {}
             self._restart_in_progress = False
             self._restart_ready = False
         if candidate_process is not None and candidate_parent_conn is not None:
@@ -1252,7 +1262,7 @@ class WarmAnalyzerRuntime:
         worker_entry_map = worker_entry_map or {}
         self._supervisors = {
             "video": WorkerSupervisor("video", context_factory=context_factory, worker_entry=worker_entry_map.get("video")),
-            "audio": WorkerSupervisor("audio", context_factory=context_factory, worker_entry=worker_entry_map.get("audio")),
+            "audio": WorkerSupervisor("audio", startup_timeout_seconds=30.0, context_factory=context_factory, worker_entry=worker_entry_map.get("audio")),
             "image": WorkerSupervisor("image", context_factory=context_factory, worker_entry=worker_entry_map.get("image")),
         }
 
