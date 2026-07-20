@@ -471,6 +471,22 @@ class AudioUnitTests(TestCase):
         self.assertIn(result["details"]["speech_state"], {"quiet_usable_speech", "usable_speech"})
         self.assertTrue(result["details"]["usable_speech_detected"])
 
+    def test_no_speech_state_is_not_quiet_but_usable(self):
+        warnings, speech_state, quiet_but_usable, usable_speech_detected = audio._speech_state_and_warnings(
+            duration_seconds=3.0,
+            rms_energy=audio.MIN_RMS_ENERGY * 0.7,
+            noise_estimate=0.2,
+            silence_ratio=0.5,
+            speech_presence_score=0.13,
+            clipping_ratio=0.0,
+            tonal_concentration=0.2,
+            rms_variation=0.5,
+        )
+        self.assertIn("speech_not_detected", warnings)
+        self.assertEqual(speech_state, "no_speech")
+        self.assertFalse(quiet_but_usable)
+        self.assertFalse(usable_speech_detected)
+
     def test_silence_tone_noise_and_clipping_confidence_are_gated(self):
         speech = self._analyze(_speech_like(amplitude=0.02))
         silence = self._analyze(np.zeros(int(audio.TARGET_SAMPLE_RATE * 3), dtype=np.float32))

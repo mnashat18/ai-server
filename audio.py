@@ -948,6 +948,7 @@ def _speech_state_and_warnings(
         or silence_ratio > 0.80
         or (speech_presence_score < 0.15 and rms_energy < minimum_usable_energy and noise_estimate < 0.55 and clipping_ratio <= MAX_CLIPPING_RATIO)
     )
+    quiet_but_usable = quiet_but_usable and not no_usable_speech
     warnings: list[str] = []
     if duration_seconds < MIN_AUDIO_DURATION_SEC:
         warnings.append("audio_too_short")
