@@ -798,6 +798,10 @@ def _voice_clarity_from_features(
     return float(np.clip(score, 0.0, 1.0))
 
 
+def _audio_confidence_from_components(*, audio_quality_score: float, voice_clarity_score: float) -> float:
+    return float(np.clip(0.45 * audio_quality_score + 0.55 * voice_clarity_score, 0.0, 1.0))
+
+
 def _feature_pipeline(y: np.ndarray, sr: int, *, scan_id: str | None = None) -> dict:
     if librosa is None:
         raise RuntimeError("audio_decode_failed")
@@ -1027,13 +1031,9 @@ def _build_success_details(
         )
     )
     voice_clarity_score = features["voice_clarity_score"]
-    audio_confidence = float(
-        np.clip(
-            (0.45 * audio_quality_score + 0.55 * voice_clarity_score)
-            * clamp01(0.25 + 0.75 * features["speech_presence_score"], 0.0),
-            0.0,
-            1.0,
-        )
+    audio_confidence = _audio_confidence_from_components(
+        audio_quality_score=audio_quality_score,
+        voice_clarity_score=voice_clarity_score,
     )
     audio_quality_ms = _elapsed_ms(quality_started)
     silent = bool(features["silence_ratio"] > 0.80 or features["rms_energy"] < (MIN_RMS_ENERGY * 0.5))
@@ -1074,6 +1074,18 @@ def _build_success_details(
         },
         "audio_quality_timings_ms": features["timings_ms"],
     }
+    logger.info(
+        "[AUDIO_CONFIDENCE_COMPONENTS] audio_quality_score=%.6f voice_clarity_score=%.6f speech_presence_score=%.6f "
+        "audio_confidence=%.6f speech_state=%s usable_speech_detected=%s quiet_but_usable=%s warning_count=%s",
+        audio_quality_score,
+        voice_clarity_score,
+        features["speech_presence_score"],
+        audio_confidence,
+        speech_state,
+        usable_speech_detected,
+        quiet_but_usable,
+        len(warnings),
+    )
     _log_audio_perf(scan_id, "audio_result_build_ms", quality_started)
     return details
 

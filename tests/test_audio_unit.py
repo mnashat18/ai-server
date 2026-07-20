@@ -467,9 +467,47 @@ class AudioUnitTests(TestCase):
                 self.assertIn(details["speech_state"], {"no_speech", "unusable_quality"})
 
     def test_speech_like_modulation_remains_usable(self):
-        result = self._analyze(_speech_like(amplitude=0.02))
-        self.assertIn(result["details"]["speech_state"], {"quiet_usable_speech", "usable_speech"})
-        self.assertTrue(result["details"]["usable_speech_detected"])
+        result = self._analyze(_speech_like(amplitude=0.08))
+        details = result["details"]
+        self.assertEqual(details["status"], "ok")
+        self.assertIn(details["speech_state"], {"quiet_usable_speech", "usable_speech"})
+        self.assertTrue(details["usable_speech_detected"])
+        self.assertFalse(
+            {"audio_too_quiet", "audio_too_noisy", "audio_clipping", "speech_not_detected"}
+            & set(details["audio_warnings"])
+        )
+        for field in ("audio_quality_score", "voice_clarity_score", "speech_presence_score", "audio_confidence"):
+            self.assertTrue(math.isfinite(details[field]))
+
+    def test_audio_confidence_formula_owns_only_quality_and_clarity(self):
+        quality = 0.8
+        clarity = 0.6
+        expected = 0.45 * quality + 0.55 * clarity
+        for increasing_presence in (0.0, 0.4, 1.0):
+            with self.subTest(speech_presence_score=increasing_presence):
+                self.assertAlmostEqual(
+                    audio._audio_confidence_from_components(
+                        audio_quality_score=quality,
+                        voice_clarity_score=clarity,
+                    ),
+                    expected,
+                )
+
+    def test_audio_confidence_components_are_independent_and_bounded(self):
+        baseline = audio._audio_confidence_from_components(audio_quality_score=0.4, voice_clarity_score=0.4)
+        clearer = audio._audio_confidence_from_components(audio_quality_score=0.4, voice_clarity_score=0.8)
+        higher_quality = audio._audio_confidence_from_components(audio_quality_score=0.8, voice_clarity_score=0.4)
+        self.assertGreater(clearer, baseline)
+        self.assertGreater(higher_quality, baseline)
+        for quality in (0.0, 0.5, 1.0):
+            for clarity in (0.0, 0.5, 1.0):
+                confidence = audio._audio_confidence_from_components(
+                    audio_quality_score=quality,
+                    voice_clarity_score=clarity,
+                )
+                self.assertTrue(math.isfinite(confidence))
+                self.assertGreaterEqual(confidence, 0.0)
+                self.assertLessEqual(confidence, 1.0)
 
     def test_no_speech_state_is_not_quiet_but_usable(self):
         warnings, speech_state, quiet_but_usable, usable_speech_detected = audio._speech_state_and_warnings(
@@ -585,11 +623,24 @@ class AudioUnitTests(TestCase):
                 self.assertIsNone(result["details"]["speech_rate"])
 
     def test_quiet_but_usable_signal_sets_quiet_but_usable(self):
-        result = self._analyze(_speech_like(amplitude=0.02))
-        self.assertIn(result["details"]["speech_state"], {"quiet_usable_speech", "usable_speech"})
-        if result["details"]["speech_state"] == "quiet_usable_speech":
-            self.assertTrue(result["details"]["quiet_but_usable"])
-            self.assertTrue(result["details"]["usable_speech_detected"])
+        warnings, speech_state, quiet_but_usable, usable_speech_detected = audio._speech_state_and_warnings(
+            duration_seconds=3.0,
+            rms_energy=0.01,
+            noise_estimate=0.2,
+            silence_ratio=0.5,
+            speech_presence_score=0.2,
+            clipping_ratio=0.0,
+            tonal_concentration=0.2,
+            rms_variation=0.5,
+        )
+        self.assertEqual(speech_state, "quiet_usable_speech")
+        self.assertTrue(quiet_but_usable)
+        self.assertTrue(usable_speech_detected)
+        self.assertNotIn("speech_not_detected", warnings)
+        self.assertAlmostEqual(
+            audio._audio_confidence_from_components(audio_quality_score=0.5, voice_clarity_score=0.2),
+            0.45 * 0.5 + 0.55 * 0.2,
+        )
 
     def test_too_quiet_signal_is_not_quiet_but_usable(self):
         result = self._analyze(_speech_like(amplitude=0.0015))
