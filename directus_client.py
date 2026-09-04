@@ -739,6 +739,18 @@ class DirectusClient:
             raise RuntimeError("Directus list response must be a list of dictionaries")
         return result
 
+    def check_processing_readiness(self) -> None:
+        """Verify the service token can perform a minimal processing read.
+
+        This intentionally reads only one non-sensitive field and never mutates
+        Directus data. An empty collection is a successful dependency check.
+        """
+        self.list_items(
+            "wellness_scans",
+            fields=["id"],
+            limit=1,
+        )
+
 
     def get_collection_fields(self, collection: str) -> set[str] | None:
         collection_text = str(collection).strip()
@@ -1068,9 +1080,17 @@ class DirectusClient:
             + optional_scan_fields,
         )
 
-    def list_business_profile_members(self, user_id: Any, business_profile_id: Any) -> list[dict]:
+    def list_business_profile_members(
+        self,
+        user_id: Any,
+        business_profile_id: Any,
+        *,
+        require_schema: bool = False,
+    ) -> list[dict]:
         available = self.get_collection_fields("business_profile_members")
         if not available or not {"id", "user", "business_profile"}.issubset(available):
+            if require_schema:
+                raise RuntimeError("Directus membership schema is unavailable")
             return []
 
         fields = [

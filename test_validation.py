@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import ANY, MagicMock, patch
 
@@ -2496,6 +2497,214 @@ class MainPayloadTests(unittest.TestCase):
         self.assertEqual(update_payload["status"], "completed")
         self.assertEqual(update_payload["failure_reason"], None)
         self.assertNotIn("ai_model_version", update_payload)
+
+
+class BaselineStatusAndReadinessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(main.app)
+        self.membership = {
+            "id": "membership-1",
+            "user": "user-1",
+            "business_profile": "bp-1",
+            "member": "member-1",
+            "status": "active",
+        }
+
+    def _get_baseline_status(self, *, member_id="member-1", business_profile_id="bp-1", token="test-token"):
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+        return self.client.get(
+            "/baseline/status",
+            params={"member_id": member_id, "business_profile_id": business_profile_id},
+            headers=headers,
+        )
+
+    def _ready_response(self, *, directus_ready=True, directus_check=None, analyzer_ready=True, model_required=False, model_loaded=False):
+        runtime = MagicMock()
+        runtime.is_ready.return_value = analyzer_ready
+        check = directus_check or MagicMock()
+        with patch.object(main.directus, "is_configured", return_value=directus_ready), patch.object(
+            main.directus, "check_processing_readiness", side_effect=check
+        ), patch.object(main, "get_analyzer_runtime", return_value=runtime), patch.object(
+            main.ml_runtime, "local_model_required", return_value=model_required
+        ), patch.object(main.ml_runtime, "is_loaded", return_value=model_loaded):
+            response = main.readiness()
+        return response, check, runtime
+
+    def test_baseline_status_requires_bearer(self):
+        response = self._get_baseline_status(token=None)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["detail"], "invalid_authorization")
+
+    def test_baseline_status_rejects_oversized_relation_ids(self):
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main, "_authenticate_process_user", return_value="user-1"
+        ):
+            response = self._get_baseline_status(member_id="m" * 256)
+        self.assertEqual(response.status_code, 422)
+
+    def test_process_rejects_oversized_scan_id(self):
+        response = self.client.post("/process", json={"scan_id": "s" * 256})
+        self.assertEqual(response.status_code, 422)
+
+    def test_baseline_status_rejects_invalid_bearer(self):
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main,
+            "_authenticate_process_user",
+            side_effect=HTTPException(status_code=401, detail="invalid_authorization"),
+        ):
+            response = self._get_baseline_status()
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["detail"], "invalid_authorization")
+
+    def test_baseline_status_allows_authorized_member_baseline(self):
+        baseline = {"is_active": True, "scan_count": 3, "baseline_confidence": 0.8}
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main, "_authenticate_process_user", return_value="user-1"
+        ), patch.object(
+            main.directus, "list_business_profile_members", return_value=[self.membership]
+        ) as membership_lookup, patch.object(
+            main.directus, "get_employee_baseline", return_value=baseline
+        ) as baseline_lookup:
+            response = self._get_baseline_status()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["is_active"])
+        membership_lookup.assert_called_once_with("user-1", "bp-1", require_schema=True)
+        baseline_lookup.assert_called_once_with("member-1", "bp-1")
+
+    def test_baseline_status_denies_cross_member_without_baseline_lookup(self):
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main, "_authenticate_process_user", return_value="user-1"
+        ), patch.object(
+            main.directus, "list_business_profile_members", return_value=[self.membership]
+        ), patch.object(main.directus, "get_employee_baseline") as baseline_lookup:
+            response = self._get_baseline_status(member_id="member-2")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "baseline_status_not_found")
+        baseline_lookup.assert_not_called()
+
+    def test_baseline_status_denies_cross_workspace_without_baseline_lookup(self):
+        other_workspace_membership = dict(self.membership, business_profile="bp-other")
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main, "_authenticate_process_user", return_value="user-1"
+        ), patch.object(
+            main.directus,
+            "list_business_profile_members",
+            return_value=[other_workspace_membership],
+        ), patch.object(main.directus, "get_employee_baseline") as baseline_lookup:
+            response = self._get_baseline_status(business_profile_id="bp-2")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "baseline_status_not_found")
+        baseline_lookup.assert_not_called()
+
+    def test_baseline_status_returns_inactive_for_missing_authorized_baseline(self):
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main, "_authenticate_process_user", return_value="user-1"
+        ), patch.object(
+            main.directus, "list_business_profile_members", return_value=[self.membership]
+        ), patch.object(main.directus, "get_employee_baseline", return_value=None):
+            response = self._get_baseline_status()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["is_active"])
+        self.assertEqual(response.json()["scan_count"], 0)
+
+    def test_baseline_status_denies_inactive_membership(self):
+        inactive_membership = dict(self.membership, status="inactive")
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main, "_authenticate_process_user", return_value="user-1"
+        ), patch.object(
+            main.directus, "list_business_profile_members", return_value=[inactive_membership]
+        ), patch.object(main.directus, "get_employee_baseline") as baseline_lookup:
+            response = self._get_baseline_status()
+
+        self.assertEqual(response.status_code, 404)
+        baseline_lookup.assert_not_called()
+
+    def test_baseline_status_returns_controlled_failure_for_membership_lookup_error(self):
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main, "_authenticate_process_user", return_value="user-1"
+        ), patch.object(
+            main.directus,
+            "list_business_profile_members",
+            side_effect=RuntimeError("secret directus response"),
+        ), patch.object(main.directus, "get_employee_baseline") as baseline_lookup:
+            response = self._get_baseline_status()
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["detail"], "baseline_status_dependency_failure")
+        self.assertNotIn("secret directus response", response.text)
+        baseline_lookup.assert_not_called()
+
+    def test_baseline_status_returns_controlled_failure_for_baseline_lookup_error(self):
+        with patch.object(main.directus, "is_configured", return_value=True), patch.object(
+            main, "_authenticate_process_user", return_value="user-1"
+        ), patch.object(
+            main.directus, "list_business_profile_members", return_value=[self.membership]
+        ), patch.object(
+            main.directus,
+            "get_employee_baseline",
+            side_effect=RuntimeError("secret directus response"),
+        ):
+            response = self._get_baseline_status()
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["detail"], "baseline_status_dependency_failure")
+        self.assertNotIn("secret directus response", response.text)
+
+    def test_readiness_all_dependencies_ready_returns_minimal_success(self):
+        response, check, runtime = self._ready_response()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), {"ready": True})
+        check.assert_called_once_with()
+        runtime.is_ready.assert_called_once_with()
+
+    def test_readiness_returns_503_when_directus_is_unconfigured(self):
+        response, check, runtime = self._ready_response(directus_ready=False)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body), {"ready": False})
+        check.assert_not_called()
+        runtime.is_ready.assert_not_called()
+
+    def test_readiness_returns_503_when_directus_check_fails(self):
+        response, check, runtime = self._ready_response(
+            directus_check=RuntimeError("secret directus response")
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body), {"ready": False})
+        self.assertNotIn("secret directus response", response.body.decode())
+        runtime.is_ready.assert_not_called()
+
+    def test_readiness_returns_503_when_analyzer_is_unavailable(self):
+        response, _check, runtime = self._ready_response(analyzer_ready=False)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body), {"ready": False})
+        runtime.is_ready.assert_called_once_with()
+
+    def test_readiness_returns_503_when_required_model_is_missing(self):
+        response, _check, _runtime = self._ready_response(
+            model_required=True,
+            model_loaded=False,
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body), {"ready": False})
+
+    def test_readiness_allows_optional_missing_model(self):
+        response, _check, _runtime = self._ready_response(
+            model_required=False,
+            model_loaded=False,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), {"ready": True})
 
 
 if __name__ == "__main__":

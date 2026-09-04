@@ -1739,6 +1739,18 @@ class PipelineTests(unittest.TestCase):
         _, kwargs = client.list_items.call_args
         self.assertEqual(kwargs["sort"], "-scan_count,-date_updated")
 
+    def test_processing_readiness_uses_bounded_read_only_collection_read(self):
+        client = DirectusClient(base_url="http://example.com", token="x")
+        client.list_items = MagicMock(return_value=[])
+
+        client.check_processing_readiness()
+
+        client.list_items.assert_called_once_with(
+            "wellness_scans",
+            fields=["id"],
+            limit=1,
+        )
+
     def test_directus_400_logs_sanitized_summary_without_response_body(self):
         client = DirectusClient(base_url="http://example.com", token="x")
         response = requests.Response()
@@ -4523,24 +4535,18 @@ class PipelineTests(unittest.TestCase):
 
     def test_liveness_is_200_while_readiness_is_503_during_startup(self):
         class StartingRuntime:
-            def readiness(self):
-                return {
-                    "ready": False,
-                    "runtime_state": "starting",
-                    "video_ready": False,
-                    "audio_ready": False,
-                    "image_ready": False,
-                    "startup_elapsed_ms": 12,
-                    "terminal_reason": None,
-                }
+            def is_ready(self):
+                return False
 
-        with unittest.mock.patch.object(main, "get_analyzer_runtime", return_value=StartingRuntime()):
+        with unittest.mock.patch.object(main, "_directus_processing_ready", return_value=True), unittest.mock.patch.object(
+            main, "get_analyzer_runtime", return_value=StartingRuntime()
+        ):
             live = main.health()
             ready = main.readiness()
 
         self.assertEqual(live["status"], "alive")
         self.assertEqual(ready.status_code, 503)
-        self.assertEqual(json.loads(ready.body)["runtime_state"], "starting")
+        self.assertEqual(json.loads(ready.body), {"ready": False})
 
     def test_process_returns_503_before_runtime_ready_without_marking_processing(self):
         class StartingRuntime:

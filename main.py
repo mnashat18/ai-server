@@ -15,7 +15,7 @@ import sys
 from multiprocessing.connection import wait as multiprocessing_wait
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import requests
@@ -231,14 +231,14 @@ class Task(BaseModel):
 
 
 class ScanRequest(BaseModel):
-    scan_id: str = Field(..., min_length=1)
+    scan_id: str = Field(..., min_length=1, max_length=255)
 
     class Config:
         extra = "ignore"
 
 
 class BaselineRequest(BaseModel):
-    scan_id: str | None = None
+    scan_id: str | None = Field(default=None, max_length=255)
     media: Media | None = None
     manually_unreliable: bool = False
 
@@ -1709,6 +1709,92 @@ def _baseline_rows_for_member(member_id: str | None, business_profile_id: str | 
     except Exception as exc:
         logger.warning("baseline_fetch_failed member_id=%s error=%s", member_id, exc)
         return []
+
+
+def _authenticate_baseline_status_user(
+    authorization: str | None = Header(default=None),
+) -> Any:
+    """Authenticate a baseline-status caller without trusting query IDs."""
+    if not _bearer_token(authorization):
+        raise HTTPException(status_code=401, detail="invalid_authorization")
+    if directus is None or not directus.is_configured():
+        logger.warning("baseline_status_auth_unavailable reason=directus_not_configured")
+        raise HTTPException(status_code=503, detail="directus_unavailable")
+    return _authenticate_process_user(authorization, "baseline-status")
+
+
+def _authorize_baseline_status_access(
+    authenticated_user_id: Any,
+    member_id: str,
+    business_profile_id: str,
+) -> None:
+    """Require an active server-resolved membership for the requested relation."""
+    try:
+        membership_rows = directus.list_business_profile_members(
+            authenticated_user_id,
+            business_profile_id,
+            require_schema=True,
+        )
+    except Exception as exc:
+        logger.warning(
+            "baseline_status_membership_lookup_failed error_type=%s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="baseline_status_dependency_failure",
+        ) from exc
+
+    target_scope = {"member": member_id}
+    for row in membership_rows or []:
+        if not _ids_equal(row.get("user"), authenticated_user_id):
+            continue
+        if not _ids_equal(row.get("business_profile"), business_profile_id):
+            continue
+        if not _membership_row_is_active(row):
+            continue
+        if _membership_row_matches_scan_scope(row, target_scope):
+            return
+
+    logger.info("baseline_status_access_denied")
+    raise HTTPException(status_code=404, detail="baseline_status_not_found")
+
+
+def _authorized_baseline_for_status(
+    member_id: str,
+    business_profile_id: str,
+) -> dict | None:
+    """Read baseline data only after access has been authorized."""
+    try:
+        return directus.get_employee_baseline(member_id, business_profile_id)
+    except Exception as exc:
+        logger.warning(
+            "baseline_status_lookup_failed error_type=%s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="baseline_status_dependency_failure",
+        ) from exc
+
+
+def _directus_processing_ready() -> bool:
+    if directus is None or not directus.is_configured():
+        logger.warning("readiness_directus_unavailable reason=not_configured")
+        return False
+    try:
+        directus.check_processing_readiness()
+    except Exception as exc:
+        logger.warning(
+            "readiness_directus_check_failed error_type=%s",
+            type(exc).__name__,
+        )
+        return False
+    return True
+
+
+def _public_readiness_response(*, ready: bool) -> JSONResponse:
+    return JSONResponse(status_code=200 if ready else 503, content={"ready": ready})
 
 
 def _identifier_payload(scan_context: dict) -> dict:
@@ -3257,13 +3343,19 @@ def health():
 
 @app.get("/ready")
 def readiness():
+    if not _directus_processing_ready():
+        return _public_readiness_response(ready=False)
+
     runtime = get_analyzer_runtime()
-    readiness_payload = runtime.readiness()
-    if not readiness_payload.get("ready"):
-        return JSONResponse(status_code=503, content=readiness_payload)
-    payload = _model_health()
-    payload["analyzer_runtime"] = readiness_payload
-    return payload
+    if not runtime.is_ready():
+        logger.warning("readiness_analyzer_unavailable")
+        return _public_readiness_response(ready=False)
+
+    if ml_runtime.local_model_required() and not ml_runtime.is_loaded():
+        logger.warning("readiness_required_model_unavailable")
+        return _public_readiness_response(ready=False)
+
+    return _public_readiness_response(ready=True)
 
 
 @app.get("/readiness")
@@ -3299,12 +3391,16 @@ if DEBUG_SCAN_ENDPOINT_ENABLED:
 
 @app.get("/baseline/status", response_model=BaselineStatusResponse)
 def baseline_status(
-    member_id: str = Query(...),
-    business_profile_id: str = Query(...),
+    member_id: str = Query(..., min_length=1, max_length=255),
+    business_profile_id: str = Query(..., min_length=1, max_length=255),
+    authenticated_user_id: str = Depends(_authenticate_baseline_status_user),
 ):
-    if not directus.is_configured():
-        raise HTTPException(status_code=500, detail="Directus credentials are not configured")
-    baseline = _baseline_for_member(member_id, business_profile_id)
+    _authorize_baseline_status_access(
+        authenticated_user_id,
+        member_id,
+        business_profile_id,
+    )
+    baseline = _authorized_baseline_for_status(member_id, business_profile_id)
     return baseline_status_payload(baseline)
 
 
